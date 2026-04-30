@@ -1,0 +1,14 @@
+.env
+*.log
+
+# pg_dump artifacts from seeding the canonical PG from the legacy stack —
+# can be hundreds of MB. Regenerate locally via scripts/seed-from-legacy.sh
+# whenever needed; never commit.
+seeds/
+
+# Terraform state and per-environment overrides go in user's hands, not
+# the repo. The aws/ tree's .gitignore should also catch state, but
+# defending here too.
+*.tfstate
+*.tfstate.*
+.terraform/

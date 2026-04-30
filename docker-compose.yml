@@ -1,0 +1,230 @@
+# qontinui-stack — canonical database stack for the canonical-DB topology.
+#
+# This is the authoritative dev/self-host/cloud-equivalent backplane. It runs
+# Postgres 16 (with pgvector), Redis 7, and MinIO (S3-compatible blob), plus
+# a one-shot alembic migrator that brings the schema to head on `up`.
+#
+# Topology plan: D:\qontinui-root\tmp_canonical_db_topology_plan.md (§9 Phase 1).
+#
+# Port choices: 5433 / 6380 / 9100-9101 — deliberately offset from the current
+# qontinui-web stack (5432 / 6379 / 9000-9001) so both can run side-by-side
+# during the cutover. After cutover completes (per topology plan §10), the
+# qontinui-web stack is decommissioned and this stack can move to the
+# standard ports if desired.
+#
+# Service summary:
+#   postgres   — canonical PG; pgvector enabled; four schemas pre-created.
+#   redis      — claims, pub/sub, presence; sub-second TTL primitives.
+#   minio      — S3-compatible blob; dev-only; staging+prod use real S3.
+#   migrator   — one-shot, runs `alembic upgrade head` on `up`, then exits.
+#
+# Connection strings for ~/.qontinui/profiles.json (dev profile):
+#   postgres://qontinui_user:qontinui_dev_password@<host>:5433/qontinui_db
+#   redis://<host>:6380/0
+#   http://<host>:9100   (MinIO S3 API)
+#   http://<host>:9101   (MinIO console)
+#
+# <host> is the PC's LAN IP (typically 192.168.x.x), exposed to MSI laptop
+# and the third machine over LAN. Topology plan §9 Phase 2 covers exposure.
+
+services:
+  # ───────────────────────────────────────────────────────────────────────
+  # PostgreSQL 16 + pgvector — canonical durable state.
+  # ───────────────────────────────────────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: qontinui-canonical-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-qontinui_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-qontinui_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-qontinui_db}
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - canonical_postgres_data:/var/lib/postgresql/data
+      # Bootstrap scripts run only on first container start (when the data
+      # volume is empty). Idempotent ON CONFLICT-style guards inside the
+      # scripts make them safe to re-run if the volume is wiped.
+      - ./init-scripts:/docker-entrypoint-initdb.d:ro
+    # Same hardening the qontinui-web stack uses (qontinui-web/docker-compose.yml:22-27)
+    # — bounded idle-in-transaction timeout + TCP keepalives so abandoned
+    # backends from crashed dev runners get cleaned up promptly. Without
+    # these, a single dev session can leak 10+ orphan backends before
+    # container restart.
+    command: >
+      postgres
+      -c idle_in_transaction_session_timeout=300000
+      -c tcp_keepalives_idle=60
+      -c tcp_keepalives_interval=10
+      -c tcp_keepalives_count=6
+      -c max_connections=200
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-qontinui_user} -d ${POSTGRES_DB:-qontinui_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ───────────────────────────────────────────────────────────────────────
+  # Redis 7 — claims, pub/sub, presence.
+  # ───────────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: qontinui-canonical-redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6380}:6379"
+    volumes:
+      - canonical_redis_data:/data
+    # appendonly = on for crash-resilient claim audit; the durable audit
+    # lives in PG, but the live claim state in Redis surviving a container
+    # restart matters during dev to avoid all-claims-expire on `down`/`up`.
+    #
+    # requirepass is set so LAN-reachable Redis isn't a wide-open shared
+    # cache. Same auth posture lifts cleanly to AWS staging/prod (just
+    # supply a different REDIS_PASSWORD).
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - 1gb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --requirepass
+      - ${REDIS_PASSWORD:-qontinui_dev_redis}
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-qontinui_dev_redis}", "--no-auth-warning", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ───────────────────────────────────────────────────────────────────────
+  # MinIO — S3-compatible blob storage (dev only).
+  # ───────────────────────────────────────────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    container_name: qontinui-canonical-minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "${MINIO_API_PORT:-9100}:9000"
+      - "${MINIO_CONSOLE_PORT:-9101}:9001"
+    volumes:
+      - canonical_minio_data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Bucket-creation sidecar — runs once after MinIO is healthy, then exits.
+  minio-init:
+    image: minio/mc:latest
+    container_name: qontinui-canonical-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        /usr/bin/mc alias set canonical http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin} && \
+        /usr/bin/mc mb canonical/qontinui-dev --ignore-existing && \
+        /usr/bin/mc anonymous set download canonical/qontinui-dev && \
+        echo "MinIO bucket qontinui-dev ready" && \
+        exit 0
+    restart: "no"
+
+  # ───────────────────────────────────────────────────────────────────────
+  # Alembic migrator — one-shot `alembic upgrade head` on `up`.
+  #
+  # Built from ./migrator/Dockerfile against a build context one level up
+  # (`..`), so it can COPY from sibling repos qontinui-web/backend/ (alembic
+  # chain + model graph) and qontinui-schemas/ (pydantic-only path dep).
+  # See ./migrator/Dockerfile for the full rationale, including why we
+  # use a curated dep set instead of `poetry install --only main` against
+  # qontinui-web/backend (the latter would drag torch + CUDA in via the
+  # heavy `qontinui` path dep).
+  #
+  # Connect string uses the in-stack service name `postgres` and the
+  # in-container port 5432, NOT the host-mapped 5433.
+  # ───────────────────────────────────────────────────────────────────────
+  migrator:
+    build:
+      context: ..
+      dockerfile: qontinui-stack/migrator/Dockerfile
+    image: qontinui-canonical-migrator:latest
+    container_name: qontinui-canonical-migrator
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-qontinui_user}:${POSTGRES_PASSWORD:-qontinui_dev_password}@postgres:5432/${POSTGRES_DB:-qontinui_db}
+    restart: "no"
+
+  # ───────────────────────────────────────────────────────────────────────
+  # qontinui-coord — coordinator service.
+  #
+  # Built from ../qontinui-coord/Dockerfile. Terminates WebSockets,
+  # ingests GitHub webhooks (HMAC-validated, republished on Redis), and
+  # fronts the canonical PG + Redis. See ../qontinui-coord/README.md.
+  #
+  # In-stack DSNs use the service names (postgres, redis), not the
+  # host-mapped ports. GITHUB_WEBHOOK_SECRET is intentionally unset by
+  # default so the endpoint rejects all requests until the operator
+  # configures the shared secret in .env.
+  # ───────────────────────────────────────────────────────────────────────
+  coord:
+    build:
+      context: ../qontinui-coord
+      dockerfile: Dockerfile
+    image: qontinui-canonical-coord:latest
+    container_name: qontinui-canonical-coord
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "${COORD_PORT:-9870}:9870"
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-qontinui_user}:${POSTGRES_PASSWORD:-qontinui_dev_password}@postgres:5432/${POSTGRES_DB:-qontinui_db}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-qontinui_dev_redis}@redis:6379/0
+      COORD_BIND_ADDR: 0.0.0.0:9870
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
+      # Phase 5B.5 — sibling-repo clones land here. Persistent volume so
+      # clones survive container restarts; otherwise every up cycle would
+      # re-clone every tracked repo from scratch.
+      COORD_MIRRORS_ROOT: /var/lib/qontinui-coord/mirrors
+      # GITHUB_TOKEN is optional; required only for cloning private
+      # qontinui-web. When unset, public-repo enrichment still works.
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      RUST_LOG: ${COORD_RUST_LOG:-qontinui_coord=info,axum=info,tower_http=info}
+    volumes:
+      - canonical_coord_mirrors:/var/lib/qontinui-coord/mirrors
+
+# ───────────────────────────────────────────────────────────────────────────
+# Volumes — explicit names so `docker compose down` doesn't take them out;
+# only `docker compose down -v` wipes data. Matches qontinui-web's
+# convention.
+# ───────────────────────────────────────────────────────────────────────────
+volumes:
+  canonical_postgres_data:
+    name: qontinui_canonical_postgres_data
+  canonical_redis_data:
+    name: qontinui_canonical_redis_data
+  canonical_coord_mirrors:
+    name: qontinui_canonical_coord_mirrors
+  canonical_minio_data:
+    name: qontinui_canonical_minio_data
+
+# Default network (`qontinui-stack_default`) is created automatically and
+# isolates this stack from the legacy qontinui-web stack. Connections from
+# the host (or LAN) target the published ports; in-stack services
+# (migrator → postgres) use service names.

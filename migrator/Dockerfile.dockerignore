@@ -1,0 +1,40 @@
+# Build context is D:/qontinui-root/ — wide on purpose so we can COPY from
+# qontinui-stack/, qontinui-web/, and qontinui-schemas/ siblings. This file
+# trims that context to just what the Dockerfile actually copies, keeping
+# build send time fast.
+#
+# Allow-list pattern: ignore everything, then un-ignore the dirs we need.
+# `*` matches files at the root; `**` would match recursively.
+
+# Default-deny everything.
+*
+
+# Allow the three sibling repos we COPY from.
+!qontinui-stack/migrator/
+!qontinui-schemas/
+!qontinui-web/backend/
+
+# Within those, exclude churn that doesn't affect the migrator image.
+qontinui-schemas/node_modules/
+qontinui-schemas/ts/
+qontinui-schemas/rust/
+qontinui-schemas/tests/
+qontinui-schemas/scripts/
+qontinui-schemas/poetry.lock
+qontinui-schemas/.venv/
+qontinui-schemas/__pycache__/
+qontinui-schemas/**/__pycache__/
+
+qontinui-web/backend/.venv/
+qontinui-web/backend/htmlcov/
+qontinui-web/backend/data/
+qontinui-web/backend/logs/
+qontinui-web/backend/coverage.xml
+qontinui-web/backend/poetry.lock
+qontinui-web/backend/__pycache__/
+qontinui-web/backend/**/__pycache__/
+qontinui-web/backend/backup_migrations/
+qontinui-web/backend/docs/
+qontinui-web/backend/tests/
+qontinui-web/backend/scripts/
+qontinui-web/backend/user_projects/

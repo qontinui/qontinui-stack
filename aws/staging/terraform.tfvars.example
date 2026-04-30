@@ -1,0 +1,20 @@
+# Copy to terraform.tfvars and fill in. terraform.tfvars is gitignored.
+
+region          = "us-east-1"
+environment     = "staging"
+
+# DNS — must already exist in Route53.
+domain_name     = "qontinui.io"
+route53_zone_id = "Z01234567890ABCDEFGH"
+
+# Coord image — push first via ../scripts/push-coord-image.sh
+coord_image_uri = "<aws-account-id>.dkr.ecr.us-east-1.amazonaws.com/qontinui-coord:staging"
+
+# GitHub webhook shared secret. Use `openssl rand -hex 32` to generate.
+coord_github_webhook_secret = "REPLACE-ME"
+
+# Sizing — defaults are fine for staging. Bump for prod.
+# postgres_instance_class = "db.t4g.micro"
+# postgres_multi_az       = false
+# redis_node_type         = "cache.t4g.micro"
+# coord_desired_count     = 1

@@ -1,0 +1,11 @@
+# Local Terraform state and backend lock — should always be remote.
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+
+# Real tfvars carry secrets; only the .example is checked in.
+*.tfvars
+!*.tfvars.example
