@@ -83,6 +83,13 @@ COPY qontinui-web/backend/app /app/app
 COPY qontinui-stack/migrator/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
+# ---- Healthcheck script (alembic-status sidecar) -----------------------------
+# Long-running observers reuse this image with `command: ["sleep", "infinity"]`
+# and a docker healthcheck that calls /alembic_at_head.sh. See
+# qontinui-stack/docker-compose.yml `alembic-status` service.
+COPY qontinui-stack/migrator/alembic_at_head.sh /alembic_at_head.sh
+RUN chmod +x /alembic_at_head.sh
+
 # Smoke-check at build time: the model graph must import cleanly. If a future
 # qontinui-web change adds an import that needs a dep we don't ship, this
 # fails the build instead of erroring at `docker compose up` time.

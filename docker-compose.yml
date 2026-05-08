@@ -168,6 +168,56 @@ services:
     restart: "no"
 
   # ───────────────────────────────────────────────────────────────────────
+  # Alembic status sidecar — long-running observability surface.
+  #
+  # Runs the same image as the migrator but with a no-op command, so the
+  # container stays alive for healthchecks. Its docker healthcheck
+  # (/alembic_at_head.sh) compares `alembic current` (DB-stamped rev)
+  # to `alembic heads` (chain head from the embedded alembic/versions/).
+  # The check fails on: empty alembic_version, multi-head divergence
+  # (the 2026-05-07 failure mode), or current != head (post-migration
+  # silent-failure fallout).
+  #
+  # Why a sidecar instead of augmenting postgres's healthcheck:
+  #   - postgres is the postgres image; it doesn't have alembic or the
+  #     chain. Injecting them would fork the upstream image.
+  #   - This decouples "is PG accepting connections?" (postgres health)
+  #     from "is the schema at head?" (alembic-status health). External
+  #     observers pick whichever signal matches their concern.
+  #   - The migrator-success gate on coord (line 211) handles the
+  #     in-stack startup ordering. This sidecar is purely for external
+  #     visibility — `docker inspect`, supervisor probes, CI smoke
+  #     scripts, future Prometheus exporters.
+  #
+  # depends_on migrator: service_completed_successfully — without this,
+  # the sidecar would briefly report unhealthy (current != head) on a
+  # cold start while the migrator is still running. Gating on migrator
+  # completion makes "starting" → "healthy" the only legitimate
+  # transition.
+  # ───────────────────────────────────────────────────────────────────────
+  alembic-status:
+    image: qontinui-canonical-migrator:latest
+    container_name: qontinui-canonical-alembic-status
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-qontinui_user}:${POSTGRES_PASSWORD:-qontinui_dev_password}@postgres:5432/${POSTGRES_DB:-qontinui_db}
+    # `tini` is PID-1 so signals to the container terminate cleanly.
+    # `sleep infinity` keeps the container alive without burning CPU.
+    entrypoint: ["/usr/bin/tini", "--"]
+    command: ["sh", "-c", "exec sleep infinity"]
+    healthcheck:
+      test: ["CMD", "/alembic_at_head.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # ───────────────────────────────────────────────────────────────────────
   # qontinui-coord — coordinator service.
   #
   # Built from ../qontinui-coord/Dockerfile. Terminates WebSockets,
