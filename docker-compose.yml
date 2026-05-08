@@ -186,11 +186,25 @@ services:
     image: qontinui-canonical-coord:latest
     container_name: qontinui-canonical-coord
     restart: unless-stopped
+    # `migrator: service_completed_successfully` makes a migrator
+    # failure (multi-head divergence, broken DDL, transient PG hiccup)
+    # block coord startup loudly, instead of letting coord come up
+    # against an under-migrated DB and emit "column X does not exist"
+    # 500s into runtime logs that nobody reads. Alembic upgrade is
+    # idempotent (no-op when already at head), so the gate is cheap on
+    # the happy path and load-bearing on the failure path.
+    # Background: 2026-05-07 multi-head divergence
+    # (cr01a2b3c4d5 + 7c5e4d3b2a1f) had the migrator exit 255 four
+    # hours before anyone noticed, because nothing depended on its
+    # success. See investigation in
+    # qontinui-web@5d320ffb / qontinui-runner@1d984230f.
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
     ports:
       - "${COORD_PORT:-9870}:9870"
     environment:
