@@ -259,7 +259,11 @@ services:
       - "${SCCACHE_DAEMON_PORT:-4226}:4226"
       - "${SCCACHE_STATS_PORT:-4227}:4227"
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O-", "http://localhost:4227/health"]
+      # Hit 127.0.0.1 explicitly: alpine's busybox wget tries IPv6 (::1)
+      # first for `localhost`, but Python's stdlib HTTPServer binds
+      # IPv4-only, so the healthcheck would otherwise fail with
+      # "Connection refused" while the service is happily up.
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:4227/health"]
       interval: 30s
       timeout: 5s
       retries: 3
