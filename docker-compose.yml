@@ -220,6 +220,52 @@ services:
       start_period: 15s
 
   # ───────────────────────────────────────────────────────────────────────
+  # qontinui canonical sccache — LAN-shared rustc compile-unit cache.
+  #
+  # Row 2 Phase 2 of the fleet topology design
+  # (plans/2026-05-14-fleet-topology-and-build-pool-design.md §3.3).
+  # The shared cache itself lives in MinIO under bucket `qontinui-sccache`;
+  # each agent / build machine runs a local sccache daemon configured to
+  # talk S3 to that bucket. This container's role is:
+  #
+  #   1. Idempotently create the `qontinui-sccache` MinIO bucket at boot.
+  #   2. Expose stats HTTP for the coord `/metrics` scraper (:4227).
+  #   3. Pre-stage a dormant sccache server (:4226) for Phase 6
+  #      cloud-burst CI workers that will compile inside containers.
+  #
+  # Port convention follows the rest of the stack: sccache default daemon
+  # port 4226 stays internal-only (host-mapped for Phase 6); stats HTTP at
+  # 4227 is host-exposed so coord on :9870 can scrape it over the LAN.
+  # ───────────────────────────────────────────────────────────────────────
+  sccache:
+    build:
+      context: ./sccache
+      dockerfile: Dockerfile
+    image: qontinui-canonical-sccache:latest
+    container_name: qontinui-canonical-sccache
+    restart: unless-stopped
+    depends_on:
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      SCCACHE_BUCKET: ${SCCACHE_BUCKET:-qontinui-sccache}
+      SCCACHE_MINIO_HOST: ${SCCACHE_MINIO_HOST:-minio:9000}
+      SCCACHE_MINIO_USER: ${MINIO_ROOT_USER:-minioadmin}
+      SCCACHE_MINIO_PASS: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      SCCACHE_STATS_PORT: "4227"
+    ports:
+      - "${SCCACHE_DAEMON_PORT:-4226}:4226"
+      - "${SCCACHE_STATS_PORT:-4227}:4227"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:4227/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # ───────────────────────────────────────────────────────────────────────
   # NATS JetStream — durable, replayable event streams.
   #
   # Row 9 Phase 1 (per plans/2026-05-14-failure-modes-at-scale-design.md
@@ -366,6 +412,11 @@ services:
       # GITHUB_TOKEN is optional; required only for cloning private
       # qontinui-web. When unset, public-repo enrichment still works.
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      # Row 2 Phase 2 — sccache stats scrape target. Coord aggregates
+      # bucket-side counters (object count, total size) from this URL on
+      # its /metrics endpoint. Unset disables sccache stats reporting
+      # (the rest of /metrics keeps working).
+      SCCACHE_STATS_URL: ${SCCACHE_STATS_URL:-http://sccache:4227}
       RUST_LOG: ${COORD_RUST_LOG:-qontinui_coord=info,axum=info,tower_http=info}
     volumes:
       - canonical_coord_mirrors:/var/lib/qontinui-coord/mirrors
