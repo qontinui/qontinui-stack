@@ -125,6 +125,17 @@ services:
       retries: 3
 
   # Bucket-creation sidecar — runs once after MinIO is healthy, then exits.
+  #
+  # Owns these buckets:
+  #   qontinui-dev          — general dev blob store
+  #   qontinui-bazel-remote — content-addressed cache backing for the
+  #                           bazel-remote service below (Row 10 Item 4).
+  #
+  # Bucket creation is idempotent (`mb --ignore-existing`); the sidecar
+  # is the gate that downstream services depend on for "bucket exists".
+  # The sccache container creates its own `qontinui-sccache` bucket via
+  # its entrypoint — that pattern stays in place; only buckets co-owned
+  # with multi-service contracts live here.
   minio-init:
     image: minio/mc:latest
     container_name: qontinui-canonical-minio-init
@@ -138,7 +149,8 @@ services:
         /usr/bin/mc alias set canonical http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin} && \
         /usr/bin/mc mb canonical/qontinui-dev --ignore-existing && \
         /usr/bin/mc anonymous set download canonical/qontinui-dev && \
-        echo "MinIO bucket qontinui-dev ready" && \
+        /usr/bin/mc mb canonical/${BAZEL_REMOTE_BUCKET:-qontinui-bazel-remote} --ignore-existing && \
+        echo "MinIO buckets qontinui-dev + ${BAZEL_REMOTE_BUCKET:-qontinui-bazel-remote} ready" && \
         exit 0
     restart: "no"
 
@@ -264,6 +276,76 @@ services:
       # IPv4-only, so the healthcheck would otherwise fail with
       # "Connection refused" while the service is happily up.
       test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:4227/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # ───────────────────────────────────────────────────────────────────────
+  # bazel-remote — content-addressed build cache (CAS) + ActionResult (AC).
+  #
+  # Row 10 Item 4 of the validation-freshness implementation tracker
+  # (plans/2026-05-14-row-10-implementation-tracker.md). The supervisor
+  # build pool will (in Items 5–7) extend its current timestamp-keyed
+  # reuse to a content-hash key derived by `canonical_diff_hash.py`, then
+  # query bazel-remote's AC at that key before dispatching a build. This
+  # container is just the backing store; integration is Wave 4+.
+  #
+  # Topology:
+  #   - HTTP API on host :9094 (container :80) — REST CAS + AC routes
+  #     used by the spike + (eventually) supervisor pool. Default port 80
+  #     is hardcoded in the upstream image entrypoint.
+  #   - gRPC on host :9095 (container :9092) — REAPI gRPC for native
+  #     Bazel-style clients; reserved for Item 7+ once supervisor writes
+  #     real ActionResult protobufs.
+  #   - Local disk cache at /data (volume-mounted) acts as the hot tier.
+  #   - S3 backing against canonical MinIO bucket `qontinui-bazel-remote`
+  #     is the durable cold tier: blobs survive container restart even
+  #     after the local volume is wiped.
+  #
+  # Image: `muxinc/bazel-remote:latest` (mirror of buchgr/bazel-remote;
+  # `buchgr/bazel-remote` was pulled from Docker Hub per Phase-0 spike
+  # findings). Same image the spike at `tmp_spike_bazel_remote/`
+  # verified end-to-end.
+  #
+  # AC validation: `--disable_http_ac_validation` is on initially so HTTP
+  # AC PUTs accept opaque blobs — matches the spike posture and lets
+  # Items 5–6 write JSON pointers ({artifact_sha, artifact_size}) before
+  # Item 7 switches the supervisor pool to real REAPI `ActionResult`
+  # protobufs. Item 7 turns validation back on.
+  # ───────────────────────────────────────────────────────────────────────
+  bazel-remote:
+    image: muxinc/bazel-remote:latest
+    container_name: qontinui-canonical-bazel-remote
+    restart: unless-stopped
+    depends_on:
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    # Image entrypoint hardcodes `./bazel-remote --port=80 --dir=/data`;
+    # `command` flags below append. --max_size is required by the binary
+    # so cache size is bounded. S3 flags route to canonical MinIO over
+    # plain HTTP (--s3.disable_ssl) since the in-stack bridge is local.
+    command:
+      - --max_size=${BAZEL_REMOTE_MAX_SIZE_GIB:-50}
+      - --grpc_port=9092
+      - --s3.endpoint=${BAZEL_REMOTE_S3_ENDPOINT:-minio:9000}
+      - --s3.bucket=${BAZEL_REMOTE_BUCKET:-qontinui-bazel-remote}
+      - --s3.access_key_id=${MINIO_ROOT_USER:-minioadmin}
+      - --s3.secret_access_key=${MINIO_ROOT_PASSWORD:-minioadmin}
+      - --s3.disable_ssl
+      - --disable_http_ac_validation
+    ports:
+      - "${BAZEL_REMOTE_HTTP_PORT:-9094}:80"
+      - "${BAZEL_REMOTE_GRPC_PORT:-9095}:9092"
+    volumes:
+      - canonical_bazel_remote_data:/data
+    healthcheck:
+      # /status returns a JSON stats blob — exercises the HTTP server +
+      # confirms the cache directory is initialised. wget ships in the
+      # image (no curl); the binary listens on container-port 80.
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:80/status"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -439,6 +521,8 @@ volumes:
     name: qontinui_canonical_coord_mirrors
   canonical_minio_data:
     name: qontinui_canonical_minio_data
+  canonical_bazel_remote_data:
+    name: qontinui_canonical_bazel_remote_data
   canonical_nats_1_data:
     name: qontinui_canonical_nats_1_data
   canonical_nats_2_data:
