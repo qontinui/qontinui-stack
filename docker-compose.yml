@@ -308,11 +308,17 @@ services:
   # findings). Same image the spike at `tmp_spike_bazel_remote/`
   # verified end-to-end.
   #
-  # AC validation: `--disable_http_ac_validation` is on initially so HTTP
-  # AC PUTs accept opaque blobs — matches the spike posture and lets
-  # Items 5–6 write JSON pointers ({artifact_sha, artifact_size}) before
-  # Item 7 switches the supervisor pool to real REAPI `ActionResult`
-  # protobufs. Item 7 turns validation back on.
+  # AC validation: ON (Row 10 Item 7, 2026-05-15). The supervisor build
+  # pool now writes real REAPI `ActionResult` protobufs
+  # (qontinui-supervisor src/reapi.rs), so bazel-remote validates every
+  # HTTP AC PUT — body must parse as `build.bazel.remote.execution.v2
+  # .ActionResult` and every referenced digest must already be in CAS.
+  # The `--disable_http_ac_validation` flag was removed once the
+  # supervisor synthetic round-trip (tests/row10_cache_synthetic.rs)
+  # proved the protobuf passes validation. Do NOT re-add the flag: any
+  # legacy JSON-pointer AC body (Items 5-6 interim, never shipped — 5-7
+  # landed together) would now be rejected, which is the intended
+  # behavior.
   # ───────────────────────────────────────────────────────────────────────
   bazel-remote:
     image: muxinc/bazel-remote:latest
@@ -335,7 +341,6 @@ services:
       - --s3.access_key_id=${MINIO_ROOT_USER:-minioadmin}
       - --s3.secret_access_key=${MINIO_ROOT_PASSWORD:-minioadmin}
       - --s3.disable_ssl
-      - --disable_http_ac_validation
     ports:
       - "${BAZEL_REMOTE_HTTP_PORT:-9094}:80"
       - "${BAZEL_REMOTE_GRPC_PORT:-9095}:9092"
@@ -434,6 +439,49 @@ services:
       start_period: 10s
 
   # ───────────────────────────────────────────────────────────────────────
+  # Jaeger all-in-one — OpenTelemetry trace backend (Row 9 Phase 5).
+  #
+  # Single-container deployment with the OTLP receiver (gRPC :4317, HTTP
+  # :4318) and the Jaeger UI (:16686). All-in-one writes to in-memory
+  # storage by default — fine for the v1 burn-in / dev box; production
+  # observability stack (Tempo, Honeycomb, Datadog) is a Phase 6+ choice.
+  #
+  # Per Row 9 design §3.6: trace IDs propagate via traceparent over HTTP
+  # and via NATS message headers; coord / supervisor / runner all export
+  # to this collector. Sampling defaults are coded into the services
+  # (1% baseline, 100% for tagged events).
+  #
+  # Ports:
+  #   16686 → Jaeger UI (browse traces at http://localhost:16686)
+  #   4317  → OTLP gRPC receiver (services point here via OTEL_EXPORTER_OTLP_ENDPOINT)
+  #   4318  → OTLP HTTP receiver (services that prefer HTTP/JSON)
+  #
+  # When the host already binds 4317/4318 (running collector, dev tools),
+  # override via env vars before `docker compose up`.
+  # ───────────────────────────────────────────────────────────────────────
+  jaeger:
+    image: jaegertracing/all-in-one:1.62
+    container_name: qontinui-canonical-jaeger
+    restart: unless-stopped
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      # Cap the in-memory store so a runaway trace volume can't OOM the box.
+      MEMORY_MAX_TRACES: "${JAEGER_MAX_TRACES:-50000}"
+    ports:
+      - "${JAEGER_UI_PORT:-16686}:16686"
+      - "${OTLP_GRPC_PORT:-4317}:4317"
+      - "${OTLP_HTTP_PORT:-4318}:4318"
+    healthcheck:
+      # /api/services is the cheapest endpoint that proves the collector
+      # is responsive — returns 200 with `{"data": null, ...}` when no
+      # traces have arrived yet.
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:16686/api/services"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ───────────────────────────────────────────────────────────────────────
   # qontinui-coord — coordinator service.
   #
   # Built from ../qontinui-coord/Dockerfile. Terminates WebSockets,
@@ -480,6 +528,11 @@ services:
         condition: service_healthy
       nats-3:
         condition: service_healthy
+      # Jaeger gate is best-effort like NATS: coord retries OTLP exports
+      # internally. Gating on `service_healthy` is preferred so the first
+      # exported span after coord boot doesn't race a cold collector.
+      jaeger:
+        condition: service_healthy
     ports:
       - "${COORD_PORT:-9870}:9870"
     environment:
@@ -504,6 +557,15 @@ services:
       # (the rest of /metrics keeps working).
       SCCACHE_STATS_URL: ${SCCACHE_STATS_URL:-http://sccache:4227}
       RUST_LOG: ${COORD_RUST_LOG:-qontinui_coord=info,axum=info,tower_http=info}
+      # Row 9 Phase 5 — OpenTelemetry export. Unset disables tracing; the
+      # coord process logs at startup and continues without OTel. The
+      # baseline sample rate is 1% (per design §3.6); the
+      # `TaggedSampler` promotes tagged spans (auth-failure,
+      # partition-event, cache-miss-cold, merge-conflict) to 100%
+      # regardless of the baseline rate.
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://jaeger:4317}
+      OTEL_SERVICE_NAME: ${COORD_OTEL_SERVICE_NAME:-qontinui-coord}
+      OTEL_TRACES_SAMPLER_ARG: ${COORD_OTEL_SAMPLE_RATE:-0.01}
     volumes:
       - canonical_coord_mirrors:/var/lib/qontinui-coord/mirrors
 
