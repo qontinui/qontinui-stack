@@ -460,7 +460,7 @@ services:
   # override via env vars before `docker compose up`.
   # ───────────────────────────────────────────────────────────────────────
   jaeger:
-    image: jaegertracing/all-in-one:1.62
+    image: jaegertracing/all-in-one:1.62.0
     container_name: qontinui-canonical-jaeger
     restart: unless-stopped
     environment:
@@ -497,6 +497,10 @@ services:
     build:
       context: ../qontinui-coord
       dockerfile: Dockerfile
+    # Cutover 2026-05-16: unpinned from :pre-phase5-pinned to :latest after
+    # canonical-PG upgrade (wave_7_01_merge_heads single head) completed via
+    # Session B's reconcile-then-stamp program. :pre-phase5-pinned image preserved
+    # locally as rollback target if needed.
     image: qontinui-canonical-coord:latest
     container_name: qontinui-canonical-coord
     restart: unless-stopped
@@ -538,12 +542,35 @@ services:
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER:-qontinui_user}:${POSTGRES_PASSWORD:-qontinui_dev_password}@postgres:5432/${POSTGRES_DB:-qontinui_db}
       REDIS_URL: redis://:${REDIS_PASSWORD:-qontinui_dev_redis}@redis:6379/0
-      # Multi-server URL — async-nats parses the comma-separated list
-      # and uses any responsive node as the entry point; the cluster
-      # mesh handles internal routing.
-      NATS_URL: nats://${NATS_CLIENT_USER:-qontinui_client}:${NATS_CLIENT_PASSWORD:-qontinui_dev_nats}@nats-1:4222,nats://${NATS_CLIENT_USER:-qontinui_client}:${NATS_CLIENT_PASSWORD:-qontinui_dev_nats}@nats-2:4222,nats://${NATS_CLIENT_USER:-qontinui_client}:${NATS_CLIENT_PASSWORD:-qontinui_dev_nats}@nats-3:4222
+      # Single-URL form (Gap 2 workaround, 2026-05-17). async-nats 0.48's
+      # connect(&str) treats a comma-separated NATS_URL as ONE URL and
+      # fails to parse the second host's `:4222` as a port; the existing
+      # `split_url_creds` workaround in nats_streams.rs handles
+      # user:pass@host auth extraction but not multi-URL splitting. Single
+      # entry point still lets the NATS cluster mesh handle internal
+      # routing; loses only cold-boot failover to nats-2/-3 if nats-1 is
+      # the slow starter. Proper fix queued as a coord PR: split on `,`
+      # and pass Vec<String> to connect. See
+      # feedback_async_nats_url_creds_rejected + Gap 2 in
+      # proj_deployment_config_gaps_2026-05-rollout.
+      NATS_URL: nats://${NATS_CLIENT_USER:-qontinui_client}:${NATS_CLIENT_PASSWORD:-qontinui_dev_nats}@nats-1:4222
       COORD_BIND_ADDR: 0.0.0.0:9870
       GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
+      # Strategy Phase 1 service-account JWT bridge — coord mints/verifies
+      # JWTs for qontinui-web's StrategyClient. Unset = 503 on
+      # /coord/auth/service-token (feature off, fail-closed). Same value
+      # must be present in qontinui-web backend env for mint/verify
+      # symmetry. Added 2026-05-17 per Gap 5 in
+      # proj_deployment_config_gaps_2026-05-rollout.
+      COORD_ADMIN_SECRET: ${COORD_ADMIN_SECRET:-}
+      # Strategy Phase 1 substrate root — coord reads strategy docs from
+      # this path via `git -C <path>` subprocess. Path points one level
+      # INTO the bind-mount because coord needs .git to be reachable
+      # from the substrate dir (git walks up). The mount source is the
+      # whole qontinui-dev-notes repo (read-only); coord's
+      # `safe_doc_name` guards path traversal so only `*.md` under
+      # project-strategy/ is reachable via /strategy/docs.
+      STRATEGY_SUBSTRATE_PATH: /app/strategy-substrate/project-strategy
       # Phase 5B.5 — sibling-repo clones land here. Persistent volume so
       # clones survive container restarts; otherwise every up cycle would
       # re-clone every tracked repo from scratch.
@@ -568,6 +595,32 @@ services:
       OTEL_TRACES_SAMPLER_ARG: ${COORD_OTEL_SAMPLE_RATE:-0.01}
     volumes:
       - canonical_coord_mirrors:/var/lib/qontinui-coord/mirrors
+      # Strategy Phase 1 substrate — read-only bind of the host's
+      # qontinui-dev-notes repo. Mount is the WHOLE repo (not just
+      # project-strategy/) because coord's `git -C <substrate>` needs
+      # `.git` reachable from the substrate dir; .git lives at the
+      # repo root, not inside project-strategy/. STRATEGY_SUBSTRATE_PATH
+      # points one level INTO this mount (project-strategy/) so
+      # /strategy/docs serves only those files; safe_doc_name guards
+      # path traversal. Blast radius: 87MB of internal dev notes,
+      # read-only, no credentials in tree. Added 2026-05-17 per Gap 5
+      # in proj_deployment_config_gaps_2026-05-rollout.
+      - type: bind
+        source: D:/qontinui-root/qontinui-dev-notes
+        target: /app/strategy-substrate
+        read_only: true
+      # Phase B.1 (Gap 1) — docker socket bind for the canary watchers
+      # (alembic_status_watcher, jetstream_health_watcher) to shell to
+      # `docker inspect` against sibling canonical-stack containers.
+      # Read-only: coord queries health status, never mutates the
+      # daemon. Pairs with `docker.io` in qontinui-coord/Dockerfile
+      # (coord PR #32, 2026-05-17). Without the socket, the CLI is
+      # present but every probe fails with "Cannot connect to the
+      # Docker daemon" and the alerts never fire.
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+        read_only: true
 
 # ───────────────────────────────────────────────────────────────────────────
 # Volumes — explicit names so `docker compose down` doesn't take them out;
