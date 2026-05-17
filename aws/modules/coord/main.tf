@@ -217,13 +217,16 @@ resource "aws_ecs_task_definition" "coord" {
         }
       }
 
-      healthCheck = {
-        command     = ["CMD-SHELL", "wget -qO- http://localhost:9870/health || exit 1"]
-        interval    = 30
-        timeout     = 5
-        retries     = 3
-        startPeriod = 30
-      }
+      # Container-level healthCheck intentionally omitted. coord's image is a
+      # minimal Rust runtime that does NOT ship wget/curl/sh-fetch utilities,
+      # so the original `wget -qO- http://localhost:9870/health` CMD-SHELL
+      # probe always failed → ECS replaced the task every ~3 min, which
+      # regenerated the ephemeral `/root/.qontinui/coord-jwt-ed25519.pkcs8`
+      # JWT signing key and invalidated outstanding service tokens (web's
+      # StrategyClient → 401). The ALB target group (`aws_lb_target_group`
+      # below) is the sole authoritative health source: HTTP GET /health on
+      # port 9870 from the ALB's SG. One source of truth; container-HC and
+      # ALB-HC can no longer disagree.
     }
   ])
 }
