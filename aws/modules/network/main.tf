@@ -9,9 +9,9 @@
 #
 # This shape is the canonical "ALB → app → managed-data-stores" pattern.
 
-variable "environment"  { type = string }
-variable "vpc_cidr"     { type = string }
-variable "az_count"     { type = number }
+variable "environment" { type = string }
+variable "vpc_cidr" { type = string }
+variable "az_count" { type = number }
 
 data "aws_availability_zones" "available" {
   state = "available"
@@ -164,7 +164,7 @@ resource "aws_security_group_rule" "client_from_alb_9870" {
   protocol                 = "tcp"
   source_security_group_id = aws_security_group.alb.id
   security_group_id        = aws_security_group.client.id
-  description              = "ALB → coord task"
+  description              = "ALB to coord task"
 }
 
 resource "aws_security_group" "data_plane" {
@@ -189,7 +189,7 @@ resource "aws_security_group_rule" "data_pg_from_client" {
   protocol                 = "tcp"
   source_security_group_id = aws_security_group.client.id
   security_group_id        = aws_security_group.data_plane.id
-  description              = "client → RDS Postgres"
+  description              = "client to RDS Postgres"
 }
 
 resource "aws_security_group_rule" "data_redis_from_client" {
@@ -199,7 +199,7 @@ resource "aws_security_group_rule" "data_redis_from_client" {
   protocol                 = "tcp"
   source_security_group_id = aws_security_group.client.id
   security_group_id        = aws_security_group.data_plane.id
-  description              = "client → ElastiCache Redis"
+  description              = "client to ElastiCache Redis"
 }
 
 # Self-ingress for ElastiCache replication group internals.
@@ -215,9 +215,9 @@ resource "aws_security_group_rule" "data_self" {
 
 # ─── Outputs ────────────────────────────────────────────────────────────
 
-output "vpc_id"             { value = aws_vpc.main.id }
-output "public_subnet_ids"  { value = aws_subnet.public[*].id }
+output "vpc_id" { value = aws_vpc.main.id }
+output "public_subnet_ids" { value = aws_subnet.public[*].id }
 output "private_subnet_ids" { value = aws_subnet.private[*].id }
-output "alb_sg_id"          { value = aws_security_group.alb.id }
-output "client_sg_id"       { value = aws_security_group.client.id }
-output "data_plane_sg_id"   { value = aws_security_group.data_plane.id }
+output "alb_sg_id" { value = aws_security_group.alb.id }
+output "client_sg_id" { value = aws_security_group.client.id }
+output "data_plane_sg_id" { value = aws_security_group.data_plane.id }

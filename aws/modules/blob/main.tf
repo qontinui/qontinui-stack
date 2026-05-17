@@ -71,4 +71,4 @@ resource "aws_s3_bucket_lifecycle_configuration" "blob" {
 # ─── Outputs ────────────────────────────────────────────────────────────
 
 output "bucket_name" { value = aws_s3_bucket.blob.bucket }
-output "bucket_arn"  { value = aws_s3_bucket.blob.arn }
+output "bucket_arn" { value = aws_s3_bucket.blob.arn }

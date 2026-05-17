@@ -18,4 +18,4 @@ aws ecs update-service \
     --desired-count 0 \
     --region "$REGION" >/dev/null
 
-echo "==> Done. ALB + ElastiCache + storage continue billing (~$30/mo idle)."
+echo '==> Done. ALB + ElastiCache + storage continue billing (~$30/mo idle).'
