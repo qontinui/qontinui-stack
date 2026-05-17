@@ -19,9 +19,13 @@
 #   # 1. Build the OSS slim image first (from qontinui-web/backend/):
 #   docker build -t qontinui-web-backend:slim-<sha> qontinui-web/backend/
 #
-#   # 2. Fetch CC_TOKEN to a tmp file (BuildKit secret source — never in layers):
+#   # 2. Fetch CC_TOKEN to a tmp file (BuildKit secret source — never in layers).
+#   #    cc_token lives in us-east-1 alongside the other staging Secrets Manager
+#   #    entries (migrated 2026-05-17 from eu-central-1 for region colocation).
+#   #    Setting `$env:AWS_DEFAULT_REGION = "us-east-1"` once in your shell
+#   #    profile is the cleaner alternative to passing --region on every call.
 #   aws secretsmanager get-secret-value --secret-id qontinui/staging/cc_token \
-#     --region eu-central-1 --query SecretString --output text > /tmp/cc_token
+#     --region us-east-1 --query SecretString --output text > /tmp/cc_token
 #
 #   # 3. Build overlay:
 #   docker build \
