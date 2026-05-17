@@ -241,17 +241,20 @@ resource "aws_ecs_task_definition" "coord" {
       environment = [
         { name = "COORD_BIND_ADDR", value = "0.0.0.0:9870" },
         { name = "RUST_LOG", value = "qontinui_coord=info,axum=info,tower_http=info" },
-        # Strategy substrate (markdown docs) baked into the coord image at
-        # /srv/strategy-substrate (qontinui-coord PR `feat(coord): bake
-        # strategy substrate into image at /srv/strategy-substrate`).
-        # Overrides the relative-path default in `substrate_dir()` which
-        # only resolves on the local dogfood checkout. Without this env
-        # set, /strategy/docs on Fargate returns
+        # Strategy substrate (markdown docs) baked into the coord image as
+        # the full qontinui-dev-notes repo at /srv/dev-notes (qontinui-coord
+        # PRs #40 `a9c1b07` + #41 `a4e3155` + #42 — the last preserves .git/
+        # so coord's `git -C <substrate>` provenance reads succeed). Path
+        # here points INTO the repo so safe_doc_name's bounded reads target
+        # project-strategy/*.md, while git's parent-walk from there finds
+        # .git/ at /srv/dev-notes/.git. Overrides the relative-path default
+        # in `substrate_dir()` which only resolves on the local dogfood
+        # checkout. Without this env set, /strategy/docs on Fargate returns
         # `500 substrate unreadable: No such file or directory`. Closes
-        # proj_aws_staging_coord_deploy_2026-05-17 Open Issues #N
+        # proj_aws_staging_coord_deploy_2026-05-17 Open Issues
         # (substrate-path-on-Fargate). Interim posture — retires when
         # strategy docs migrate to coord-mediated storage.
-        { name = "STRATEGY_SUBSTRATE_PATH", value = "/srv/strategy-substrate" },
+        { name = "STRATEGY_SUBSTRATE_PATH", value = "/srv/dev-notes/project-strategy" },
       ]
 
       secrets = [
