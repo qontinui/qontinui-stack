@@ -241,6 +241,17 @@ resource "aws_ecs_task_definition" "coord" {
       environment = [
         { name = "COORD_BIND_ADDR", value = "0.0.0.0:9870" },
         { name = "RUST_LOG", value = "qontinui_coord=info,axum=info,tower_http=info" },
+        # Strategy substrate (markdown docs) baked into the coord image at
+        # /srv/strategy-substrate (qontinui-coord PR `feat(coord): bake
+        # strategy substrate into image at /srv/strategy-substrate`).
+        # Overrides the relative-path default in `substrate_dir()` which
+        # only resolves on the local dogfood checkout. Without this env
+        # set, /strategy/docs on Fargate returns
+        # `500 substrate unreadable: No such file or directory`. Closes
+        # proj_aws_staging_coord_deploy_2026-05-17 Open Issues #N
+        # (substrate-path-on-Fargate). Interim posture — retires when
+        # strategy docs migrate to coord-mediated storage.
+        { name = "STRATEGY_SUBSTRATE_PATH", value = "/srv/strategy-substrate" },
       ]
 
       secrets = [
