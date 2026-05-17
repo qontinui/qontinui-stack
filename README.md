@@ -117,6 +117,91 @@ PGPASSWORD=qontinui_dev_password pg_dump -h <host> -p 5433 -U qontinui_user qont
 A scheduled cron that uploads to S3 (or to MinIO + offsite mirror) is on the
 roadmap (topology plan §10).
 
+## Coord redeploy procedure
+
+The `coord` service builds from `../qontinui-coord/Dockerfile` and is
+referenced in compose as `qontinui-canonical-coord:latest`. **Every
+`docker compose build coord` retags `:latest` to the freshly-built image,
+and Docker prunes the previous `:latest`'s underlying layers** (no tag
+references them any more). The live container keeps running on its
+already-extracted rootfs, but the image it was created from is gone from
+the content store. That is the ":latest tag landmine":
+
+- Any `docker compose up -d coord` rolls the new (possibly
+  DB-incompatible) binary forward with no way back.
+- A Docker daemon / host restart cannot recreate the container — there is
+  no image to recreate it from.
+- `docker commit` on the live container then fails with
+  `content digest ... not found`; recovery needs the heavier
+  `docker export | docker import` flatten (see memory
+  `feedback_docker_commit_export_import_recovery`).
+
+### Preserve before every rebuild (required step)
+
+Before **any** coord image rebuild, pin the current `:latest` as a
+distinct rollback target:
+
+```bash
+cd D:/qontinui-root/qontinui-stack
+./scripts/coord-preserve-before-rebuild.sh <deploy-name>
+# e.g. ./scripts/coord-preserve-before-rebuild.sh wave-8
+```
+
+This tags the current `:latest` as `qontinui-canonical-coord:pre-<deploy-name>-pinned`.
+The script is non-destructive (it only adds a tag), refuses to overwrite
+an existing `:pre-<deploy-name>-pinned` tag, and exits 0 with a warning
+if there is no local `:latest` to preserve. Choose a `<deploy-name>` that
+identifies the deploy (`wave-8`, `2026-06-01-coord`, the PR number — any
+`[A-Za-z0-9._-]` string).
+
+Then rebuild and roll forward:
+
+```bash
+docker compose build coord
+docker compose up -d coord
+docker compose logs -f coord   # watch the healthcheck settle
+```
+
+### Rollback
+
+If the new binary misbehaves (DB incompatibility, regression, failed
+healthcheck), repin compose to the preserved tag and bounce only coord:
+
+1. Edit the `coord:` service in `docker-compose.yml`:
+   `image: qontinui-canonical-coord:latest`
+   → `image: qontinui-canonical-coord:pre-<deploy-name>-pinned`
+2. `docker compose up -d coord`
+
+Rollback is container-only and non-disruptive to the rest of the stack.
+Revert the compose edit once a corrected image is rebuilt and verified.
+
+### Cleaning up old preserved tags
+
+Preserved tags accumulate (`docker images qontinui-canonical-coord`).
+Keep the **two most recent** `:pre-*-pinned` tags (current rollback target
++ one prior) and delete older ones during routine maintenance (weekly, or
+after two consecutive deploys have proven stable):
+
+```bash
+docker rmi qontinui-canonical-coord:pre-<old-deploy-name>-pinned
+```
+
+Before deleting any tag, confirm it is not the image the live container
+is running on:
+
+```bash
+docker inspect qontinui-canonical-coord --format '{{.Image}}'
+```
+
+Removing a tag is non-destructive when another tag still references the
+same image; it only frees the image store once the *last* reference is
+gone. Never delete the tag the running container resolves to.
+
+> The preservation discipline above codifies Gap 4 of the 2026-05 rollout
+> (memory `proj_deployment_config_gaps_2026-05-rollout`). The pattern was
+> empirically validated three times by hand (`:pre-phase5-pinned`,
+> `:pre-config-session-pinned`) before being scripted.
+
 ## Migrator
 
 The `migrator` service is a one-shot container that runs `alembic upgrade head`
