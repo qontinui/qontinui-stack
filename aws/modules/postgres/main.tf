@@ -1,17 +1,17 @@
 # RDS Postgres 16 with pgvector. Master credentials live in Secrets Manager;
 # the coord task pulls them from there at runtime via the ECS task role.
 
-variable "environment"           { type = string }
-variable "vpc_id"                { type = string }
-variable "subnet_ids"            { type = list(string) }
-variable "data_plane_sg_id"      { type = string }
-variable "client_sg_id"          { type = string }
-variable "instance_class"        { type = string }
-variable "allocated_storage_gb"  { type = number }
+variable "environment" { type = string }
+variable "vpc_id" { type = string }
+variable "subnet_ids" { type = list(string) }
+variable "data_plane_sg_id" { type = string }
+variable "client_sg_id" { type = string }
+variable "instance_class" { type = string }
+variable "allocated_storage_gb" { type = number }
 variable "max_allocated_storage" { type = number }
-variable "username"              { type = string }
-variable "db_name"               { type = string }
-variable "multi_az"              { type = bool }
+variable "username" { type = string }
+variable "db_name" { type = string }
+variable "multi_az" { type = bool }
 variable "backup_retention_days" { type = number }
 
 resource "random_password" "master" {
@@ -48,6 +48,17 @@ resource "aws_db_parameter_group" "main" {
   name        = "qontinui-${var.environment}-pg16"
   family      = "postgres16"
   description = "qontinui canonical PG; idle timeout + keepalives"
+
+  # coord's tokio-postgres ships no TLS connector (NoTls) — matches its
+  # plaintext docker-compose/canonical design. RDS defaults force_ssl=1.
+  # The data plane is already isolated (private subnets; data_plane SG
+  # only accepts the client SG), so plaintext-in-VPC is the correct
+  # staging alignment. Re-enabling needs a coord tokio-postgres-rustls
+  # code change (tracked follow-up). Dynamic param — applies w/o reboot.
+  parameter {
+    name  = "rds.force_ssl"
+    value = "0"
+  }
 
   parameter {
     name  = "idle_in_transaction_session_timeout"
@@ -87,18 +98,18 @@ resource "aws_db_instance" "main" {
   db_subnet_group_name   = aws_db_subnet_group.main.name
   parameter_group_name   = aws_db_parameter_group.main.name
 
-  multi_az                = var.multi_az
-  publicly_accessible     = false
-  backup_retention_period = var.backup_retention_days
-  backup_window           = "03:00-04:00"
-  maintenance_window      = "sun:04:30-sun:05:30"
-  deletion_protection     = false        # staging — flip to true in prod
-  skip_final_snapshot     = true         # staging — flip to false in prod
-  apply_immediately       = false
+  multi_az                   = var.multi_az
+  publicly_accessible        = false
+  backup_retention_period    = var.backup_retention_days
+  backup_window              = "03:00-04:00"
+  maintenance_window         = "sun:04:30-sun:05:30"
+  deletion_protection        = false # staging — flip to true in prod
+  skip_final_snapshot        = true  # staging — flip to false in prod
+  apply_immediately          = false
   auto_minor_version_upgrade = true
 
-  performance_insights_enabled = false   # staging — enable in prod for $7/mo
-  monitoring_interval          = 0       # staging — enable enhanced mon in prod
+  performance_insights_enabled = false # staging — enable in prod for $7/mo
+  monitoring_interval          = 0     # staging — enable enhanced mon in prod
 
   enabled_cloudwatch_logs_exports = ["postgresql", "upgrade"]
 
@@ -137,6 +148,6 @@ output "master_secret_arn" {
 
 # Connection string with the password URL-encoded inline. Sensitive output.
 output "connection_string" {
-  value = "postgres://${var.username}:${urlencode(random_password.master.result)}@${aws_db_instance.main.address}:${aws_db_instance.main.port}/${var.db_name}?sslmode=require"
+  value     = "postgres://${var.username}:${urlencode(random_password.master.result)}@${aws_db_instance.main.address}:${aws_db_instance.main.port}/${var.db_name}?sslmode=disable"
   sensitive = true
 }

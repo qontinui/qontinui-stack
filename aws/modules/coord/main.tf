@@ -5,18 +5,18 @@
 # module). The task itself runs in private subnets and only accepts ALB
 # traffic.
 
-variable "environment"           { type = string }
-variable "region"                { type = string }
-variable "vpc_id"                { type = string }
-variable "public_subnet_ids"     { type = list(string) }
-variable "private_subnet_ids"    { type = list(string) }
-variable "client_sg_id"          { type = string }
-variable "alb_sg_id"             { type = string }
+variable "environment" { type = string }
+variable "region" { type = string }
+variable "vpc_id" { type = string }
+variable "public_subnet_ids" { type = list(string) }
+variable "private_subnet_ids" { type = list(string) }
+variable "client_sg_id" { type = string }
+variable "alb_sg_id" { type = string }
 
-variable "image_uri"             { type = string }
-variable "cpu"                   { type = number }
-variable "memory_mb"             { type = number }
-variable "desired_count"         { type = number }
+variable "image_uri" { type = string }
+variable "cpu" { type = number }
+variable "memory_mb" { type = number }
+variable "desired_count" { type = number }
 
 variable "database_url" {
   type      = string
@@ -30,8 +30,14 @@ variable "github_webhook_secret" {
   type      = string
   sensitive = true
 }
+variable "coord_admin_secret" {
+  type      = string
+  sensitive = true
+  # Shared with the web backend's StrategyClient. coord reads env
+  # COORD_ADMIN_SECRET to gate POST /coord/auth/service-token.
+}
 
-variable "s3_bucket_arn"         { type = string }
+variable "s3_bucket_arn" { type = string }
 
 # ─── Cluster ────────────────────────────────────────────────────────────
 
@@ -83,6 +89,16 @@ resource "aws_secretsmanager_secret_version" "webhook_secret" {
   secret_string = var.github_webhook_secret
 }
 
+resource "aws_secretsmanager_secret" "coord_admin_secret" {
+  name        = "qontinui/${var.environment}/coord/admin_secret"
+  description = "Shared admin secret for the web→coord strategy bridge (${var.environment})"
+}
+
+resource "aws_secretsmanager_secret_version" "coord_admin_secret" {
+  secret_id     = aws_secretsmanager_secret.coord_admin_secret.id
+  secret_string = var.coord_admin_secret
+}
+
 # ─── IAM ────────────────────────────────────────────────────────────────
 
 # Execution role: ECS uses this to pull the image and write logs and
@@ -115,6 +131,7 @@ data "aws_iam_policy_document" "task_exec_secrets" {
       aws_secretsmanager_secret.database_url.arn,
       aws_secretsmanager_secret.redis_url.arn,
       aws_secretsmanager_secret.webhook_secret.arn,
+      aws_secretsmanager_secret.coord_admin_secret.arn,
     ]
   }
 }
@@ -181,13 +198,14 @@ resource "aws_ecs_task_definition" "coord" {
 
       environment = [
         { name = "COORD_BIND_ADDR", value = "0.0.0.0:9870" },
-        { name = "RUST_LOG",        value = "qontinui_coord=info,axum=info,tower_http=info" },
+        { name = "RUST_LOG", value = "qontinui_coord=info,axum=info,tower_http=info" },
       ]
 
       secrets = [
-        { name = "DATABASE_URL",          valueFrom = aws_secretsmanager_secret.database_url.arn },
-        { name = "REDIS_URL",             valueFrom = aws_secretsmanager_secret.redis_url.arn },
+        { name = "DATABASE_URL", valueFrom = aws_secretsmanager_secret.database_url.arn },
+        { name = "REDIS_URL", valueFrom = aws_secretsmanager_secret.redis_url.arn },
         { name = "GITHUB_WEBHOOK_SECRET", valueFrom = aws_secretsmanager_secret.webhook_secret.arn },
+        { name = "COORD_ADMIN_SECRET", valueFrom = aws_secretsmanager_secret.coord_admin_secret.arn },
       ]
 
       logConfiguration = {
@@ -267,6 +285,11 @@ resource "aws_ecs_service" "coord" {
 
 # ─── Outputs ────────────────────────────────────────────────────────────
 
-output "cluster_name"     { value = aws_ecs_cluster.main.name }
-output "service_name"     { value = aws_ecs_service.coord.name }
+output "cluster_name" { value = aws_ecs_cluster.main.name }
+output "cluster_arn" { value = aws_ecs_cluster.main.arn }
+output "cluster_id" { value = aws_ecs_cluster.main.id }
+output "service_name" { value = aws_ecs_service.coord.name }
 output "target_group_arn" { value = aws_lb_target_group.coord.arn }
+output "target_group_arn_suffix" { value = aws_lb_target_group.coord.arn_suffix }
+output "task_exec_role_arn" { value = aws_iam_role.task_exec.arn }
+output "task_role_arn" { value = aws_iam_role.task.arn }

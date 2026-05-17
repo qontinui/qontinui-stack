@@ -24,9 +24,33 @@ output "coord_url" {
   value       = "wss://${var.coord_subdomain}.${var.domain_name}"
 }
 
+output "coord_https_url" {
+  description = "Public HTTPS base URL for coord (REST: service-token mint, /strategy, /health)."
+  value       = "https://${var.coord_subdomain}.${var.domain_name}"
+}
+
+# web_url / web_* outputs removed — web backend DEFERRED-ON-IMAGE-SLIM
+# (follow-up plan 2026-05-17-web-image-slim.md). web.staging.qontinui.io
+# DNS + ACM SAN remain provisioned (dormant) for that plan.
+
+output "migrator_task_family" {
+  description = "ECS task-def family for the canonical-DB migrator (run via aws ecs run-task; idempotent)."
+  value       = module.migrator.task_family
+}
+
+output "migrator_log_group" {
+  description = "CloudWatch log group for the canonical-DB migrator."
+  value       = module.migrator.log_group
+}
+
 output "github_webhook_url" {
   description = "URL to register in GitHub repo webhook settings."
   value       = "https://${var.coord_subdomain}.${var.domain_name}/webhooks/github"
+}
+
+output "budget_sns_topic_arn" {
+  description = "SNS topic for budget alerts — confirm the email subscription AWS sends."
+  value       = module.cost_control.sns_topic_arn
 }
 
 output "rds_endpoint" {

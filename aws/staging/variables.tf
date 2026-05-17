@@ -42,6 +42,61 @@ variable "coord_subdomain" {
   default     = "coord-staging"
 }
 
+variable "web_subdomain" {
+  description = "Subdomain for the qontinui-web backend ALB ingress."
+  type        = string
+  default     = "web-staging"
+}
+
+variable "frontend_url" {
+  description = "Vercel frontend origin — used for the web backend's CORS allow-list and absolute links."
+  type        = string
+}
+
+# ─── Web backend service ────────────────────────────────────────────────
+
+variable "web_image_uri" {
+  description = "ECR URI of the qontinui-web-backend image. Push first (built from qontinui-web origin/main — strategy proxy lives there)."
+  type        = string
+  default     = ""
+}
+
+variable "migrator_image_uri" {
+  description = "ECR URI of the canonical-DB migrator image (alembic upgrade head; built from origin/main qontinui-web alembic chain)."
+  type        = string
+}
+
+variable "web_cpu" {
+  description = "Fargate task CPU units for web. 512 = 0.5 vCPU (FastAPI + asyncpg)."
+  type        = number
+  default     = 512
+}
+
+variable "web_memory_mb" {
+  description = "Fargate task memory (MB) for web."
+  type        = number
+  default     = 1024
+}
+
+variable "web_desired_count" {
+  description = "Web task replicas. 1 for staging."
+  type        = number
+  default     = 1
+}
+
+# ─── Cost control ───────────────────────────────────────────────────────
+
+variable "budget_monthly_limit" {
+  description = "Monthly AWS Budget limit in USD."
+  type        = string
+  default     = "100"
+}
+
+variable "budget_alert_email" {
+  description = "Email for budget threshold alerts (SNS + direct). Confirm the SNS subscription email AWS sends."
+  type        = string
+}
+
 # ─── Postgres ───────────────────────────────────────────────────────────
 
 variable "postgres_instance_class" {
