@@ -14,8 +14,8 @@ variable "coord_subdomain" { type = string }
 variable "coord_target_group" { type = string }
 variable "web_subdomain" { type = string }
 variable "web_target_group" {
-  type    = string
-  default = "" # "" = web deferred; host-routing rule is not created
+  type        = string
+  description = "Target group ARN for the web Fargate service. Web is no longer deferred (slim image + cloud-control overlay live as of plan 2026-05-17-web-image-slim); the listener rule below is unconditional."
 }
 
 locals {
@@ -101,9 +101,12 @@ resource "aws_lb_listener" "https" {
 }
 
 # Host-based routing: web.<domain> → web target group. coord stays the
-# listener default (no rule needed for it).
+# listener default (no rule needed for it). Unconditional now that web
+# is live; the prior count-guard (`web_target_group == ""`) had to go
+# because the composition root passes module.web.target_group_arn which
+# is "known after apply" — count can't depend on that. Plan B if web is
+# ever re-deferred: a literal `enabled` bool input + count = enabled.
 resource "aws_lb_listener_rule" "web" {
-  count        = var.web_target_group == "" ? 0 : 1
   listener_arn = aws_lb_listener.https.arn
   priority     = 100
 

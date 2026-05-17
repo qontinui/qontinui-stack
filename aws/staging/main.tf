@@ -17,24 +17,28 @@
 #          │       │
 #          v       v
 #      RDS PG   ElastiCache Redis
-#       │  └─ db qontinui_db   (coord, Rust)
-#       └──── db qontinui_web  (web, FastAPI/Alembic — one-off migrate task)
-#                  │
-#               (also reachable from runner clients via Tailscale/VPN —
-#                see "Client connectivity" in README)
+#         │
+#         └─ db qontinui_db  ← canonical one-DB
+#              ├─ coord.*    (coord Rust reads/writes)
+#              ├─ public.*   (web models — projects, runners, sessions, …)
+#              ├─ auth.*     (web fastapi-users — users, oauth)
+#              └─ cloud.*    (cloud-control models — subscriptions, admin)
+#         (also reachable from runner clients via Tailscale/VPN — see
+#          "Client connectivity" in README)
 
 # ─── Shared secret: web↔coord strategy bridge ───────────────────────────
-# coord reads COORD_ADMIN_SECRET to gate POST /coord/auth/service-token.
-# Generated here (fresh clean-room staging — intentionally NOT mirrored
-# from the local dev .env). The web backend (deferred — see plan
-# "DEFERRED-ON-IMAGE-SLIM") will consume the same value when it ships.
+# coord reads COORD_ADMIN_SECRET to gate POST /coord/auth/service-token;
+# web mints service-tokens against that endpoint using the same value to
+# call coord's /strategy/* APIs. Generated here (fresh clean-room staging —
+# intentionally NOT mirrored from the local dev .env). Passed into both
+# module.coord and module.web from this single source of truth.
 #
-# DB topology: CANONICAL ONE-DB model. coord + (future) web share
-# `qontinui_db`; the unified qontinui-web alembic chain (run via
-# qontinui-canonical-migrator) creates `coord.*` AND `public.*`. The
-# earlier separate-`qontinui_web`-DB design was removed (it was premised
-# on coord/web schemas being independent — they are not; 45 web alembic
-# migrations build coord.*, incl. `CREATE SCHEMA coord`).
+# DB topology: CANONICAL ONE-DB model. coord + web share `qontinui_db`;
+# the unified qontinui-web alembic chain (run via qontinui-canonical-
+# migrator) creates `coord.*` + `public.*` + `auth.*` + `cloud.*`. The
+# earlier separate-`qontinui_web`-DB design was removed — coord/web
+# schemas are NOT independent; 45 web alembic migrations build coord.*,
+# incl. `CREATE SCHEMA coord`. See proj_canonical_one_db_unified_alembic.
 
 resource "random_password" "coord_admin_secret" {
   length  = 48
@@ -135,11 +139,70 @@ module "migrator" {
   database_url = replace(replace(module.postgres.connection_string, "postgres://", "postgresql://"), "%", "%%")
 }
 
-# ─── Web backend service — DEFERRED ─────────────────────────────────────
-# modules/web removed: the 13.6 GB web image is undeployable as-is and
-# the separate-DB design was premised on a wrong DB-topology framing.
-# Re-introduced (canonical one-DB; slimmed image) by the follow-up plan
-# `2026-05-17-web-image-slim.md`. Tunnel keeps dormant web-host routing.
+# ─── Web backend service (ECS Fargate) ──────────────────────────────────
+# Re-introduced 2026-05-17 by the web-image-slim plan: the slim OSS image
+# (1.91 GB, torch-free, ECR push <5 min) is layered with the proprietary
+# cloud-control package via qontinui-stack/web-prod/Dockerfile, yielding
+# the staging-prod-<sha> image that boots with cloud-control's models
+# (Subscription, AdminNotificationSettings) registered. Canonical one-DB:
+# DATABASE_URL is the same DSN as coord, scheme converted to postgresql://
+# so SQLAlchemy/asyncpg accept it. cloud-control runtime models map to
+# cloud.* tables that the qontinui-web alembic chain already created in
+# qontinui_db. See plan `2026-05-17-web-image-slim.md`.
+
+resource "random_password" "web_secret_key" {
+  length  = 48
+  special = false # 48 alphanum chars exceeds the 32-char pydantic min length; avoids escape concerns
+}
+
+module "web" {
+  source = "../modules/web"
+
+  environment        = var.environment
+  region             = var.region
+  vpc_id             = module.network.vpc_id
+  private_subnet_ids = module.network.private_subnet_ids
+  client_sg_id       = module.network.client_sg_id
+  alb_sg_id          = module.network.alb_sg_id
+
+  cluster_id = module.coord.cluster_id # reuse coord's cluster (one per env)
+
+  image_uri     = var.web_image_uri
+  cpu           = var.web_cpu
+  memory_mb     = var.web_memory_mb
+  desired_count = var.web_desired_count
+
+  # postgres module emits postgres://...?sslmode=disable. Two transforms:
+  #   1. postgres:// → postgresql:// — SQLAlchemy + asyncpg want the longer
+  #      scheme. (Migrator does the same; coord consumes the raw form OK.)
+  #   2. Strip ?sslmode=disable — qontinui-web's db/session.py only handles
+  #      sslmode=require (it strips that and configures SSL via connect_args).
+  #      For any other sslmode value the bare URL is forwarded to asyncpg
+  #      which rejects "sslmode" as an unknown kwarg with
+  #      `TypeError: connect() got an unexpected keyword argument 'sslmode'`.
+  #      Web doesn't need plaintext-vs-TLS hinting in the URL anyway: the
+  #      else branch in session.py defaults connect_args["ssl"] = False,
+  #      which is what we want against this RDS (rds.force_ssl=0; coord
+  #      already runs plaintext for the same reason). Follow-up: qontinui-web
+  #      PR to make session.py handle sslmode=disable + sslmode=prefer.
+  database_url = replace(replace(module.postgres.connection_string, "postgres://", "postgresql://"), "?sslmode=disable", "")
+
+  coord_url          = "https://${var.coord_subdomain}.${var.domain_name}"
+  coord_admin_secret = random_password.coord_admin_secret.result # same value coord uses
+  secret_key         = random_password.web_secret_key.result
+
+  frontend_url = var.frontend_url
+  backend_url  = "https://${var.web_subdomain}.${var.domain_name}"
+
+  # CORS allowlist: Vercel frontend + web's own subdomain (for same-origin
+  # fetches if any). Localhost origins intentionally excluded on staging —
+  # don't expand the staging surface to dev browsers; set ENVIRONMENT=
+  # development to use the broader defaults in app/main.py.
+  backend_cors_origins = jsonencode([
+    var.frontend_url,
+    "https://${var.web_subdomain}.${var.domain_name}",
+  ])
+}
 
 # ─── Tunnel (ALB + ACM + Route53) ───────────────────────────────────────
 
@@ -155,7 +218,7 @@ module "tunnel" {
   coord_subdomain    = var.coord_subdomain
   coord_target_group = module.coord.target_group_arn
   web_subdomain      = var.web_subdomain
-  web_target_group   = "" # web deferred; dormant host-routing (count-guarded)
+  web_target_group   = module.web.target_group_arn # web Fargate now active
 }
 
 # ─── Cost control (budget + SNS-email alert) ────────────────────────────
