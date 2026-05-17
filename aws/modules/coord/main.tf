@@ -99,6 +99,46 @@ resource "aws_secretsmanager_secret_version" "coord_admin_secret" {
   secret_string = var.coord_admin_secret
 }
 
+# JWT signing key (Ed25519 PKCS#8 PEM). Operator-staged out-of-band; this
+# data source resolves it by name at plan time.
+#
+# Why a data source, not an aws_secretsmanager_secret resource:
+#   - Mirrors the qontinui/staging/cc_token pattern — keypair material is
+#     operator-decided, terraform never sees or stores the value.
+#     Per feedback_deployment_config_gap_class: secret-management posture
+#     stays operator-decided; terraform handles wiring/IAM, not generation.
+#   - Eliminates the bootstrap chicken-and-egg of terraform-managed secret
+#     resources that need a `secret_string` at create time but a
+#     `lifecycle.ignore_changes = [secret_string]` to avoid fighting
+#     operator overwrites.
+#
+# Operator-staging recipe (run ONCE before first `terraform apply` that
+# references this data source):
+#
+#   # 1. Generate keypair (Ed25519 PKCS#8 PEM):
+#   openssl genpkey -algorithm Ed25519 -out coord-jwt.pkcs8 -outform PEM
+#
+#   # 2. Create secret with PEM as value (use file:// to avoid shell-escaping
+#   #    the multi-line PEM):
+#   aws secretsmanager create-secret \
+#     --region us-east-1 \
+#     --name qontinui/staging/coord_jwt_signing_key \
+#     --description "Ed25519 PKCS#8 PEM signing key for coord JWT issuance (staging)" \
+#     --secret-string file://coord-jwt.pkcs8
+#
+#   # 3. Securely delete the local PEM (key never leaves Secrets Manager
+#   #    after this point):
+#   shred -u coord-jwt.pkcs8     # POSIX
+#   # OR (PowerShell): Remove-Item coord-jwt.pkcs8 -Force
+#
+# Rotation: aws secretsmanager update-secret --secret-id ... --secret-string
+# file://new.pkcs8 + ECS force-new-deployment. Until automated rotation with
+# overlapping kid lands (jwt.rs §6 risk bullet), outstanding tokens minted
+# under the prior key 401 immediately. Coordinate with consumers.
+data "aws_secretsmanager_secret" "coord_jwt_signing_key" {
+  name = "qontinui/${var.environment}/coord_jwt_signing_key"
+}
+
 # ─── IAM ────────────────────────────────────────────────────────────────
 
 # Execution role: ECS uses this to pull the image and write logs and
@@ -123,7 +163,8 @@ resource "aws_iam_role_policy_attachment" "task_exec_managed" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
-# Task exec role needs to read the secrets we just created.
+# Task exec role needs to read the secrets we just created + the
+# operator-staged JWT signing key (referenced via data source above).
 data "aws_iam_policy_document" "task_exec_secrets" {
   statement {
     actions = ["secretsmanager:GetSecretValue"]
@@ -132,6 +173,7 @@ data "aws_iam_policy_document" "task_exec_secrets" {
       aws_secretsmanager_secret.redis_url.arn,
       aws_secretsmanager_secret.webhook_secret.arn,
       aws_secretsmanager_secret.coord_admin_secret.arn,
+      data.aws_secretsmanager_secret.coord_jwt_signing_key.arn,
     ]
   }
 }
@@ -206,6 +248,15 @@ resource "aws_ecs_task_definition" "coord" {
         { name = "REDIS_URL", valueFrom = aws_secretsmanager_secret.redis_url.arn },
         { name = "GITHUB_WEBHOOK_SECRET", valueFrom = aws_secretsmanager_secret.webhook_secret.arn },
         { name = "COORD_ADMIN_SECRET", valueFrom = aws_secretsmanager_secret.coord_admin_secret.arn },
+        # Companion to qontinui-coord PR `feat(jwt): load signing key from
+        # COORD_JWT_SIGNING_KEY env`. Eliminates the ephemeral-Fargate-FS
+        # JWT key regeneration that invalidated service tokens on every
+        # coord task replacement (proj_aws_staging_coord_deploy_2026-05-17
+        # Open Issues #2). Requires a coord image built from a commit that
+        # includes the env-var loading path; older images that only look at
+        # /root/.qontinui/coord-jwt-ed25519.pkcs8 ignore this env value and
+        # mint-and-persist as before — no regression, just no improvement.
+        { name = "COORD_JWT_SIGNING_KEY", valueFrom = data.aws_secretsmanager_secret.coord_jwt_signing_key.arn },
       ]
 
       logConfiguration = {
