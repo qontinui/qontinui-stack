@@ -24,6 +24,9 @@
 #   #    entries (migrated 2026-05-17 from eu-central-1 for region colocation).
 #   #    Setting `$env:AWS_DEFAULT_REGION = "us-east-1"` once in your shell
 #   #    profile is the cleaner alternative to passing --region on every call.
+#   #    The RUN below strips \r\n from the secret with `tr -d`, so it's safe
+#   #    to fetch from either a POSIX or Windows host (Windows-side `> file`
+#   #    redirects add CRLF; Linux-side adds LF only).
 #   aws secretsmanager get-secret-value --secret-id qontinui/staging/cc_token \
 #     --region us-east-1 --query SecretString --output text > /tmp/cc_token
 #
@@ -55,7 +58,7 @@ RUN apt-get update \
 # survive into the runtime image (a defense-in-depth measure even though
 # .git/ wouldn't be reachable from a running container without exec).
 RUN --mount=type=secret,id=cc_token,required=true \
-    CC_TOKEN="$(cat /run/secrets/cc_token)" \
+    CC_TOKEN="$(tr -d '\r\n' < /run/secrets/cc_token)" \
     && git clone --depth 1 \
         "https://x-access-token:${CC_TOKEN}@github.com/jspinak/qontinui-cloud-control.git" \
         /qontinui-cloud-control \
