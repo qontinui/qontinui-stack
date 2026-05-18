@@ -194,14 +194,22 @@ module "web" {
   frontend_url = var.frontend_url
   backend_url  = "https://${var.web_subdomain}.${var.domain_name}"
 
-  # CORS allowlist: Vercel frontend + web's own subdomain (for same-origin
-  # fetches if any). Localhost origins intentionally excluded on staging —
-  # don't expand the staging surface to dev browsers; set ENVIRONMENT=
-  # development to use the broader defaults in app/main.py.
-  backend_cors_origins = jsonencode([
-    var.frontend_url,
-    "https://${var.web_subdomain}.${var.domain_name}",
-  ])
+  # CORS allowlist:
+  #   - exact list: Vercel frontend (qontinui.io etc.). Apex domains
+  #     can't be expressed by the staging-subtree regex, so they stay
+  #     exact-match.
+  #   - regex: any subdomain of `staging.qontinui.io`. Covers
+  #     `web.staging.qontinui.io` (own backend), `demo.staging.qontinui.io`
+  #     (coordination-layer demo), and any future preview / test
+  #     subdomain — no task-def revision needed when a new subdomain
+  #     is provisioned.
+  # The anchored `^...$` + per-component charset `[a-z0-9-]+` reject
+  # suffix-attack origins like `staging.qontinui.io.attacker.com`.
+  # Localhost origins intentionally excluded on staging — don't expand
+  # the staging surface to dev browsers; set ENVIRONMENT=development
+  # to use the broader defaults in app/main.py.
+  backend_cors_origins      = jsonencode([var.frontend_url])
+  backend_cors_origin_regex = "^https://([a-z0-9-]+\\.)*${replace(var.domain_name, ".", "\\.")}$"
 }
 
 # ─── Tunnel (ALB + ACM + Route53) ───────────────────────────────────────
