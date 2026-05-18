@@ -73,6 +73,11 @@ variable "backend_cors_origins" {
   type        = string
   description = "JSON array of CORS-allowed origins. Pydantic parses with json.loads when value starts with '['."
 }
+variable "backend_cors_origin_regex" {
+  type        = string
+  default     = ""
+  description = "Optional regex pattern for CORS-allowed origins (in addition to backend_cors_origins). An origin matching either the exact list OR this regex is permitted. Decouples backend deploys from frontend domain provisioning — any subdomain matching the pattern works without a task-def revision. Empty string = exact list only."
+}
 
 # ─── Security group rule: ALB → web on 8000 ─────────────────────────────
 # The shared client_sg only opens port 9870 (coord) from the ALB by default
@@ -214,6 +219,7 @@ resource "aws_ecs_task_definition" "web" {
         { name = "FRONTEND_URL", value = var.frontend_url },
         { name = "BACKEND_URL", value = var.backend_url },
         { name = "BACKEND_CORS_ORIGINS", value = var.backend_cors_origins },
+        { name = "BACKEND_CORS_ORIGIN_REGEX", value = var.backend_cors_origin_regex },
         { name = "REDIS_ENABLED", value = "false" },
         { name = "RATE_LIMIT_ENABLED", value = "true" },
         { name = "USE_SES_API", value = "false" },
