@@ -63,16 +63,20 @@ Modules don't change.
 * AWS CLI configured (`aws configure`) with credentials that can create
   VPC/RDS/ElastiCache/ECS/S3/IAM/ACM/Route53 resources.
 * A Route53 hosted zone for the domain you'll attach (e.g. `qontinui.io`).
-* The `qontinui-canonical-coord` Docker image pushed to ECR (the module
-  expects an `image_uri` variable; `staging/main.tf` defaults to ECR
-  `qontinui-coord:staging`). Push command in `scripts/push-coord-image.sh`.
+* The `qontinui-canonical-coord` Docker image pushed to ECR (see
+  "Coord deploys" below). The terraform module expects an `image_uri`
+  variable; `staging/main.tf` defaults to ECR `qontinui-coord:staging`.
+  Real deploys SHA-pin the task definition revision via
+  `scripts/push-coord-image.sh`; terraform's `:staging` default is used
+  only for the initial bring-up.
 
 ## First apply
 
 ```bash
 cd qontinui-stack/aws/staging
 cp terraform.tfvars.example terraform.tfvars
-# edit terraform.tfvars — domain name, hosted zone id, image tag
+# edit terraform.tfvars — domain name, hosted zone id
+bash ../scripts/push-coord-image.sh   # first push, registers + deploys
 terraform init
 terraform plan
 terraform apply
@@ -81,6 +85,37 @@ terraform apply
 Output includes the staging `database_url`, `redis_url`, and `coord_url`.
 Stash them into a new `staging` profile in `~/.qontinui/profiles.json`,
 then `qontinui_profile use staging` to switch.
+
+## Coord deploys (ongoing)
+
+For routine coord changes, do NOT re-run `terraform apply`. The push
+script registers a new task definition revision pinned to the commit
+SHA and updates the ECS service directly:
+
+```bash
+# From a checkout of qontinui-coord on the commit you want to ship:
+cd qontinui-coord
+git status   # must be clean — the script fails on dirty trees
+cd ../qontinui-stack
+AWS_REGION=us-east-1 ENVIRONMENT=staging \
+    bash aws/scripts/push-coord-image.sh
+```
+
+The script:
+
+1. Computes the short commit SHA from the qontinui-coord checkout.
+2. Builds linux/amd64 + pushes both `:<sha>` and `:staging` to ECR.
+3. Registers a new task definition revision pinned at `:<sha>`.
+4. Updates the ECS service + waits for rollout completion.
+
+Why SHA-pin instead of letting ECS chase `:staging`? Two reasons:
+rollback (`aws ecs update-service --task-definition <family>:<old-rev>`
+is one command if you know the SHA), and audit (every task definition
+revision records the exact image it ran). The `:staging` alias is kept
+moving so first-time `terraform apply` works without a separate push.
+
+To dry-run (push image + register revision, skip the service update):
+`SKIP_DEPLOY=1 bash aws/scripts/push-coord-image.sh`.
 
 ## On/off ritual (cost control)
 
