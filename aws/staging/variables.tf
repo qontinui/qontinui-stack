@@ -152,8 +152,16 @@ variable "redis_node_type" {
 # ─── Coord service ──────────────────────────────────────────────────────
 
 variable "coord_image_uri" {
-  description = "ECR URI of the qontinui-canonical-coord image. Push via scripts/push-coord-image.sh first."
-  type        = string
+  description = <<-EOT
+    ECR URI of the qontinui-canonical-coord image. Used ONLY by the
+    initial `terraform apply` that creates the task definition; ongoing
+    coord deploys SHA-pin a fresh revision via
+    `scripts/push-coord-image.sh` + `aws ecs update-service`. The
+    script tags every build as both `:<sha>` and `:staging`, so leaving
+    this at `:staging` in terraform.tfvars is safe — terraform won't
+    be re-applied for image changes.
+  EOT
+  type    = string
   # Default left empty so a missed push surfaces immediately at apply time.
   default = ""
 }
