@@ -1,6 +1,10 @@
 .env
 *.log
 
+# Per-session scratch (AWS provisioning artifacts, policy JSON drafts, etc.).
+# Never commit — credentials and one-shot resources land here transiently.
+tmp_*
+
 # pg_dump artifacts from seeding the canonical PG from the legacy stack —
 # can be hundreds of MB. Regenerate locally via scripts/seed-from-legacy.sh
 # whenever needed; never commit.
