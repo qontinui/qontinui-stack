@@ -235,6 +235,19 @@ add the dep to `migrator/pyproject.toml` and rebuild.
 
 Pre-2026-04-30, the migrator failed against existing DBs because the alembic chain had revisions past `e8a3c5b9d142` that depended on tables created by the runner-native `MIGRATIONS` array — a dual-migration-system drift. **Resolved by the migration consolidation** (qontinui-web PR #11, merged 2026-04-30). The alembic chain now owns every table; the migrator runs clean against fresh and seeded canonical DBs. Kept here as historical context for anyone who finds an old branch with the old behavior.
 
+## Cross-machine sccache (shared S3)
+
+The in-stack `sccache` service (above) caches into the in-stack MinIO bucket
+`qontinui-sccache` — fine for builders living inside the stack network, but
+developer machines (spaceship, MSI, future build hosts) hit a separate
+shared real-AWS S3 bucket so they all read/write the same artifact store
+across the LAN/internet. Operator-side setup, per-machine env, rotation:
+
+- [`docs/sccache-cross-machine.md`](docs/sccache-cross-machine.md)
+
+The two lanes coexist: in-stack MinIO stays for the docker-compose-only
+path, AWS S3 lane is purely additive for host-machine builds.
+
 ## Promotion path
 
 This stack runs identically (different infrastructure, same shape) on AWS for
