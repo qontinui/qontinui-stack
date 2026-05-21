@@ -149,6 +149,70 @@ Then run a trivial cargo build (`cargo check` in any workspace member) and
 inspect `sccache --show-stats`. The S3 `Requests sent` counter should
 increment.
 
+## Verifying the cross-machine win
+
+Phase 2.3 ships a repeatable mechanism so the cycle-time payoff is *measured*,
+not eyeballed once (memory: `feedback_build_verification_over_manual_observation`).
+The script is `scripts/verify-sccache-cross-machine.sh`.
+
+It has two roles run on two machines against the **same source state** with the
+same `SCCACHE_*` / `AWS_*` env exported (see *Per-machine setup* above):
+
+```bash
+# Machine A (the one that already built — populates S3):
+./scripts/verify-sccache-cross-machine.sh --role producer
+
+# Machine B (a different machine — should pull A's artifacts from S3):
+./scripts/verify-sccache-cross-machine.sh --role consumer
+```
+
+- **producer** builds cold and uploads compile units to S3, then prints the
+  exact consumer command to run on the other machine.
+- **consumer** builds into a fresh empty target dir (so every compile unit must
+  be resolved from cache, not a stale local `target/`) and **asserts the
+  cache-hit rate clears 80%** — the plan's Stream-2 termination predicate. Exit
+  0 = pass, exit 1 = fail (with a diagnosis of the likely cause: differing
+  source state, `--remap-path-prefix` mismatch, or the producer never ran).
+
+By default the script generates a small deterministic synthetic probe crate
+(serde + tokio + serde_json) under `$TMPDIR` so there are real rustc
+invocations to cache without depending on a heavy workspace member. Pass
+`--crate <path>` to build a real member (e.g. `--crate ../../qontinui-coord`)
+for a heavier signal. `--threshold <pct>` overrides the 80% gate.
+
+`--dry-run` validates env + tooling + args and prints what *would* run without
+touching S3 — use it as a per-machine readiness check before committing to a
+long build:
+
+```bash
+./scripts/verify-sccache-cross-machine.sh --dry-run   # exits 0 if configured, 1 if not
+```
+
+### Single-machine substrate proof (no second machine needed)
+
+Running `--role producer` then `--role consumer` on the **same** machine still
+proves the shared backend works end-to-end: the consumer builds into a fresh
+empty target dir, so its hits can *only* come from S3 (the cold producer
+uploaded them). Both upload and download paths are exercised. This is what
+Phase 2.3 ran on spaceship while MSI was offline.
+
+Measured on spaceship 2026-05-22 (sccache 0.15.0, synthetic probe):
+
+| Build | Wall-clock | Cache hits | Hit rate |
+|---|---|---|---|
+| Cold (empty S3, populates bucket) | 15.28 s | 0 / 21 | 0 % |
+| Warm (fresh local target, reads S3) | 9.01 s | 18 / 21 | **85.71 %** |
+
+The 21 compile units uploaded on the cold build were confirmed present in
+`s3://qontinui-sccache-shared/` (object count went 0 → 21 → 24). The 3 residual
+misses on warm are the path-dependent units (the bin crate itself) — expected,
+and the reason `--remap-path-prefix` matters for getting the cross-machine
+number above 80% when worktree paths differ between machines.
+
+**Cross-machine (spaceship → MSI) is the true number and is PENDING MSI being
+online.** The substrate is verified single-machine; run the producer/consumer
+pair above on both machines to capture the two-machine figure.
+
 ## Coexistence with the in-stack MinIO
 
 | Lane | Backend | Bucket | Who uses it |
