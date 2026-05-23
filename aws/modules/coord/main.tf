@@ -320,6 +320,39 @@ resource "aws_lb_target_group" "coord" {
   deregistration_delay = 30
 }
 
+# ─── HA Phase C — replica count, Fargate storage, and Multi-AZ notes ───────
+#
+# (a) SCRIPT-DRIVEN COUNT vs TERRAFORM
+#     desired_count here sets the baseline that Terraform writes on first
+#     apply.  Because of `lifecycle { ignore_changes = [desired_count] }` the
+#     LIVE running count is owned by the replica-management stop/start scripts
+#     (aws/scripts/staging-stop.sh + staging-start.sh).  `terraform apply`
+#     will NOT reset the count after the service exists.  To promote a new
+#     baseline: update var.desired_count AND run
+#       terraform apply -target=module.coord.aws_ecs_service.coord
+#     OR set the count via `aws ecs update-service --desired-count N`.
+#
+# (b) FARGATE EPHEMERAL STORAGE — MANDATORY C.1 BOOTSTRAP ON EVERY PLACEMENT
+#     Fargate tasks have NO persistent local disk.  Every task replacement
+#     (ECS stops a task and schedules a new one) starts with an EMPTY git
+#     store.  The Phase C.1 standby bootstrap — cloning canonical repos from
+#     the current leader via the coord git-http API — is therefore MANDATORY
+#     on EVERY task start, not only the first boot.  The metric
+#     `coord_git_replica_bootstrap_seconds` must be measured against the
+#     largest repo to gate the Fargate-vs-EC2+EBS store decision (see
+#     HA-PHASE-C-STORE-DECISION.md in this directory).
+#
+# (c) MULTI-AZ — depends on private_subnet_ids spanning >=2 AZs
+#     ECS Fargate spreads tasks across the subnets listed in
+#     network_configuration.subnets.  Multi-AZ placement is guaranteed only
+#     when those subnets cover >=2 availability zones.  The staging network
+#     module uses az_count=2 (default), producing two private subnets — one
+#     per AZ (us-east-1a + us-east-1b).  If az_count is ever reduced to 1,
+#     Multi-AZ placement is lost silently; do NOT do this on a live HA
+#     cluster.  The nat_gateway is in AZ[0] only (cost optimization);
+#     prod should add one NAT per AZ for full AZ-failure isolation.
+# ─────────────────────────────────────────────────────────────────────────────
+
 resource "aws_ecs_service" "coord" {
   name            = "coord"
   cluster         = aws_ecs_cluster.main.id
