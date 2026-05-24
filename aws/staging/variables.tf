@@ -179,9 +179,26 @@ variable "coord_memory_mb" {
 }
 
 variable "coord_desired_count" {
-  description = "Number of coord task replicas. 1 for staging, ≥2 + Multi-AZ for prod."
+  description = <<-EOT
+    DESIRED BASELINE replica count for the coord ECS service (HA Phase C).
+    Default raised to 2 so Terraform provisions the service with at least two
+    tasks spread across the two private subnets (one per AZ — see az_count).
+
+    IMPORTANT — this value is the baseline written into the Terraform state.
+    The LIVE running count is managed operationally by the replica-management
+    stop/start scripts (aws/scripts/staging-stop.sh + staging-start.sh), which
+    call `aws ecs update-service --desired-count N` directly.  Because the ECS
+    service resource has `lifecycle { ignore_changes = [desired_count] }`,
+    running `terraform apply` will NOT override whatever count the scripts last
+    set.  The baseline here only takes effect on a fresh `terraform apply`
+    against a service that does not yet exist, or after an explicit
+    `terraform apply -target=module.coord.aws_ecs_service.coord`.
+
+    Cross-reference: HA Phase C plan — coord HA Phase C.6 (multi-AZ replica
+    baseline + chaos validation).
+  EOT
   type        = number
-  default     = 1
+  default     = 2
 }
 
 variable "coord_github_webhook_secret" {
