@@ -37,6 +37,60 @@ variable "coord_admin_secret" {
   # COORD_ADMIN_SECRET to gate POST /coord/auth/service-token.
 }
 
+# ─── Non-secret env literals ──────────────────────────────────────────────
+# These are plain configuration values (not credentials) injected as task
+# `environment` entries. Defaults match the LIVE staging task-def
+# (qontinui-coord/deploy/taskdef.staging.json) so a `terraform plan` is a
+# no-op against the running service; override per-environment as needed.
+
+variable "coord_sso_default_role" {
+  type        = string
+  default     = "operator"
+  description = "COORD_SSO_DEFAULT_ROLE — role assigned to SSO-authenticated users lacking an explicit mapping."
+}
+
+variable "coord_sso_default_tenant" {
+  type        = string
+  default     = "default"
+  description = "COORD_SSO_DEFAULT_TENANT — tenant assigned to SSO-authenticated users lacking an explicit mapping."
+}
+
+variable "coord_oidc_audience" {
+  type        = string
+  default     = "1r83igrltq3hfko2fnifhmjvvk"
+  description = "COORD_OIDC_AUDIENCE — expected `aud` claim (Cognito app-client id) for SSO ID tokens."
+}
+
+variable "coord_oidc_issuer" {
+  type        = string
+  default     = "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_rgTB9dbZ1"
+  description = "COORD_OIDC_ISSUER — OIDC issuer URL (Cognito user-pool) for SSO ID-token validation."
+}
+
+variable "coord_ecs_auto_recover" {
+  type        = string
+  default     = "1"
+  description = "ECS_AUTO_RECOVER — when set, coord runs its self-recovery routines on boot in the ECS/Fargate environment."
+}
+
+variable "coord_vercel_watch_projects" {
+  type        = string
+  default     = "[{\"name\":\"qontinui-web\",\"github_repo\":\"qontinui/qontinui-web\",\"branch\":\"main\",\"root_directory\":\"frontend\"}]"
+  description = "VERCEL_WATCH_PROJECTS — JSON array of Vercel projects coord watches for deploy-hook firing."
+}
+
+variable "coord_github_app_id" {
+  type        = string
+  default     = "3825026"
+  description = "GITHUB_APP_ID — public GitHub App identifier (not a secret). Paired with the github_app_private_key secret for App auth."
+}
+
+variable "coord_github_app_installation_id" {
+  type        = string
+  default     = "134903706"
+  description = "GITHUB_APP_INSTALLATION_ID — public GitHub App installation identifier (not a secret)."
+}
+
 variable "s3_bucket_arn" { type = string }
 
 # Phase 8 cold-tier PTY-output bucket. coord is the sole writer/reader; the
@@ -152,6 +206,53 @@ data "aws_secretsmanager_secret" "coord_jwt_signing_key" {
   name = "qontinui/${var.environment}/coord_jwt_signing_key"
 }
 
+# GitHub App private key (RSA PKCS#1/#8 PEM). Same operator-staged keypair
+# posture as coord_jwt_signing_key above: terraform never sees or stores the
+# PEM, it only resolves the secret by name (for IAM wiring) and references the
+# ARN in the task-def. Lives under the module-owned `qontinui/staging/coord/*`
+# namespace (live ARN suffix `-EbMtNa`).
+#
+# Operator-staging recipe (run ONCE before the first apply/deploy that
+# references this data source):
+#
+#   # 1. Download the App's private key (.pem) from the GitHub App settings
+#   #    page (Settings → Developer settings → GitHub Apps → <app> →
+#   #    "Generate a private key"). App id 3825026, installation 134903706.
+#   # 2. Create the secret (file:// avoids shell-escaping the multi-line PEM):
+#   aws secretsmanager create-secret \
+#     --region us-east-1 \
+#     --name qontinui/staging/coord/github_app_private_key \
+#     --description "GitHub App private key (PEM) for qontinui-coord (staging)" \
+#     --secret-string file://github-app.private-key.pem
+#   # 3. Securely delete the local PEM.
+#
+# Rotation: update-secret + ECS force-new-deployment (coord reads the PEM at
+# boot via GITHUB_APP_PRIVATE_KEY).
+data "aws_secretsmanager_secret" "github_app_private_key" {
+  name = "qontinui/${var.environment}/coord/github_app_private_key"
+}
+
+# Externally-created secrets (NOT managed by this module). These predate the
+# module and live under the `qontinui-coord-staging/*` name prefix; terraform
+# resolves them by name to wire IAM + task-def `valueFrom` without owning their
+# lifecycle or values. The github-oauth secret is a JSON document — individual
+# keys are projected with the `:<json-key>::` valueFrom suffix in the task-def.
+data "aws_secretsmanager_secret" "github_oauth" {
+  name = "qontinui-coord-${var.environment}/github-oauth"
+}
+
+data "aws_secretsmanager_secret" "github_token" {
+  name = "qontinui-coord-${var.environment}/github-token"
+}
+
+data "aws_secretsmanager_secret" "vercel_deploy_hooks" {
+  name = "qontinui-coord-${var.environment}/vercel-deploy-hooks"
+}
+
+data "aws_secretsmanager_secret" "nats_url" {
+  name = "qontinui-coord-${var.environment}/nats-url"
+}
+
 # ─── IAM ────────────────────────────────────────────────────────────────
 
 # Execution role: ECS uses this to pull the image and write logs and
@@ -176,8 +277,13 @@ resource "aws_iam_role_policy_attachment" "task_exec_managed" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
-# Task exec role needs to read the secrets we just created + the
-# operator-staged JWT signing key (referenced via data source above).
+# Task exec role needs to read every secret the task-def references at
+# launch time: the four module-created secrets, the operator-staged JWT
+# signing key + GitHub App private key, and the four externally-created
+# `qontinui-coord-staging/*` secrets (all via data sources above). Mirrors the
+# live exec-role policy (11 secret ARNs). GetSecretValue on the bare secret ARN
+# covers JSON-key projections (github-oauth) too — the `:key::` suffix is a
+# task-def valueFrom concern, not an IAM resource.
 data "aws_iam_policy_document" "task_exec_secrets" {
   statement {
     actions = ["secretsmanager:GetSecretValue"]
@@ -187,6 +293,11 @@ data "aws_iam_policy_document" "task_exec_secrets" {
       aws_secretsmanager_secret.webhook_secret.arn,
       aws_secretsmanager_secret.coord_admin_secret.arn,
       data.aws_secretsmanager_secret.coord_jwt_signing_key.arn,
+      data.aws_secretsmanager_secret.github_app_private_key.arn,
+      data.aws_secretsmanager_secret.github_oauth.arn,
+      data.aws_secretsmanager_secret.github_token.arn,
+      data.aws_secretsmanager_secret.vercel_deploy_hooks.arn,
+      data.aws_secretsmanager_secret.nats_url.arn,
     ]
   }
 }
@@ -295,9 +406,16 @@ resource "aws_ecs_task_definition" "coord" {
         protocol      = "tcp"
       }]
 
+      # Reconciled to the full live env set (11 entries) from
+      # qontinui-coord/deploy/taskdef.staging.json. All non-secret literals;
+      # values are module variables defaulted to the live staging values so a
+      # `terraform plan` is a no-op against the running revision.
       environment = [
         { name = "COORD_BIND_ADDR", value = "0.0.0.0:9870" },
-        { name = "RUST_LOG", value = "qontinui_coord=info,axum=info,tower_http=info" },
+        { name = "COORD_SSO_DEFAULT_ROLE", value = var.coord_sso_default_role },
+        { name = "COORD_SSO_DEFAULT_TENANT", value = var.coord_sso_default_tenant },
+        { name = "COORD_OIDC_AUDIENCE", value = var.coord_oidc_audience },
+        { name = "COORD_OIDC_ISSUER", value = var.coord_oidc_issuer },
         # Strategy substrate (markdown docs) baked into the coord image as
         # the full qontinui-dev-notes repo at /srv/dev-notes (qontinui-coord
         # PRs #40 `a9c1b07` + #41 `a4e3155` + #42 — the last preserves .git/
@@ -312,8 +430,21 @@ resource "aws_ecs_task_definition" "coord" {
         # (substrate-path-on-Fargate). Interim posture — retires when
         # strategy docs migrate to coord-mediated storage.
         { name = "STRATEGY_SUBSTRATE_PATH", value = "/srv/dev-notes/project-strategy" },
+        { name = "ECS_AUTO_RECOVER", value = var.coord_ecs_auto_recover },
+        { name = "RUST_LOG", value = "qontinui_coord=info,axum=info,tower_http=info" },
+        { name = "VERCEL_WATCH_PROJECTS", value = var.coord_vercel_watch_projects },
+        # GitHub App identifiers are PUBLIC (not secrets); the App private key
+        # is the secret (see secrets[] below).
+        { name = "GITHUB_APP_ID", value = var.coord_github_app_id },
+        { name = "GITHUB_APP_INSTALLATION_ID", value = var.coord_github_app_installation_id },
       ]
 
+      # Reconciled to the full live secret set (11 entries) from
+      # qontinui-coord/deploy/taskdef.staging.json. Four module-created secrets,
+      # two operator-staged keypair secrets (JWT + GitHub App), four
+      # externally-created `qontinui-coord-staging/*` secrets (resolved via data
+      # sources above). github-oauth is a JSON secret; client_id/client_secret
+      # are projected with the `:key::` valueFrom suffix.
       secrets = [
         { name = "DATABASE_URL", valueFrom = aws_secretsmanager_secret.database_url.arn },
         { name = "REDIS_URL", valueFrom = aws_secretsmanager_secret.redis_url.arn },
@@ -328,6 +459,16 @@ resource "aws_ecs_task_definition" "coord" {
         # /root/.qontinui/coord-jwt-ed25519.pkcs8 ignore this env value and
         # mint-and-persist as before — no regression, just no improvement.
         { name = "COORD_JWT_SIGNING_KEY", valueFrom = data.aws_secretsmanager_secret.coord_jwt_signing_key.arn },
+        # GitHub App private key (PEM). Pairs with GITHUB_APP_ID /
+        # GITHUB_APP_INSTALLATION_ID env above for App-based GitHub auth.
+        { name = "GITHUB_APP_PRIVATE_KEY", valueFrom = data.aws_secretsmanager_secret.github_app_private_key.arn },
+        # github-oauth is a JSON secret; project individual keys with the
+        # `:<json-key>::` valueFrom suffix (ECS Secrets Manager JSON support).
+        { name = "GITHUB_OAUTH_CLIENT_ID", valueFrom = "${data.aws_secretsmanager_secret.github_oauth.arn}:client_id::" },
+        { name = "GITHUB_OAUTH_CLIENT_SECRET", valueFrom = "${data.aws_secretsmanager_secret.github_oauth.arn}:client_secret::" },
+        { name = "GITHUB_TOKEN", valueFrom = data.aws_secretsmanager_secret.github_token.arn },
+        { name = "VERCEL_DEPLOY_HOOKS", valueFrom = data.aws_secretsmanager_secret.vercel_deploy_hooks.arn },
+        { name = "NATS_URL", valueFrom = data.aws_secretsmanager_secret.nats_url.arn },
       ]
 
       logConfiguration = {
@@ -434,8 +575,20 @@ resource "aws_ecs_service" "coord" {
 
   enable_execute_command = true # SSM Session Manager into a running task
 
+  # TF/CI seam (mirrors module.web, qontinui-stack PR #17). Terraform owns the
+  # canonical task-def DEFINITION (aws_ecs_task_definition.coord above:
+  # cpu/memory/env/secrets/IAM/log) and all provisioning. CI / the coord deploy
+  # path (aws/scripts/push-coord-image.sh + `aws ecs update-service`) owns
+  # DEPLOYMENT: it registers a fresh SHA-pinned revision (inheriting this
+  # canonical definition) and points the service at it. Terraform must NOT
+  # revert the service's task_definition pointer to its own revision — that
+  # would undo every coord deploy. The canonical definition stays live because
+  # the deploy path inherits it; TF-side task-def changes (a new secret, an env)
+  # take effect on the next deploy. desired_count stays script-owned (replica
+  # stop/start). `terraform apply` is a human-gated provisioning op that never
+  # touches the running revision.
   lifecycle {
-    ignore_changes = [desired_count] # let stop/start scripts manage replicas
+    ignore_changes = [task_definition, desired_count]
   }
 
   depends_on = [aws_lb_target_group.coord]
