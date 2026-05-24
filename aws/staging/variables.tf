@@ -206,3 +206,11 @@ variable "coord_github_webhook_secret" {
   type        = string
   sensitive   = true
 }
+
+# ─── Cold-tier session output (Phase 8) ─────────────────────────────────
+
+variable "session_output_cold_ttl_days" {
+  description = "Days after which a cold-tier PTY-output session object expires (S3 lifecycle). Phase 8 default is 90."
+  type        = number
+  default     = 90
+}

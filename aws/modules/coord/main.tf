@@ -39,6 +39,19 @@ variable "coord_admin_secret" {
 
 variable "s3_bucket_arn" { type = string }
 
+# Phase 8 cold-tier PTY-output bucket. coord is the sole writer/reader; the
+# policy below is scoped to ONLY this bucket and its objects.
+variable "session_output_cold_bucket_arn" {
+  type        = string
+  description = "ARN of the cold-tier session-output S3 bucket (Phase 8). coord writes one object per shared session and reads them back for the dashboard xterm pane."
+}
+
+variable "session_output_cold_key_prefix" {
+  type        = string
+  default     = "tenant/"
+  description = "Fixed key prefix all cold-tier objects live under (tenant/<tenant_id>/session/<session_id>.log). Scopes s3:ListBucket so coord can only enumerate session-output keys."
+}
+
 # ─── Cluster ────────────────────────────────────────────────────────────
 
 resource "aws_ecs_cluster" "main" {
@@ -208,6 +221,50 @@ data "aws_iam_policy_document" "task_blob" {
 resource "aws_iam_role_policy" "task_blob" {
   role   = aws_iam_role.task.id
   policy = data.aws_iam_policy_document.task_blob.json
+}
+
+# Phase 8 cold-tier session-output access. Deliberately a SEPARATE, narrower
+# policy from task_blob (not folded in) so the cold-tier grant stays auditable
+# and minimal:
+#   - Object actions: GetObject + PutObject only. No DeleteObject — objects are
+#     immutable per session and expiry is owned by the bucket's 90-day
+#     lifecycle rule, not by coord. (Per-tenant cold quota is enforced
+#     coord-side by refusing new PutObjects once the tenant's summed object
+#     size exceeds its limit — see docs/session-output-cold-tier.md. S3 has no
+#     native per-prefix quota, so this is an application-level check.)
+#   - ListBucket: scoped with an s3:prefix condition to the `tenant/` key
+#     namespace so coord can enumerate session-output keys (for quota
+#     accounting) but cannot list anything else that might land in the bucket.
+data "aws_iam_policy_document" "task_session_output_cold" {
+  statement {
+    sid = "SessionOutputColdObjects"
+    actions = [
+      "s3:GetObject",
+      "s3:PutObject",
+    ]
+    resources = [
+      "${var.session_output_cold_bucket_arn}/${var.session_output_cold_key_prefix}*",
+    ]
+  }
+
+  statement {
+    sid     = "SessionOutputColdListScoped"
+    actions = ["s3:ListBucket"]
+    resources = [
+      var.session_output_cold_bucket_arn,
+    ]
+    condition {
+      test     = "StringLike"
+      variable = "s3:prefix"
+      values   = ["${var.session_output_cold_key_prefix}*"]
+    }
+  }
+}
+
+resource "aws_iam_role_policy" "task_session_output_cold" {
+  name   = "qontinui-${var.environment}-coord-session-output-cold"
+  role   = aws_iam_role.task.id
+  policy = data.aws_iam_policy_document.task_session_output_cold.json
 }
 
 # ─── Task definition ────────────────────────────────────────────────────

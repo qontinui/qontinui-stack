@@ -95,6 +95,22 @@ module "blob" {
   environment = var.environment
 }
 
+# ─── Cold-tier session output (Phase 8) ─────────────────────────────────
+# Object-per-session PTY-output store, 90-day TTL. The COLD tier of the
+# three-tier retention model (hot = JetStream replay buffer, warm =
+# coord.session_output Postgres, cold = this bucket). Per-session key layout:
+# tenant/<tenant_id>/session/<session_id>.log. coord is the sole writer/reader
+# (least-privilege policy attached to its task role below). See
+# modules/session-output-cold/main.tf and docs/session-output-cold-tier.md.
+# `terraform apply` for this is an OPERATOR step — nothing is provisioned here.
+
+module "session_output_cold" {
+  source = "../modules/session-output-cold"
+
+  environment   = var.environment
+  cold_ttl_days = var.session_output_cold_ttl_days
+}
+
 # ─── Coord service (ECS Fargate) ────────────────────────────────────────
 
 module "coord" {
@@ -119,6 +135,12 @@ module "coord" {
   coord_admin_secret    = random_password.coord_admin_secret.result
 
   s3_bucket_arn = module.blob.bucket_arn
+
+  # Phase 8 cold tier — coord is the writer/reader. A least-privilege policy
+  # scoped to ONLY this bucket (Put/Get/List, no Delete — TTL handles
+  # expiry) is attached to coord's task role inside the coord module.
+  session_output_cold_bucket_arn = module.session_output_cold.bucket_arn
+  session_output_cold_key_prefix = module.session_output_cold.key_prefix
 }
 
 # ─── Canonical-DB migrator (one-off alembic upgrade head) ───────────────

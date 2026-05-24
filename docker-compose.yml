@@ -127,9 +127,17 @@ services:
   # Bucket-creation sidecar — runs once after MinIO is healthy, then exits.
   #
   # Owns these buckets:
-  #   qontinui-dev          — general dev blob store
-  #   qontinui-bazel-remote — content-addressed cache backing for the
-  #                           bazel-remote service below (Row 10 Item 4).
+  #   qontinui-dev                  — general dev blob store
+  #   qontinui-bazel-remote         — content-addressed cache backing for the
+  #                                   bazel-remote service below (Row 10 Item 4).
+  #   qontinui-session-output-cold  — Phase 8 cold-tier PTY output (dev mirror
+  #                                   of the staging session-output-cold S3
+  #                                   bucket). Key layout:
+  #                                   tenant/<tenant_id>/session/<session_id>.log.
+  #                                   Kept PRIVATE (no anonymous download) to
+  #                                   mirror staging's full public-access block —
+  #                                   PTY output is sensitive; reads go through
+  #                                   coord, never anonymous S3.
   #
   # Bucket creation is idempotent (`mb --ignore-existing`); the sidecar
   # is the gate that downstream services depend on for "bucket exists".
@@ -150,7 +158,8 @@ services:
         /usr/bin/mc mb canonical/qontinui-dev --ignore-existing && \
         /usr/bin/mc anonymous set download canonical/qontinui-dev && \
         /usr/bin/mc mb canonical/${BAZEL_REMOTE_BUCKET:-qontinui-bazel-remote} --ignore-existing && \
-        echo "MinIO buckets qontinui-dev + ${BAZEL_REMOTE_BUCKET:-qontinui-bazel-remote} ready" && \
+        /usr/bin/mc mb canonical/${SESSION_OUTPUT_COLD_BUCKET:-qontinui-session-output-cold} --ignore-existing && \
+        echo "MinIO buckets qontinui-dev + ${BAZEL_REMOTE_BUCKET:-qontinui-bazel-remote} + ${SESSION_OUTPUT_COLD_BUCKET:-qontinui-session-output-cold} ready" && \
         exit 0
     restart: "no"
 
