@@ -19,6 +19,17 @@ output "blob" {
   }
 }
 
+output "session_output_cold" {
+  description = "Cold-tier PTY-output S3 config (Phase 8). coord derives its writer config from this. Key layout: tenant/<tenant_id>/session/<session_id>.log."
+  value = {
+    bucket     = module.session_output_cold.bucket_name
+    region     = var.region
+    endpoint   = "https://s3.${var.region}.amazonaws.com"
+    key_prefix = module.session_output_cold.key_prefix
+    ttl_days   = module.session_output_cold.cold_ttl_days
+  }
+}
+
 output "coord_url" {
   description = "Public WSS URL for the coord service."
   value       = "wss://${var.coord_subdomain}.${var.domain_name}"
