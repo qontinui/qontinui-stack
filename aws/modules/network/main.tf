@@ -167,6 +167,24 @@ resource "aws_security_group_rule" "client_from_alb_9870" {
   description              = "ALB to coord task"
 }
 
+# Allow coord task → coord task on the coord port (HA Phase C git-plane
+# replication). With desired_count >= 2 a follower bootstraps, and the leader
+# replicates, by dialing the PEER's :9870 git-http endpoint DIRECTLY
+# (task-to-task within this SG) — not via the ALB. The ALB rule above only
+# covers ALB→task, so without this self-ingress the follower's bootstrap fetch
+# to the leader's internal endpoint (e.g. http://ip-10-20-x-y.ec2.internal:9870)
+# silently TIMES OUT (SYNs dropped), the follower never reaches `in_sync`, and
+# no git-plane replication happens. Mirrors `data_self` for the data-plane SG.
+resource "aws_security_group_rule" "client_self_9870" {
+  type              = "ingress"
+  from_port         = 9870
+  to_port           = 9870
+  protocol          = "tcp"
+  self              = true
+  security_group_id = aws_security_group.client.id
+  description       = "coord task to coord task (HA Phase C replication, port 9870)"
+}
+
 resource "aws_security_group" "data_plane" {
   name        = "qontinui-${var.environment}-data-plane"
   description = "RDS + ElastiCache; ingress from client_sg only"
