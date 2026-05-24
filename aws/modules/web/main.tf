@@ -301,6 +301,17 @@ resource "aws_ecs_service" "web" {
   deployment_minimum_healthy_percent = 50
   deployment_maximum_percent         = 200
 
+  # Auto-roll-back a failed deploy instead of leaving the service flapping on a
+  # crash-looping task. Enabled live 2026-05-24 during the web image crash-loop
+  # incident (a stale-schemas image boot-failed ~30x over an hour because the
+  # breaker was off); codified here so `terraform apply` stops planning to
+  # disable it. CI (staging-web-deploy.yml) relies on this backstop plus its
+  # post-deploy verify step that fails loudly if a rollback occurs.
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
+
   enable_execute_command = true
 
   # TF/CI seam. Terraform owns the canonical task-def DEFINITION
