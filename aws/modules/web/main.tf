@@ -303,8 +303,21 @@ resource "aws_ecs_service" "web" {
 
   enable_execute_command = true
 
+  # TF/CI seam. Terraform owns the canonical task-def DEFINITION
+  # (aws_ecs_task_definition.web above: cpu/memory/env/secrets/health/IAM/log)
+  # and all provisioning. CI (qontinui-web/.github/workflows/staging-web-deploy.yml)
+  # owns DEPLOYMENT: it `describe-task-definition`s THIS family's latest revision
+  # (inheriting the canonical definition here), swaps in the freshly-built
+  # SHA-pinned image, registers a new revision, and points the service at it.
+  # So Terraform must NOT revert the service's task_definition pointer to its
+  # own revision — that would undo every CI deploy and fight the pipeline.
+  # The canonical definition stays live because CI inherits it via describe-latest;
+  # Terraform-side task-def changes (e.g. memory, a new secret) take effect on the
+  # next CI deploy. desired_count is owned by autoscaling / stop-start scripts
+  # (same rationale as module.coord). Deployment is agent-driven (CI); `terraform
+  # apply` stays a human-gated provisioning op that never touches the running revision.
   lifecycle {
-    ignore_changes = [desired_count]
+    ignore_changes = [task_definition, desired_count]
   }
 
   depends_on = [aws_lb_target_group.web]
