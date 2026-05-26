@@ -1,5 +1,5 @@
 variable "region" {
-  description = "AWS region for the staging environment."
+  description = "AWS region."
   type        = string
   default     = "us-east-1"
 }
@@ -13,13 +13,13 @@ variable "environment" {
 # ─── Networking ─────────────────────────────────────────────────────────
 
 variable "vpc_cidr" {
-  description = "CIDR block for the staging VPC."
+  description = "CIDR block for the VPC."
   type        = string
   default     = "10.20.0.0/16"
 }
 
 variable "az_count" {
-  description = "Number of AZs to span. 2 is minimum for an ALB; staging single-AZ for cost is achieved by setting RDS multi_az=false, not by going to 1 AZ here."
+  description = "Number of AZs to span. 2 is minimum for an ALB; single-AZ for cost is achieved by setting RDS multi_az=false, not by going to 1 AZ here."
   type        = number
   default     = 2
 }
@@ -27,7 +27,7 @@ variable "az_count" {
 # ─── DNS / TLS ──────────────────────────────────────────────────────────
 
 variable "domain_name" {
-  description = "Base domain (e.g. qontinui.io). Coord ingress goes to coord-staging.<domain>."
+  description = "Base domain (e.g. qontinui.io). Coord ingress goes to <coord_subdomain>.<domain>."
   type        = string
 }
 
@@ -39,13 +39,13 @@ variable "route53_zone_id" {
 variable "coord_subdomain" {
   description = "Subdomain for the coord ALB ingress."
   type        = string
-  default     = "coord-staging"
+  default     = "coord"
 }
 
 variable "web_subdomain" {
   description = "Subdomain for the qontinui-web backend ALB ingress."
   type        = string
-  default     = "web-staging"
+  default     = "api"
 }
 
 variable "frontend_url" {
@@ -79,7 +79,7 @@ variable "web_memory_mb" {
 }
 
 variable "web_desired_count" {
-  description = "Web task replicas. 1 for staging."
+  description = "Web task replicas."
   type        = number
   default     = 1
 }
@@ -100,7 +100,7 @@ variable "budget_alert_email" {
 # ─── Postgres ───────────────────────────────────────────────────────────
 
 variable "postgres_instance_class" {
-  description = "RDS instance class. db.t4g.micro is staging-cheap; bump for prod."
+  description = "RDS instance class. db.t4g.micro is current sizing."
   type        = string
   default     = "db.t4g.micro"
 }
@@ -130,7 +130,7 @@ variable "postgres_db_name" {
 }
 
 variable "postgres_multi_az" {
-  description = "Multi-AZ RDS. Set true for prod, false for staging."
+  description = "Multi-AZ RDS. Currently single-AZ; set true when HA is needed."
   type        = bool
   default     = false
 }
@@ -144,7 +144,7 @@ variable "postgres_backup_retention_days" {
 # ─── Redis ──────────────────────────────────────────────────────────────
 
 variable "redis_node_type" {
-  description = "ElastiCache node type. cache.t4g.micro is staging-cheap."
+  description = "ElastiCache node type. cache.t4g.micro is current sizing."
   type        = string
   default     = "cache.t4g.micro"
 }
@@ -186,8 +186,8 @@ variable "coord_desired_count" {
 
     IMPORTANT — this value is the baseline written into the Terraform state.
     The LIVE running count is managed operationally by the replica-management
-    stop/start scripts (aws/scripts/staging-stop.sh + staging-start.sh), which
-    call `aws ecs update-service --desired-count N` directly.  Because the ECS
+    stop/start scripts (aws/scripts/stop.sh + start.sh), which call
+    `aws ecs update-service --desired-count N` directly.  Because the ECS
     service resource has `lifecycle { ignore_changes = [desired_count] }`,
     running `terraform apply` will NOT override whatever count the scripts last
     set.  The baseline here only takes effect on a fresh `terraform apply`

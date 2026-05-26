@@ -1,7 +1,10 @@
-# Composition root for qontinui-stack staging on AWS.
+# Composition root for qontinui-stack production on AWS.
+#
+# The directory and `environment` variable still say "staging" — renaming
+# would destroy and recreate data resources. This IS production.
 #
 # Wires the modules and runs nothing else here. Each module is independently
-# usable; the staging environment composes them in a topology that matches
+# usable; this environment composes them in a topology that matches
 # qontinui-stack/docker-compose.yml with managed-service substitutions.
 #
 # Service topology:
@@ -11,7 +14,7 @@
 #   v            v
 #  ALB (TLS)    GitHub webhook
 #   │            │
-#   └─→ ECS Fargate cluster (qontinui-staging)
+#   └─→ ECS Fargate cluster (qontinui-staging — name is historical)
 #          ├─ coord service  (coord.<domain>  — listener default)
 #          └─ web service     (web.<domain>   — host-routed listener rule)
 #          │       │
@@ -29,9 +32,9 @@
 # ─── Shared secret: web↔coord strategy bridge ───────────────────────────
 # coord reads COORD_ADMIN_SECRET to gate POST /coord/auth/service-token;
 # web mints service-tokens against that endpoint using the same value to
-# call coord's /strategy/* APIs. Generated here (fresh clean-room staging —
-# intentionally NOT mirrored from the local dev .env). Passed into both
-# module.coord and module.web from this single source of truth.
+# call coord's /strategy/* APIs. Generated here (intentionally NOT mirrored
+# from the local dev .env). Passed into both module.coord and module.web
+# from this single source of truth.
 #
 # DB topology: CANONICAL ONE-DB model. coord + web share `qontinui_db`;
 # the unified qontinui-web alembic chain (run via qontinui-canonical-
@@ -220,15 +223,15 @@ module "web" {
   #   - exact list: Vercel frontend (qontinui.io etc.). Apex domains
   #     can't be expressed by the staging-subtree regex, so they stay
   #     exact-match.
-  #   - regex: any subdomain of `staging.qontinui.io`. Covers
-  #     `web.staging.qontinui.io` (own backend), `demo.staging.qontinui.io`
+  #   - regex: any subdomain of the domain_name. Covers
+  #     `web.<domain>` (own backend), `demo.<domain>`
   #     (coordination-layer demo), and any future preview / test
   #     subdomain — no task-def revision needed when a new subdomain
   #     is provisioned.
   # The anchored `^...$` + per-component charset `[a-z0-9-]+` reject
-  # suffix-attack origins like `staging.qontinui.io.attacker.com`.
-  # Localhost origins intentionally excluded on staging — don't expand
-  # the staging surface to dev browsers; set ENVIRONMENT=development
+  # suffix-attack origins like `<domain>.attacker.com`.
+  # Localhost origins intentionally excluded in production — don't expand
+  # the production surface to dev browsers; set ENVIRONMENT=development
   # to use the broader defaults in app/main.py.
   backend_cors_origins      = jsonencode([var.frontend_url])
   backend_cors_origin_regex = "^https://([a-z0-9-]+\\.)*${replace(var.domain_name, ".", "\\.")}$"
