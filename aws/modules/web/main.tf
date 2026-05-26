@@ -157,6 +157,12 @@ resource "aws_iam_role_policy_attachment" "task_exec_managed" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
+# redis_url secret was created out-of-band (not TF-managed); reference by name
+# so the exec-role grant below survives `terraform apply`.
+data "aws_secretsmanager_secret" "redis_url" {
+  name = "qontinui/${var.environment}/web/redis_url"
+}
+
 data "aws_iam_policy_document" "task_exec_secrets" {
   statement {
     actions = ["secretsmanager:GetSecretValue"]
@@ -164,6 +170,7 @@ data "aws_iam_policy_document" "task_exec_secrets" {
       aws_secretsmanager_secret.database_url.arn,
       aws_secretsmanager_secret.coord_admin_secret.arn,
       aws_secretsmanager_secret.secret_key.arn,
+      data.aws_secretsmanager_secret.redis_url.arn,
     ]
   }
 }
