@@ -1,16 +1,16 @@
-# qontinui-stack on AWS
+# qontinui-stack on AWS (production)
 
-Identical architecture to `qontinui-stack/docker-compose.yml`, deployed on
-managed AWS services. **Currently paved but unused** — per topology plan
-§9 Phase 6, this directory exists so flipping `dev` → `staging` is one
-`terraform apply`, not a sprint.
+Production environment deployed on managed AWS services. The `staging/`
+directory name and internal `environment = "staging"` resource prefix are
+historical artifacts -- changing the environment label would destroy and
+recreate data resources, so the names are preserved.
 
-| Service          | Local (compose) | AWS staging                      |
+| Service          | Local (compose) | AWS (production)                 |
 |------------------|-----------------|----------------------------------|
 | Postgres 16      | container       | RDS db.t4g.micro                 |
 | Redis 7          | container       | ElastiCache cache.t4g.micro      |
 | MinIO / S3       | MinIO container | S3 bucket                        |
-| qontinui-coord   | container       | ECS Fargate (1 task, 0.25 vCPU)  |
+| qontinui-coord   | container       | ECS Fargate (2 tasks, 0.25 vCPU) |
 | Cloudflare Tunnel| host daemon     | ALB → ACM cert → Route53 record  |
 
 The runner switches environments via the profile file
@@ -30,15 +30,15 @@ just a different `DATABASE_URL` / `REDIS_URL` / `coord_url`.
 | **Total when running**         | **~$53/mo** |
 
 When stopped (RDS + ElastiCache stopped, ECS scaled to 0): ~$3/mo for
-storage + ALB. The on/off ritual lives in `scripts/staging-stop.sh` and
-`staging-start.sh`.
+storage + ALB. The on/off ritual lives in `scripts/stop.sh` and
+`start.sh`.
 
 ## Layout
 
 ```
 aws/
 ├─ README.md                         (this file)
-├─ staging/                          (one environment per directory)
+├─ staging/                          (production — name is historical)
 │  ├─ main.tf                        (composition root — wires modules)
 │  ├─ variables.tf
 │  ├─ outputs.tf
@@ -54,8 +54,7 @@ aws/
    └─ tunnel/                        (ALB + ACM + Route53 — ingress)
 ```
 
-`prod/` later is `cp -r staging/ prod/` + size bumps + multi-AZ flags.
-Modules don't change.
+`staging/` IS production. Modules are reusable across environments.
 
 ## Prerequisites
 
@@ -65,10 +64,9 @@ Modules don't change.
 * A Route53 hosted zone for the domain you'll attach (e.g. `qontinui.io`).
 * The `qontinui-canonical-coord` Docker image pushed to ECR (see
   "Coord deploys" below). The terraform module expects an `image_uri`
-  variable; `staging/main.tf` defaults to ECR `qontinui-coord:staging`.
-  Real deploys SHA-pin the task definition revision via
-  `scripts/push-coord-image.sh`; terraform's `:staging` default is used
-  only for the initial bring-up.
+  variable. Real deploys SHA-pin the task definition revision via
+  `scripts/push-coord-image.sh`; terraform's default is used only for
+  the initial bring-up.
 
 ## First apply
 
@@ -82,9 +80,9 @@ terraform plan
 terraform apply
 ```
 
-Output includes the staging `database_url`, `redis_url`, and `coord_url`.
-Stash them into a new `staging` profile in `~/.qontinui/profiles.json`,
-then `qontinui_profile use staging` to switch.
+Output includes the `database_url`, `redis_url`, and `coord_url`.
+Stash them into a profile in `~/.qontinui/profiles.json`,
+then `qontinui_profile use <profile>` to switch.
 
 ## Coord deploys (ongoing)
 
@@ -122,10 +120,10 @@ To dry-run (push image + register revision, skip the service update):
 ```bash
 # Stop everything billable. RDS + ElastiCache go to "stopped";
 # ECS service scales to 0. Storage stays (cheap).
-bash scripts/staging-stop.sh
+bash scripts/stop.sh
 
 # Start everything back up.
-bash scripts/staging-start.sh
+bash scripts/start.sh
 ```
 
 Note: RDS supports stopping for up to 7 days, then auto-restarts. For
@@ -135,21 +133,21 @@ snapshot when needed.
 ## Why not Aurora / Neon / managed-anything-fancier
 
 * **Aurora Serverless v2** scales to 0.5 ACU minimum (~$45/mo idle), more
-  expensive than db.t4g.micro for a staging that's mostly off.
+  expensive than db.t4g.micro at current scale.
 * **Neon** is the right answer for a *managed cloud product* (per
-  business-model plan §1) but staging is "user's own AWS" by design —
-  Neon would mean the user pays a third party for what's already
+  business-model plan §1) but this environment is "user's own AWS" by
+  design — Neon would mean the user pays a third party for what's already
   provisioned in their AWS account.
 * **RDS db.t4g.micro** is the cheapest fully-managed Postgres. Single-AZ
-  is fine for staging; prod's `prod/` flips to Multi-AZ.
+  currently; flip to Multi-AZ when HA is needed.
 
 When `qontinui.cloud` (the managed cloud product) launches, it runs on
 Neon + Upstash + Cloudflare Workers — not on this Terraform. This
 directory targets self-hosters who want to deploy to their own AWS.
 
-## What this skeleton intentionally omits
+## What this configuration intentionally omits
 
-* Multi-AZ. Single AZ for staging; flip the variable for prod.
+* Multi-AZ. Single AZ currently; flip the variable when HA is needed.
 * Backups beyond RDS's 7-day retention.
 * WAF rules.
 * Bastion host (use SSM Session Manager when you need shell into a task).
