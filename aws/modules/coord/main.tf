@@ -291,6 +291,56 @@ resource "aws_iam_role_policy" "task_session_output_cold" {
   policy = data.aws_iam_policy_document.task_session_output_cold.json
 }
 
+# Digital-twin Ξ_Infra observer (qontinui-coord `infra_observer.rs`) — the
+# read-only describe/get perms it needs BEYOND the freshness watcher's set, so
+# its Φ_Infra evaluation can move past the 1/3-coverage floor it shipped at.
+# Deliberately a SEPARATE, narrow, auditable policy (same rationale as
+# task_session_output_cold above), not folded into the (currently out-of-band)
+# ecs-watcher-policy. Operator-approved prod-IAM grant 2026-05-30
+# (plan 2026-05-30-digital-twin-migrations-and-infra-layers §4.1):
+#   - dim 2: ecs:DescribeTaskDefinition (no resource-level scoping in IAM → "*")
+#     unblocks reading the live task-def + its referenced secret ARNs.
+#   - dim 3: read the EXECUTION role's inline GetSecretValue grant (scoped to
+#     the two coord roles) + managed-policy bodies, to verify every task-def
+#     secret ARN is actually covered (the active-negation guard). GetPolicy/
+#     GetPolicyVersion target policy ARNs (not predictable) so are "*"-scoped;
+#     all actions are strictly read-only.
+data "aws_iam_policy_document" "task_twin_infra_observer" {
+  statement {
+    sid       = "TwinInfraEcsDescribeTaskDefinition"
+    actions   = ["ecs:DescribeTaskDefinition"]
+    resources = ["*"]
+  }
+
+  statement {
+    sid = "TwinInfraIamReadCoordRoleGrants"
+    actions = [
+      "iam:GetRolePolicy",
+      "iam:ListRolePolicies",
+      "iam:ListAttachedRolePolicies",
+    ]
+    resources = [
+      aws_iam_role.task_exec.arn,
+      aws_iam_role.task.arn,
+    ]
+  }
+
+  statement {
+    sid = "TwinInfraIamReadManagedPolicyBodies"
+    actions = [
+      "iam:GetPolicy",
+      "iam:GetPolicyVersion",
+    ]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_role_policy" "task_twin_infra_observer" {
+  name   = "qontinui-${var.environment}-coord-twin-infra-observer"
+  role   = aws_iam_role.task.id
+  policy = data.aws_iam_policy_document.task_twin_infra_observer.json
+}
+
 # ─── Task definition (BOOTSTRAP-ONLY) ─────────────────────────────────────
 #
 # This definition exists ONLY to satisfy the `task_definition` argument the
