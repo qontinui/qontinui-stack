@@ -362,9 +362,20 @@ resource "aws_lb_target_group" "coord" {
   vpc_id      = var.vpc_id
   target_type = "ip"
 
+  # Coord HA D.3 (PR-S1) — the ALB health check gates ECS rollout: a target is
+  # "healthy enough to drain the previous one" only when it returns 200 here.
+  # Repointed from /health (liveness: PG+Redis) to /ready (git-readiness: this
+  # task has bootstrapped to the fleet ack-frontier, or the fleet is at
+  # cold-start frontier 0). With this, `aws ecs wait services-stable` waits for
+  # a new follower to hold the frontier before the old caught-up task is
+  # deregistered — keeping >=1 caught-up live node across a rolling deploy and
+  # closing the deploy-induced write-plane stall (plan
+  # 2026-05-30-coord-ha-d3-failover-calibration, Axis c1). REQUIRES a coord
+  # image that serves /ready (coord PR-1) deployed FIRST — see the landing
+  # sequence; repointing before /ready exists would brick the next deploy.
   health_check {
     enabled             = true
-    path                = "/health"
+    path                = "/ready"
     port                = "9870"
     protocol            = "HTTP"
     interval            = 30
@@ -428,6 +439,17 @@ resource "aws_ecs_service" "coord" {
     container_name   = "coord"
     container_port   = 9870
   }
+
+  # Coord HA D.3 (PR-S1) — give a freshly-placed task time to bootstrap its
+  # local git store to the fleet ack-frontier and start returning 200 from
+  # /ready before the ALB's unhealthy-threshold can fail it out. A cold Fargate
+  # task starts with an EMPTY git store and must mirror-fetch the canonical
+  # repos from the current leader (coord_git_replica_bootstrap_seconds), so the
+  # grace window must comfortably exceed that bootstrap; 180s leaves headroom
+  # over the largest repo. Without this, a slow bootstrap could be killed before
+  # it ever reaches readiness. (Liveness regressions still surface: a task that
+  # never serves /ready fails the deployment — see the circuit breaker, PR-S2.)
+  health_check_grace_period_seconds = 180
 
   deployment_minimum_healthy_percent = 50
   deployment_maximum_percent         = 200
