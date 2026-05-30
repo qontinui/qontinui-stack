@@ -25,15 +25,48 @@ resource "aws_sns_topic_subscription" "budget_email" {
   # confirmation link AWS emails them. Surface this to the operator.
 }
 
-# AWS Budgets must be allowed to publish to the topic.
+# Account id for scoping the CloudWatch publish grant below.
+data "aws_caller_identity" "current" {}
+
+# This topic carries TWO publishers, so the policy needs TWO statements.
+# Setting an explicit aws_sns_topic_policy REPLACES SNS's default policy
+# (which would otherwise allow same-account principals to publish), so every
+# publisher must be granted EXPLICITLY here or its publish is silently denied.
+#
+#   1. AWS Budgets — the budget-alert path (budgets.amazonaws.com).
+#   2. CloudWatch  — the coord alarm path (cloudwatch.amazonaws.com). The
+#      observability module's coord alarms (no-healthy-hosts / 5xx / latency)
+#      target this topic; without this statement their SNS publish fails with
+#      "Failed to execute action …" and NO email is delivered. (Regression
+#      caught 2026-05-30 by forcing an alarm via `set-alarm-state` and reading
+#      the Action history — it had been broken since the alarms were created.)
+#      Scoped to this account's CloudWatch via aws:SourceAccount (least-priv;
+#      a foreign account's CloudWatch can't publish here).
 data "aws_iam_policy_document" "budget_sns" {
   statement {
+    sid       = "AllowBudgetsPublish"
     actions   = ["SNS:Publish"]
     effect    = "Allow"
     resources = [aws_sns_topic.budget.arn]
     principals {
       type        = "Service"
       identifiers = ["budgets.amazonaws.com"]
+    }
+  }
+
+  statement {
+    sid       = "AllowCloudWatchAlarmsPublish"
+    actions   = ["SNS:Publish"]
+    effect    = "Allow"
+    resources = [aws_sns_topic.budget.arn]
+    principals {
+      type        = "Service"
+      identifiers = ["cloudwatch.amazonaws.com"]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [data.aws_caller_identity.current.account_id]
     }
   }
 }
