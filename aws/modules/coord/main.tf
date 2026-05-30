@@ -489,6 +489,18 @@ resource "aws_ecs_service" "coord" {
   deployment_minimum_healthy_percent = 50
   deployment_maximum_percent         = 200
 
+  # Coord HA D.3 (PR-S2) — with the ALB health check now pointed at /ready
+  # (PR-S1), a revision whose new tasks never catch up to the fleet ack-frontier
+  # never go healthy. The circuit breaker turns that into a FAILED deployment
+  # that auto-rolls-back to the last-good task set, instead of leaving the write
+  # plane wedged. Belt-and-suspenders alongside coord CI's own post-deploy smoke
+  # + PRIOR_TD rollback. Applies to ECS deployments however triggered (CI
+  # update-service or terraform); composes with ignore_changes[task_definition].
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
+
   enable_execute_command = true # SSM Session Manager into a running task
 
   # TF/CI seam. CI (qontinui-coord/.github/workflows/deploy-coord.yml) owns
