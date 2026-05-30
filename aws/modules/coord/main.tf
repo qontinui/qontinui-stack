@@ -176,17 +176,41 @@ resource "aws_iam_role_policy_attachment" "task_exec_managed" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
-# Task exec role needs to read the secrets we just created + the
-# operator-staged JWT signing key (referenced via data source above).
+# Account id for constructing prefix-scoped secret ARNs below.
+data "aws_caller_identity" "current" {}
+
+# Task exec role needs to read every secret coord consumes at task-launch.
+#
+# PREFIX-SCOPED (not an explicit ARN list) — deliberately. coord's full
+# runtime task definition is authored in `qontinui-coord/deploy/taskdef.json`
+# and shipped by `deploy-coord.yml` (the reproducible per-commit-SHA model);
+# terraform owns only the infra shell. coord adds secrets to taskdef.json over
+# time (GitHub OAuth/App, GitHub token, Vercel deploy hooks, NATS, …). An
+# explicit per-ARN grant here rots the instant a new secret is added — every
+# such addition was previously made out-of-band to the live role and never
+# reflected in terraform, so a full `terraform apply` would STRIP the role
+# back to the 5 secrets terraform knew about and break coord. (See plan
+# 2026-05-30-qontinui-stack-terraform-state-reconciliation §1.2/§3-B1.)
+#
+# Granting on coord's two secret namespaces auto-covers any future coord
+# secret WITHOUT a terraform change, so the role can never strip-drift again:
+#   - qontinui/${env}/coord*    database_url, redis_url, github_webhook_secret,
+#                               admin_secret, github_app_private_key (all under
+#                               .../coord/…) PLUS coord_jwt_signing_key (no
+#                               slash) — the trailing `coord*` glob matches both
+#   - qontinui-coord-${env}/*   github-oauth, github-token, vercel-deploy-hooks,
+#                               nats-url, nats-password
+# Secrets Manager ARNs always end in `-<6char>`, so the trailing `*` is
+# mandatory regardless. These two globs are least-privilege: they do NOT match
+# web's secrets (qontinui/${env}/web/*) or migrator's
+# (qontinui/${env}/migrator/*) — a broad `qontinui/${env}/*` WOULD, so it's
+# intentionally avoided.
 data "aws_iam_policy_document" "task_exec_secrets" {
   statement {
     actions = ["secretsmanager:GetSecretValue"]
     resources = [
-      aws_secretsmanager_secret.database_url.arn,
-      aws_secretsmanager_secret.redis_url.arn,
-      aws_secretsmanager_secret.webhook_secret.arn,
-      aws_secretsmanager_secret.coord_admin_secret.arn,
-      data.aws_secretsmanager_secret.coord_jwt_signing_key.arn,
+      "arn:aws:secretsmanager:${var.region}:${data.aws_caller_identity.current.account_id}:secret:qontinui/${var.environment}/coord*",
+      "arn:aws:secretsmanager:${var.region}:${data.aws_caller_identity.current.account_id}:secret:qontinui-coord-${var.environment}/*",
     ]
   }
 }
@@ -267,8 +291,19 @@ resource "aws_iam_role_policy" "task_session_output_cold" {
   policy = data.aws_iam_policy_document.task_session_output_cold.json
 }
 
-# ─── Task definition ────────────────────────────────────────────────────
-
+# ─── Task definition (BOOTSTRAP-ONLY) ─────────────────────────────────────
+#
+# This definition exists ONLY to satisfy the `task_definition` argument the
+# `aws_ecs_service.coord` resource requires at first-ever create time (a fresh
+# environment can't stand the service up with no task def to point at). It is
+# NOT the running definition: the service `ignore_changes`s its task_definition
+# pointer, and CI (deploy-coord.yml) registers the real revision from
+# qontinui-coord/deploy/taskdef.json immediately after first apply and on every
+# merge thereafter. Its staleness is therefore harmless by design — the floating
+# `:staging` image, 3-env, 5-secret shape below is a placeholder, never live
+# traffic. Do NOT try to keep it in sync with the live revision; that's CI's job.
+# (See plan 2026-05-30-qontinui-stack-terraform-state-reconciliation §3-A1 +
+# Open-Q1.)
 resource "aws_ecs_task_definition" "coord" {
   family                   = "qontinui-${var.environment}-coord"
   cpu                      = var.cpu
@@ -456,8 +491,23 @@ resource "aws_ecs_service" "coord" {
 
   enable_execute_command = true # SSM Session Manager into a running task
 
+  # TF/CI seam. CI (qontinui-coord/.github/workflows/deploy-coord.yml) owns
+  # DEPLOYMENT: on every merge it renders the full deploy/taskdef.json (image
+  # pinned to the commit SHA, all env + secrets), `register-task-definition`s a
+  # new revision, and points the service at it via `update-service`. Terraform
+  # must therefore NOT revert the service's `task_definition` pointer to its own
+  # `aws_ecs_task_definition.coord` revision — that would undo every CI deploy,
+  # reverting the live SHA-pinned image back to the floating `:staging` bootstrap
+  # and dropping the 14 live-only env vars + 6 live-only secrets coord needs
+  # (GitHub OAuth/App, GitHub token, Vercel hooks, NATS). The terraform task def
+  # is bootstrap-only (see its comment block) and the running revision is owned
+  # entirely by CI. `desired_count` is owned by the stop/start replica scripts
+  # (same rationale). So `terraform apply` stays a human-gated provisioning op
+  # that never touches the running revision or the replica count.
+  # (Mirrors module.web; see plan
+  # 2026-05-30-qontinui-stack-terraform-state-reconciliation §3-A1.)
   lifecycle {
-    ignore_changes = [desired_count] # let stop/start scripts manage replicas
+    ignore_changes = [task_definition, desired_count]
   }
 
   depends_on = [aws_lb_target_group.coord]
