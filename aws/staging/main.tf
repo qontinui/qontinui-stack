@@ -273,4 +273,6 @@ module "observability" {
   alb_arn_suffix      = module.tunnel.alb_arn_suffix
   coord_tg_arn_suffix = module.coord.target_group_arn_suffix
   sns_topic_arn       = module.cost_control.sns_topic_arn
+  coord_cluster_name  = module.coord.cluster_name
+  coord_service_name  = module.coord.service_name
 }
