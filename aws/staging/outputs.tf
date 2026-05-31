@@ -59,6 +59,11 @@ output "github_webhook_url" {
   value       = "https://${var.coord_subdomain}.${var.domain_name}/webhooks/github"
 }
 
+output "cross_idp_presignup_lambda_arn" {
+  description = "ARN of the PreSignUp auto-link Lambda. Attach it to the Cognito pool's PreSignUp trigger via the manual `aws cognito-idp update-user-pool --lambda-config PreSignUp=<arn>` step (describe-then-merge; pool is not in Terraform). See modules/cross-idp-linking/main.tf."
+  value       = module.cross_idp_linking.lambda_arn
+}
+
 output "budget_sns_topic_arn" {
   description = "SNS topic for budget alerts — confirm the email subscription AWS sends."
   value       = module.cost_control.sns_topic_arn

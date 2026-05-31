@@ -84,6 +84,24 @@ variable "web_desired_count" {
   default     = 1
 }
 
+# ─── Cross-IdP account linking (Cognito) ─────────────────────────────────
+
+variable "cognito_user_pool_arn" {
+  description = <<-EOT
+    ARN of the Cognito user pool used for federated auth + cross-IdP account
+    linking. This pool is MANUALLY managed and intentionally NOT in Terraform
+    (never imported) — it is referenced by ARN only. Two things scope to it:
+      1. the web ECS task role's cognito-idp admin grant (module.web), and
+      2. the PreSignUp auto-link Lambda's grant + invoke permission
+         (module.cross_idp_linking).
+    The PreSignUp trigger attachment on the pool itself is a one-time manual
+    `aws cognito-idp update-user-pool` step (pool not in TF) — see
+    modules/cross-idp-linking/main.tf.
+  EOT
+  type        = string
+  default     = "arn:aws:cognito-idp:us-east-1:047719635665:userpool/us-east-1_rgTB9dbZ1"
+}
+
 # ─── Cost control ───────────────────────────────────────────────────────
 
 variable "budget_monthly_limit" {
@@ -161,7 +179,7 @@ variable "coord_image_uri" {
     this at `:staging` in terraform.tfvars is safe — terraform won't
     be re-applied for image changes.
   EOT
-  type    = string
+  type        = string
   # Default left empty so a missed push surfaces immediately at apply time.
   default = ""
 }
