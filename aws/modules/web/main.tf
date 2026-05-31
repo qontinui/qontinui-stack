@@ -79,6 +79,11 @@ variable "backend_cors_origin_regex" {
   description = "Optional regex pattern for CORS-allowed origins (in addition to backend_cors_origins). An origin matching either the exact list OR this regex is permitted. Decouples backend deploys from frontend domain provisioning — any subdomain matching the pattern works without a task-def revision. Empty string = exact list only."
 }
 
+variable "cognito_user_pool_arn" {
+  type        = string
+  description = "ARN of the (manually-managed, NOT-in-Terraform) Cognito user pool the web task administers for cross-IdP account linking. The web task role is granted admin user-management cognito-idp actions scoped to ONLY this pool ARN. Pool us-east-1_rgTB9dbZ1 lives in us-east-1/047719635665 and is referenced by ARN, never imported."
+}
+
 # ─── Security group rule: ALB → web on 8000 ─────────────────────────────
 # The shared client_sg only opens port 9870 (coord) from the ALB by default
 # — see modules/network/main.tf "client_from_alb_9870". Web listens on
@@ -181,11 +186,43 @@ resource "aws_iam_role_policy" "task_exec_secrets" {
 }
 
 # Task role: web has no S3/SES/SQS needs at staging (cloud-control's Stripe
-# + SES paths are off until billing/email is wired). Keep empty for now;
-# extend when storage/email backends move to AWS-native.
+# + SES paths are off until billing/email is wired). Carries ONLY the
+# cross-IdP account-linking grant below; extend when storage/email backends
+# move to AWS-native.
 resource "aws_iam_role" "task" {
   name               = "qontinui-${var.environment}-web-task"
   assume_role_policy = data.aws_iam_policy_document.ecs_assume.json
+}
+
+# Cross-IdP account-linking admin grant. The web backend reconciles federated
+# identities (Google / Microsoft Entra / GitHub) against the native Cognito
+# user when a user explicitly links/unlinks an IdP from the account-settings
+# UI, and resolves/cleans up users during that flow. Deliberately a SEPARATE,
+# narrow, auditable policy (same rationale as coord's task_blob /
+# task_session_output_cold) — Resource is scoped to ONLY the one pool ARN
+# (passed in from the composition root; pool is manually managed and NOT in
+# Terraform, referenced by ARN). admin_link_provider_for_user is the one
+# privileged action; the rest are read/disable/delete used by the same flow.
+# (PreSignUp *auto*-link runs in its own Lambda with its own role — see
+# modules/cross-idp-linking — not under this task role.)
+data "aws_iam_policy_document" "task_cognito_linking" {
+  statement {
+    sid = "CognitoCrossIdpAccountLinking"
+    actions = [
+      "cognito-idp:AdminLinkProviderForUser",
+      "cognito-idp:AdminDisableProviderForUser",
+      "cognito-idp:AdminGetUser",
+      "cognito-idp:AdminDeleteUser",
+      "cognito-idp:ListUsers",
+    ]
+    resources = [var.cognito_user_pool_arn]
+  }
+}
+
+resource "aws_iam_role_policy" "task_cognito_linking" {
+  name   = "qontinui-${var.environment}-web-cognito-linking"
+  role   = aws_iam_role.task.id
+  policy = data.aws_iam_policy_document.task_cognito_linking.json
 }
 
 # ─── Task definition ────────────────────────────────────────────────────

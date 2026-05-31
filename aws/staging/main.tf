@@ -235,6 +235,31 @@ module "web" {
   # to use the broader defaults in app/main.py.
   backend_cors_origins      = jsonencode([var.frontend_url])
   backend_cors_origin_regex = "^https://([a-z0-9-]+\\.)*${replace(var.domain_name, ".", "\\.")}$"
+
+  # Cross-IdP account-linking: the web task administers this (manually-managed,
+  # not-in-TF) Cognito pool for explicit user-driven link/unlink. Grant scoped
+  # to ONLY this ARN inside the web module.
+  cognito_user_pool_arn = var.cognito_user_pool_arn
+}
+
+# ─── Cross-IdP account linking — PreSignUp auto-link Lambda ──────────────
+# Auto-links a federated sign-in (Google / Microsoft Entra — NOT GitHub) onto an
+# existing verified native Cognito user when, and only when, it is provably safe
+# (verified email + trusted provider + exactly one confirmed native match). The
+# Cognito pool is manually managed and NOT in Terraform, so the trigger
+# ATTACHMENT is a one-time manual `aws cognito-idp update-user-pool` step
+# (documented in the module); Terraform provisions the Lambda, its least-priv
+# role, and the cognito-invoke permission scoped to the pool ARN.
+#
+# pool id is the last segment of the ARN's resource part
+# (arn:...:userpool/us-east-1_rgTB9dbZ1 -> us-east-1_rgTB9dbZ1).
+module "cross_idp_linking" {
+  source = "../modules/cross-idp-linking"
+
+  environment   = var.environment
+  region        = var.region
+  user_pool_arn = var.cognito_user_pool_arn
+  user_pool_id  = element(split("/", var.cognito_user_pool_arn), 1)
 }
 
 # ─── Tunnel (ALB + ACM + Route53) ───────────────────────────────────────
