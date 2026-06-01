@@ -13,12 +13,17 @@
 #     schemas, coord reads/writes coord.*. Per
 #     proj_canonical_one_db_unified_alembic — one DB, many schemas, one
 #     chain.
-#   - REDIS_ENABLED defaults to false. ElastiCache requires TLS + auth
-#     token; web's RedisConfig (app/config/redis_config.py) builds plain
-#     redis://HOST:PORT/DB without TLS or password support. Optional
-#     redis-dependent features (ARQ task queue, connection cleanup,
-#     redbeat scheduler) gracefully no-op when disabled. Re-enable when
-#     web supports rediss:// or REDIS_URL.
+#   - REDIS_ENABLED=true. The managed Redis is reached via the canonical
+#     REDIS_URL secret (qontinui/<env>/web/redis_url, a rediss:// Upstash
+#     DSN carrying scheme/TLS/auth). web's RedisConfig, the ARQ pool
+#     (RedisSettings.from_dsn), and the slowapi rate-limiter all honor
+#     REDIS_URL (ssl=True for rediss://); startup degrades gracefully to
+#     "no task queue" if Redis is briefly unreachable. Redis is required
+#     for the runner-WebSocket session store (ws_session_id presence) that
+#     drives mobile runner-pairing discovery; with it OFF a paired runner
+#     never reports ws_connected. The secret is IAM-granted to the exec
+#     role below; it must be both granted AND mounted in the container
+#     `secrets` block for the value to reach the app.
 #   - COORD_ADMIN_SECRET is the SAME secret value coord uses (passed in
 #     from the composition root). Web mints service-tokens at coord via
 #     POST /coord/auth/service-token using this shared secret.
@@ -264,7 +269,7 @@ resource "aws_ecs_task_definition" "web" {
         { name = "BACKEND_URL", value = var.backend_url },
         { name = "BACKEND_CORS_ORIGINS", value = var.backend_cors_origins },
         { name = "BACKEND_CORS_ORIGIN_REGEX", value = var.backend_cors_origin_regex },
-        { name = "REDIS_ENABLED", value = "false" },
+        { name = "REDIS_ENABLED", value = "true" },
         { name = "RATE_LIMIT_ENABLED", value = "true" },
         { name = "USE_SES_API", value = "false" },
         # Storage: local-filesystem-in-container for staging. Persists for the
@@ -277,6 +282,10 @@ resource "aws_ecs_task_definition" "web" {
         { name = "DATABASE_URL", valueFrom = aws_secretsmanager_secret.database_url.arn },
         { name = "COORD_ADMIN_SECRET", valueFrom = aws_secretsmanager_secret.coord_admin_secret.arn },
         { name = "SECRET_KEY", valueFrom = aws_secretsmanager_secret.secret_key.arn },
+        # REDIS_URL (rediss:// Upstash DSN) — the exec role is already granted
+        # GetSecretValue on this secret above; mounting it here is what makes
+        # the value reach the container so REDIS_ENABLED=true can connect.
+        { name = "REDIS_URL", valueFrom = data.aws_secretsmanager_secret.redis_url.arn },
       ]
 
       logConfiguration = {
