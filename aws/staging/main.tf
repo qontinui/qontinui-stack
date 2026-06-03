@@ -144,6 +144,11 @@ module "coord" {
   # expiry) is attached to coord's task role inside the coord module.
   session_output_cold_bucket_arn = module.session_output_cold.bucket_arn
   session_output_cold_key_prefix = module.session_output_cold.key_prefix
+
+  # Twin Ξ_Auth observer — read-only Cognito describe grant on coord's task
+  # role, scoped to ONLY this manually-managed pool ARN (same ARN the web
+  # cross-IdP-linking grant uses).
+  cognito_user_pool_arn = var.cognito_user_pool_arn
 }
 
 # ─── Canonical-DB migrator (one-off alembic upgrade head) ───────────────

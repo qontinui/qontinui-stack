@@ -52,6 +52,11 @@ variable "session_output_cold_key_prefix" {
   description = "Fixed key prefix all cold-tier objects live under (tenant/<tenant_id>/session/<session_id>.log). Scopes s3:ListBucket so coord can only enumerate session-output keys."
 }
 
+variable "cognito_user_pool_arn" {
+  type        = string
+  description = "ARN of the (manually-managed, NOT-in-Terraform) Cognito user pool the coord twin Ξ_Auth observer describes. The coord task role is granted read-only describe/list cognito-idp actions scoped to ONLY this pool ARN. Pool us-east-1_rgTB9dbZ1 lives in us-east-1/047719635665 and is referenced by ARN, never imported."
+}
+
 # ─── Cluster ────────────────────────────────────────────────────────────
 
 resource "aws_ecs_cluster" "main" {
@@ -414,6 +419,39 @@ resource "aws_iam_role_policy" "task_twin_route_observer" {
   name   = "qontinui-${var.environment}-coord-twin-route-observer"
   role   = aws_iam_role.task.id
   policy = data.aws_iam_policy_document.task_twin_route_observer.json
+}
+
+# Digital-twin Ξ_Auth observer (qontinui-coord `cognito_describe_observer.rs`,
+# plan 2026-05-31-twin-auth-identity-layer) — the read-only Cognito describe
+# perms its live-wiring drift slice (the AADSTS50011 class) needs. WITHOUT this
+# grant the calls are AccessDenied and the observer correctly degrades to blind
+# (coverage<1 / drift_class=unknown, never a false "no drift") — but it cannot
+# observe the live IdP/client/callback wiring. Read-only analogue of
+# `task_twin_infra_observer`. The observer calls exactly: DescribeUserPoolClient
+# (per app-client in COORD_OIDC_AUDIENCE), ListIdentityProviders +
+# DescribeIdentityProvider (per federated IdP — NAMES/CONFIG only, every
+# secret-bearing ProviderDetails field is dropped at the source), and ListGroups.
+# All four are user-pool-scoped actions, so the grant is scoped to ONLY the
+# manually-managed pool ARN (least privilege; the pool id the observer targets is
+# derived at runtime from COORD_OIDC_ISSUER). All actions strictly read-only;
+# NO secret-reading action (no GetCSV/secret export) is granted.
+data "aws_iam_policy_document" "task_twin_auth_observer" {
+  statement {
+    sid = "TwinAuthCognitoDescribeWiring"
+    actions = [
+      "cognito-idp:DescribeUserPoolClient",
+      "cognito-idp:ListIdentityProviders",
+      "cognito-idp:DescribeIdentityProvider",
+      "cognito-idp:ListGroups",
+    ]
+    resources = [var.cognito_user_pool_arn]
+  }
+}
+
+resource "aws_iam_role_policy" "task_twin_auth_observer" {
+  name   = "qontinui-${var.environment}-coord-twin-auth-observer"
+  role   = aws_iam_role.task.id
+  policy = data.aws_iam_policy_document.task_twin_auth_observer.json
 }
 
 # ─── Task definition (BOOTSTRAP-ONLY) ─────────────────────────────────────
