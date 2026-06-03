@@ -375,6 +375,47 @@ resource "aws_iam_role_policy" "task_twin_log_observer" {
   policy = data.aws_iam_policy_document.task_twin_log_observer.json
 }
 
+# Digital-twin Ξ_Route observer (qontinui-coord `route_observer.rs`, plan
+# 2026-05-31-twin-routing-dns-layer) — the read-only ALB + Route53 describe
+# perms its declared-side enrichment slices need. WITHOUT this grant those
+# calls are AccessDenied and the observer correctly degrades to blind
+# (coverage<1, never a false answer — the live HTTPS served-origin probe still
+# fully answers `coord_resolve_route`); WITH it the ALB host→target-group rules
+# and the Route53 record sets corroborate the live probe. Read-only analogue of
+# `task_twin_infra_observer`. The observer calls exactly: ELBv2
+# DescribeLoadBalancers → DescribeListeners → DescribeRules (navigating the live
+# HTTPS listener's host rules) and Route53 ListHostedZones → ListResourceRecordSets.
+# ELBv2 Describe* actions carry no resource-level scoping (→ "*"); Route53 zone
+# ids are discovered at runtime via ListHostedZones, so the record-set read is
+# "*"-scoped the same way `task_twin_infra_observer` scopes its unpredictable
+# policy-ARN reads. All actions strictly read-only.
+data "aws_iam_policy_document" "task_twin_route_observer" {
+  statement {
+    sid = "TwinRouteElbv2DescribeListenerRules"
+    actions = [
+      "elasticloadbalancing:DescribeLoadBalancers",
+      "elasticloadbalancing:DescribeListeners",
+      "elasticloadbalancing:DescribeRules",
+    ]
+    resources = ["*"]
+  }
+
+  statement {
+    sid = "TwinRouteRoute53ReadRecordSets"
+    actions = [
+      "route53:ListHostedZones",
+      "route53:ListResourceRecordSets",
+    ]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_role_policy" "task_twin_route_observer" {
+  name   = "qontinui-${var.environment}-coord-twin-route-observer"
+  role   = aws_iam_role.task.id
+  policy = data.aws_iam_policy_document.task_twin_route_observer.json
+}
+
 # ─── Task definition (BOOTSTRAP-ONLY) ─────────────────────────────────────
 #
 # This definition exists ONLY to satisfy the `task_definition` argument the
