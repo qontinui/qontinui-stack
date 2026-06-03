@@ -64,6 +64,14 @@ _LIFECYCLE_RE = re.compile(
     r"\b(" + "|".join(re.escape(w) for w in LIFECYCLE_WORDS) + r")\b"
 )
 
+# A plan stem is a date-prefixed kebab-case slug, e.g.
+# ``2026-06-02-ui-bridge-value-action-focus-lifecycle-plan``. Used to extract
+# Depends-On stems while rejecting prose tokens that happen to sit to the
+# right of a ``Depends-On:`` marker. The leading date alone (``2026-05-21.``)
+# does NOT match — a stem requires at least one ``-word`` segment after the
+# date, so bare dates mentioned in prose are not mistaken for deps.
+_STEM_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}-[a-z0-9]+(?:-[a-z0-9]+)*\b")
+
 UNSATISFIED_NOT_SHIPPED: frozenset[str] = frozenset(
     {"DRAFT", "VETTED", "IN PROGRESS", "PARTIAL", "NOT STARTED"}
 )
@@ -157,33 +165,46 @@ def find_status_block(text: str) -> str | None:
 def parse_depends_on(status_block: str) -> list[str]:
     """Pull the Depends-On stems out of a status block.
 
-    Mirrors the rule from ``implement-plan.md`` Step 0.4:
+    Refines the loose rule from ``implement-plan.md`` Step 0.4
+    (case-sensitive ``Depends-On:`` → split-on-commas) to be robust against
+    two real-world shapes that the naive split mis-handled:
 
-    * case-sensitive ``Depends-On:`` substring
-    * split everything to the right on commas
-    * strip whitespace and any trailing period
-    * drop empty tokens
+    * **Multiple ``Depends-On:`` occurrences.** A status blockquote often
+      carries one in the headline sentence and another in a trailing
+      ``History:`` / re-vet line. The naive ``str.find`` took only the first
+      and then swept everything to its right — including the second marker's
+      surrounding prose. We scan *every* occurrence and return the
+      order-preserving union (deduped).
+    * **Prose to the right of the marker.** Only the remainder of the *same
+      physical line* as each marker is considered (never the next blockquote
+      paragraph, which may discuss unrelated plans), and within it only
+      date-prefixed plan-stem-shaped tokens (``_STEM_RE``) are kept. So
+      ``Depends-On: 2026-06-02-foo-plan. This plan widens ^0.8.4 to ...``
+      yields exactly ``[2026-06-02-foo-plan]`` instead of comma-splitting the
+      trailing sentence into bogus stems.
+
+    Well-formed inputs (a single marker with comma-separated stems on one
+    line) resolve identically to the old behavior; malformed-but-real inputs
+    no longer produce phantom deps.
     """
-    idx = status_block.find("Depends-On:")
-    if idx < 0:
-        return []
-    tail = status_block[idx + len("Depends-On:") :]
-    raw_tokens = tail.split(",")
+    marker = "Depends-On:"
     stems: list[str] = []
-    for raw in raw_tokens:
-        token = raw.strip()
-        # Strip trailing period(s) — operators sometimes terminate the
-        # sentence after the last stem.
-        token = token.rstrip(".")
-        token = token.strip()
-        if not token:
-            continue
-        # Defensive: stop on a newline (the rest of the blockquote may
-        # continue prose unrelated to Depends-On).
-        token = token.splitlines()[0].strip()
-        if not token:
-            continue
-        stems.append(token)
+    seen: set[str] = set()
+    search_from = 0
+    while True:
+        idx = status_block.find(marker, search_from)
+        if idx < 0:
+            break
+        search_from = idx + len(marker)
+        # Restrict to the rest of THIS physical line — never bleed into the
+        # next blockquote paragraph (unrelated plan stems may be named there).
+        tail = status_block[search_from:]
+        line = tail.splitlines()[0] if tail else ""
+        for match in _STEM_RE.finditer(line):
+            stem = match.group(0)
+            if stem not in seen:
+                seen.add(stem)
+                stems.append(stem)
     return stems
 
 
