@@ -179,6 +179,11 @@ resource "aws_iam_role_policy_attachment" "task_exec_managed" {
 # Account id for constructing prefix-scoped secret ARNs below.
 data "aws_caller_identity" "current" {}
 
+# Region + partition for constructing CloudWatch Logs group ARNs (the twin
+# Ξ_Log observer's read grant below).
+data "aws_region" "current" {}
+data "aws_partition" "current" {}
+
 # Task exec role needs to read every secret coord consumes at task-launch.
 #
 # PREFIX-SCOPED (not an explicit ARN list) — deliberately. coord's full
@@ -339,6 +344,35 @@ resource "aws_iam_role_policy" "task_twin_infra_observer" {
   name   = "qontinui-${var.environment}-coord-twin-infra-observer"
   role   = aws_iam_role.task.id
   policy = data.aws_iam_policy_document.task_twin_infra_observer.json
+}
+
+# ─── Twin Ξ_Log observer — CloudWatch Logs read grant ─────────────────────
+#
+# The error_observer (Ξ_Log, plan 2026-05-31-twin-health-and-log-layer) tails
+# the per-service ECS log groups via `logs:FilterLogEvents` to roll up the
+# error/5xx stream. WITHOUT this grant the calls are AccessDenied and the
+# observer correctly degrades to blind (coverage<1, never a false "0 errors") —
+# but it cannot actually observe. This is the read-only analogue of
+# `task_twin_infra_observer`, scoped to exactly the three log groups the
+# observer reads: /ecs/qontinui-<env>/{coord,web,migrator}.
+data "aws_iam_policy_document" "task_twin_log_observer" {
+  statement {
+    sid = "TwinLogReadEcsServiceLogGroups"
+    actions = [
+      "logs:FilterLogEvents",
+      "logs:GetLogEvents",
+    ]
+    resources = [
+      for svc in ["coord", "web", "migrator"] :
+      "arn:${data.aws_partition.current.partition}:logs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:log-group:/ecs/qontinui-${var.environment}/${svc}:*"
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "task_twin_log_observer" {
+  name   = "qontinui-${var.environment}-coord-twin-log-observer"
+  role   = aws_iam_role.task.id
+  policy = data.aws_iam_policy_document.task_twin_log_observer.json
 }
 
 # ─── Task definition (BOOTSTRAP-ONLY) ─────────────────────────────────────
