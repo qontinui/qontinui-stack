@@ -80,15 +80,19 @@ COPY qontinui-web/backend/alembic /app/alembic
 COPY qontinui-web/backend/app /app/app
 
 # ---- Entrypoint --------------------------------------------------------------
+# Strip CR before chmod: docker build copies the working tree, not the git blob.
+# On a Windows checkout with core.autocrlf=true the .sh arrives CRLF despite the
+# repo's `*.sh eol=lf` .gitattributes, and tini then fails with
+# `exec /entrypoint.sh failed: No such file or directory` (shebang -> /bin/sh\r).
 COPY qontinui-stack/migrator/entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
 
 # ---- Healthcheck script (alembic-status sidecar) -----------------------------
 # Long-running observers reuse this image with `command: ["sleep", "infinity"]`
 # and a docker healthcheck that calls /alembic_at_head.sh. See
 # qontinui-stack/docker-compose.yml `alembic-status` service.
 COPY qontinui-stack/migrator/alembic_at_head.sh /alembic_at_head.sh
-RUN chmod +x /alembic_at_head.sh
+RUN sed -i 's/\r$//' /alembic_at_head.sh && chmod +x /alembic_at_head.sh
 
 # Smoke-check at build time: the model graph must import cleanly. If a future
 # qontinui-web change adds an import that needs a dep we don't ship, this
