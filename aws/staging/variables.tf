@@ -102,6 +102,20 @@ variable "cognito_user_pool_arn" {
   default     = "arn:aws:cognito-idp:us-east-1:047719635665:userpool/us-east-1_rgTB9dbZ1"
 }
 
+variable "signup_allowlist" {
+  description = <<-EOT
+    Comma-separated, case-insensitive emails permitted to self-service /
+    federate sign-up — the PreSignUp handler's invitation-only gate
+    (module.cross_idp_linking). Empty = enforcement DISABLED (fail-open).
+    Admin-created users always bypass the gate. SENSITIVE: do NOT commit real
+    customer emails to terraform.tfvars; supply at apply time via
+    `-var 'signup_allowlist=...'` or a gitignored secret tfvars.
+  EOT
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
 # ─── Cost control ───────────────────────────────────────────────────────
 
 variable "budget_monthly_limit" {

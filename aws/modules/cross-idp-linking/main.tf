@@ -61,6 +61,13 @@ variable "user_pool_id" {
   description = "Bare pool id (e.g. us-east-1_rgTB9dbZ1) — passed to the handler as the USER_POOL_ID env var so it can call list_users / admin_link_provider_for_user. Derived from user_pool_arn by the composition root."
 }
 
+variable "signup_allowlist" {
+  type        = string
+  default     = ""
+  description = "Comma-separated, case-insensitive emails permitted to self-service / federate sign-up (the PreSignUp handler's invitation-only gate). Empty string = enforcement DISABLED (fail-open). Admin-created users always bypass the gate. Supply via tfvars / -var; do not hardcode customer emails in the repo."
+  sensitive   = true
+}
+
 # ─── Source package ──────────────────────────────────────────────────────
 # Zip the handler at plan/apply time. boto3 ships in the Lambda Python runtime,
 # so no vendored deps are bundled — just handler.py.
@@ -141,7 +148,8 @@ resource "aws_lambda_function" "presignup" {
 
   environment {
     variables = {
-      USER_POOL_ID = var.user_pool_id
+      USER_POOL_ID     = var.user_pool_id
+      SIGNUP_ALLOWLIST = var.signup_allowlist
     }
   }
 

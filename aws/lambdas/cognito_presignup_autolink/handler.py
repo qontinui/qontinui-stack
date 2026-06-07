@@ -79,6 +79,43 @@ def _is_external_provider_trigger(event: dict[str, Any]) -> bool:
     return event.get("triggerSource") == "PreSignUp_ExternalProvider"
 
 
+def _allowlist() -> set[str] | None:
+    """Parse SIGNUP_ALLOWLIST — comma-separated, case-insensitive emails
+    permitted to self-service / federate sign-up.
+
+    Returns None when the env var is absent or empty, which DISABLES
+    enforcement (fail-open). This is deliberate: a missing/cleared config must
+    never silently lock every new login out of the platform. Enforcement is
+    active only when the list is explicitly populated.
+    """
+    raw = os.environ.get("SIGNUP_ALLOWLIST", "").strip()
+    if not raw:
+        return None
+    return {e.strip().lower() for e in raw.split(",") if e.strip()}
+
+
+def _enforce_signup_allowlist(email: str | None) -> None:
+    """Invitation-only gate: raise (→ Cognito denies the sign-up) when the
+    incoming email is not on the allowlist. No-op when the allowlist is unset
+    (fail-open). Callers must NOT invoke this for PreSignUp_AdminCreateUser —
+    admin-provisioned accounts are the trusted path and always bypass the gate.
+    """
+    allow = _allowlist()
+    if allow is None:
+        logger.warning(
+            "presignup: SIGNUP_ALLOWLIST unset — invitation-only gate DISABLED "
+            "(fail-open)"
+        )
+        return
+    if (email or "").strip().lower() not in allow:
+        logger.info("presignup: BLOCK sign-up — email not on allowlist")
+        # Raising fails the PreSignUp trigger; Cognito rejects the sign-up.
+        raise Exception(
+            "Sign-up is by invitation only. Contact the administrator for access."
+        )
+    logger.info("presignup: allow sign-up — email on allowlist")
+
+
 def _find_unique_native_match(user_pool_id: str, email: str) -> dict[str, Any] | None:
     """Return the single existing CONFIRMED, native, email-verified user with
     this email, or None if there is no such user OR more than one candidate
@@ -122,13 +159,21 @@ def handler(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
     """PreSignUp_ExternalProvider entrypoint. Mutates event["response"] in place
     and returns the event (Cognito contract)."""
     response = event.setdefault("response", {})
+    trigger = event.get("triggerSource")
+    attrs = event.get("request", {}).get("userAttributes", {}) or {}
+
+    # Invitation-only gate. Block any self-service or federated sign-up whose
+    # email is not on the allowlist. Admin-created users
+    # (PreSignUp_AdminCreateUser) are the trusted provisioning path and are
+    # never gated. No-op when SIGNUP_ALLOWLIST is unset (fail-open).
+    if trigger != "PreSignUp_AdminCreateUser":
+        _enforce_signup_allowlist(attrs.get("email"))
 
     if not _is_external_provider_trigger(event):
-        # Not a federated sign-up — leave untouched.
+        # Not a federated sign-up — leave untouched (gate already applied).
         return event
 
     user_pool_id = os.environ["USER_POOL_ID"]
-    attrs = event.get("request", {}).get("userAttributes", {}) or {}
 
     email = attrs.get("email")
     email_verified = attrs.get("email_verified")
