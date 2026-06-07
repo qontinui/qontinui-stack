@@ -199,19 +199,49 @@ if [[ -z "$canonical_path" ]]; then
   canonical_path="$(cd "$wt_root" && pwd -P)"
 fi
 
+# Normalize to the runner's `worktree_resource_key` form so the coord lookup
+# key matches byte-for-byte (qontinui-runner agent_worktree/mod.rs:
+# worktree_resource_key): MSYS `/d/foo` -> `d:/foo`, backslashes -> slashes,
+# strip trailing slash, lowercase. `realpath` under Git-Bash emits the `/d/...`
+# shape, but the runner STORES `d:/...` and coord only lowercases the drive on
+# lookup (it does NOT fold `/d/` -> `d:/`), so without this the key never
+# matches and the guard always sees "no claim". Fail-open: on any failure the
+# raw path is kept (a non-matching key just yields a null lookup -> WARN).
+normalize_resource_key() {
+  local p="$1"
+  if [[ "$p" =~ ^/([a-zA-Z])/(.*)$ ]]; then
+    p="${BASH_REMATCH[1]}:/${BASH_REMATCH[2]}"
+  fi
+  p="${p//\\//}"   # backslashes -> forward slashes
+  p="${p%/}"        # strip a single trailing slash
+  p="${p,,}"        # lowercase (matches the runner's .to_lowercase())
+  printf '%s' "$p"
+}
+canonical_path="$(normalize_resource_key "$canonical_path" 2>/dev/null || printf '%s' "$canonical_path")"
+
 # ---- resolve caller identity (machine_id + session_id) --------------------
 machine_id=""
-if [[ -n "${QONTINUI_AGENT_ID:-}" ]]; then
+if [[ -n "${QONTINUI_MACHINE_ID:-}" ]]; then
+  machine_id="$QONTINUI_MACHINE_ID"
+elif [[ -n "${QONTINUI_AGENT_ID:-}" ]]; then
   machine_id="$QONTINUI_AGENT_ID"
 fi
+# machine.json carries the canonical id under `device_id` (post unified-devices);
+# fall back to legacy `machine_id`. The coord owner token is keyed on the device
+# UUID, so reading device_id first is what makes "held-by-us" recognize our own
+# runner-registered worktree claim (mirrors the runner's read_device_id chain).
 if [[ -z "$machine_id" ]] && [[ -f "$HOME/.qontinui/machine.json" ]]; then
   if command -v jq >/dev/null 2>&1; then
-    machine_id="$(jq -r '.machine_id // empty' "$HOME/.qontinui/machine.json" 2>/dev/null || true)"
+    machine_id="$(jq -r '.device_id // .machine_id // empty' "$HOME/.qontinui/machine.json" 2>/dev/null || true)"
   else
-    machine_id="$(grep -oE '"machine_id"[[:space:]]*:[[:space:]]*"[^"]+"' \
+    machine_id="$(grep -oE '"device_id"[[:space:]]*:[[:space:]]*"[^"]+"' \
       "$HOME/.qontinui/machine.json" 2>/dev/null \
-      | sed -E 's/.*"machine_id"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' \
-      | head -n1 || true)"
+      | sed -E 's/.*:[[:space:]]*"([^"]+)".*/\1/' | head -n1 || true)"
+    if [[ -z "$machine_id" ]]; then
+      machine_id="$(grep -oE '"machine_id"[[:space:]]*:[[:space:]]*"[^"]+"' \
+        "$HOME/.qontinui/machine.json" 2>/dev/null \
+        | sed -E 's/.*:[[:space:]]*"([^"]+)".*/\1/' | head -n1 || true)"
+    fi
   fi
 fi
 if [[ -z "$machine_id" ]] && [[ -f "$HOME/.qontinui/machine_id" ]]; then
@@ -235,7 +265,15 @@ if [[ -z "$session_id" ]] && [[ -f "$HOME/.qontinui/agent_session_id" ]]; then
 fi
 
 # ---- coord URL -------------------------------------------------------------
-coord_url="${COORD_URL:-http://localhost:9870}"
+# Resolve coord base: COORD_HTTP_URL (the stack-wide standard the runner + skills
+# use) -> legacy COORD_URL -> prod default. The old `localhost:9870` default was
+# unreachable in prod, so the guard silently no-op'd (fail-open) and never checked
+# a real claim. Default to prod so the guard actually queries the live coord.
+coord_url="${COORD_HTTP_URL:-${COORD_URL:-https://coord.qontinui.io}}"
+# ws/wss -> http/https + strip a trailing /ws (runner agent_runtime parity).
+coord_url="${coord_url%/ws}"
+coord_url="${coord_url/#wss:/https:}"
+coord_url="${coord_url/#ws:/http:}"
 coord_url="${coord_url%/}"
 
 # ---- urlencode the path ----------------------------------------------------
