@@ -261,10 +261,11 @@ module "web" {
 module "cross_idp_linking" {
   source = "../modules/cross-idp-linking"
 
-  environment   = var.environment
-  region        = var.region
-  user_pool_arn = var.cognito_user_pool_arn
-  user_pool_id  = element(split("/", var.cognito_user_pool_arn), 1)
+  environment      = var.environment
+  region           = var.region
+  user_pool_arn    = var.cognito_user_pool_arn
+  user_pool_id     = element(split("/", var.cognito_user_pool_arn), 1)
+  signup_allowlist = var.signup_allowlist
 }
 
 # ─── Tunnel (ALB + ACM + Route53) ───────────────────────────────────────

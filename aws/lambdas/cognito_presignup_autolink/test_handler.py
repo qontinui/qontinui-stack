@@ -204,3 +204,75 @@ def test_non_external_trigger_untouched(mod):
 
     assert fake.link_calls == []
     assert out["response"] == {}
+
+
+# ─── Invitation-only allowlist gate ──────────────────────────────────────────
+
+def test_allowlist_unset_failopen_external_proceeds(mod, monkeypatch):
+    # No SIGNUP_ALLOWLIST → enforcement disabled → behaves exactly as before
+    # (here: verified Google + single match still auto-links).
+    monkeypatch.delenv("SIGNUP_ALLOWLIST", raising=False)
+    fake = FakeCognito([_native_user(email="user@example.com")])
+    _install_client(mod, fake)
+
+    out = mod.handler(_event(email="user@example.com"))
+
+    assert len(fake.link_calls) == 1
+    assert out["response"]["autoConfirmUser"] is True
+
+
+def test_allowlist_blocks_unlisted_external(mod, monkeypatch):
+    monkeypatch.setenv("SIGNUP_ALLOWLIST", "allowed@example.com")
+    fake = FakeCognito([_native_user(email="stranger@example.com")])
+    _install_client(mod, fake)
+
+    with pytest.raises(Exception):
+        mod.handler(_event(email="stranger@example.com"))
+    assert fake.link_calls == []
+
+
+def test_allowlist_allows_listed_external_and_links(mod, monkeypatch):
+    monkeypatch.setenv("SIGNUP_ALLOWLIST", "allowed@example.com, other@example.com")
+    fake = FakeCognito([_native_user(email="allowed@example.com")])
+    _install_client(mod, fake)
+
+    out = mod.handler(_event(email="allowed@example.com"))
+
+    assert len(fake.link_calls) == 1
+    assert out["response"]["autoConfirmUser"] is True
+
+
+def test_allowlist_case_insensitive(mod, monkeypatch):
+    monkeypatch.setenv("SIGNUP_ALLOWLIST", "Allowed@Example.com")
+    fake = FakeCognito([_native_user(email="allowed@example.com")])
+    _install_client(mod, fake)
+
+    out = mod.handler(_event(email="ALLOWED@example.com"))
+
+    assert len(fake.link_calls) == 1
+
+
+def test_allowlist_blocks_unlisted_native_signup(mod, monkeypatch):
+    # Belt-and-suspenders: a native self sign-up (PreSignUp_SignUp) by a
+    # non-allowlisted email is also blocked (in addition to the pool's
+    # AllowAdminCreateUserOnly=true).
+    monkeypatch.setenv("SIGNUP_ALLOWLIST", "allowed@example.com")
+    fake = FakeCognito([])
+    _install_client(mod, fake)
+
+    with pytest.raises(Exception):
+        mod.handler(_event(email="stranger@example.com", trigger="PreSignUp_SignUp"))
+
+
+def test_allowlist_admin_create_bypasses_gate(mod, monkeypatch):
+    # Admin-created users (how Stefan is onboarded) bypass the allowlist even
+    # if their email isn't on it.
+    monkeypatch.setenv("SIGNUP_ALLOWLIST", "someoneelse@example.com")
+    fake = FakeCognito([])
+    _install_client(mod, fake)
+
+    out = mod.handler(_event(email="stefan@example.com",
+                             trigger="PreSignUp_AdminCreateUser"))
+
+    assert fake.link_calls == []
+    assert out["response"] == {}
