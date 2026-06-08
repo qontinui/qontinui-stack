@@ -37,6 +37,14 @@ variable "coord_admin_secret" {
   # COORD_ADMIN_SECRET to gate POST /coord/auth/service-token.
 }
 
+variable "coord_web_service_secret" {
+  type      = string
+  sensitive = true
+  # Shared with the web backend. coord sends it as the X-Coord-Service-Secret
+  # header on the gate-action notification webhook (T3); web verifies it.
+  # Stored here so the ARN is stable for deploy/taskdef.json to reference.
+}
+
 variable "s3_bucket_arn" { type = string }
 
 # Phase 8 cold-tier PTY-output bucket. coord is the sole writer/reader; the
@@ -115,6 +123,16 @@ resource "aws_secretsmanager_secret" "coord_admin_secret" {
 resource "aws_secretsmanager_secret_version" "coord_admin_secret" {
   secret_id     = aws_secretsmanager_secret.coord_admin_secret.id
   secret_string = var.coord_admin_secret
+}
+
+resource "aws_secretsmanager_secret" "web_service_secret" {
+  name        = "qontinui/${var.environment}/coord/web_service_secret"
+  description = "Shared secret for the coord→web gate-action notification webhook (${var.environment}). Same value as web/coord_web_service_secret. coord mounts it as COORD_WEB_SERVICE_SECRET via deploy/taskdef.json; the qontinui/${var.environment}/coord* exec-role glob already covers it."
+}
+
+resource "aws_secretsmanager_secret_version" "web_service_secret" {
+  secret_id     = aws_secretsmanager_secret.web_service_secret.id
+  secret_string = var.coord_web_service_secret
 }
 
 # JWT signing key (Ed25519 PKCS#8 PEM). Operator-staged out-of-band; this
