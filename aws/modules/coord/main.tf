@@ -580,18 +580,23 @@ resource "aws_lb_target_group" "coord" {
 
   # Coord HA D.3 (PR-S1) — the ALB health check gates ECS rollout: a target is
   # "healthy enough to drain the previous one" only when it returns 200 here.
-  # Repointed from /health (liveness: PG+Redis) to /ready (git-readiness: this
-  # task has bootstrapped to the fleet ack-frontier, or the fleet is at
-  # cold-start frontier 0). With this, `aws ecs wait services-stable` waits for
-  # a new follower to hold the frontier before the old caught-up task is
-  # deregistered — keeping >=1 caught-up live node across a rolling deploy and
-  # closing the deploy-induced write-plane stall (plan
-  # 2026-05-30-coord-ha-d3-failover-calibration, Axis c1). REQUIRES a coord
-  # image that serves /ready (coord PR-1) deployed FIRST — see the landing
-  # sequence; repointing before /ready exists would brick the next deploy.
+  # Coord HA readiness-deadlock Fix A (plan 2026-06-09-coord-ha-readiness-deadlock):
+  # repointed from /ready -> /livez. D.3 had pointed this at /ready (git-readiness),
+  # but that made the ALB the sole reaper of a *catching-up* task (no container
+  # healthCheck exists), creating a death-spiral: a replica behind the ack-frontier
+  # with no caught-up peer correctly 503s /ready, gets reaped, which REMOVES the
+  # peer the fleet needs to catch up -> with 2 tasks the whole write plane can
+  # collapse. /livez is pure process-up (no PG/Redis/git probe), so ECS now only
+  # replaces a task whose PROCESS is dead, never one that is merely catching up —
+  # a catching-up replica stays alive and becomes the caught-up peer. RPO-0 is
+  # preserved app-level by the write_serving_ready gate + write-proxy-to-leader
+  # (a catching-up node still refuses write authority), independent of ALB routing.
+  # REQUIRES a coord image that serves /livez deployed FIRST — repointing before
+  # /livez exists would reap every task. (interval/timeout/thresholds unchanged —
+  # they now budget genuine process-start, not catch-up.)
   health_check {
     enabled             = true
-    path                = "/ready"
+    path                = "/livez"
     port                = "9870"
     protocol            = "HTTP"
     interval            = 30
