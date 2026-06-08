@@ -649,7 +649,17 @@ resource "aws_ecs_service" "coord" {
   # never serves /ready fails the deployment — see the circuit breaker, PR-S2.)
   health_check_grace_period_seconds = 180
 
-  deployment_minimum_healthy_percent = 50
+  # Coord HA Hardening Phase 1 (2026-06-08 outage fix) — 50 -> 100. At 50%,
+  # ECS may take this desired=2 service down to a SINGLE task mid-deploy; with
+  # `--force-new-deployment` churning every task, the lone survivor could be
+  # drained before a fresh task caught up to the ack-frontier, collapsing the
+  # caught-up quorum and wedging the RPO-0 write plane (the deploy deadlock the
+  # ALB-/ready repoint + circuit breaker alone did NOT prevent). At 100% (with
+  # maximum 200%) ECS must ADD new tasks and wait for them to pass the /ready
+  # health check BEFORE it drains either caught-up survivor — so the service
+  # never drops below 2 caught-up tasks. This quorum floor, not the circuit
+  # breaker, is what makes a coord rolling deploy safe.
+  deployment_minimum_healthy_percent = 100
   deployment_maximum_percent         = 200
 
   # Coord HA D.3 (PR-S2) — with the ALB health check now pointed at /ready
