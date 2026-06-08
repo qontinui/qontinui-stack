@@ -48,6 +48,15 @@ resource "random_password" "coord_admin_secret" {
   special = false
 }
 
+# Shared service secret for the coord→web gate-action notification webhook
+# (plan 2026-06-07-gate-action-notifications-t3). The SAME value is duplicated
+# into a coord-side and a web-side Secrets Manager entry (mirroring
+# coord_admin_secret) so neither task-exec role needs a cross-module IAM grant.
+resource "random_password" "coord_web_service_secret" {
+  length  = 48
+  special = false
+}
+
 # ─── Network ────────────────────────────────────────────────────────────
 
 module "network" {
@@ -136,6 +145,10 @@ module "coord" {
   redis_url             = module.redis.connection_string
   github_webhook_secret = var.coord_github_webhook_secret
   coord_admin_secret    = random_password.coord_admin_secret.result
+  # Shared with web for the gate-action notification webhook (T3). coord's
+  # task-exec role already wildcards qontinui/${env}/coord*, so this needs no
+  # IAM change; the coord container mounts it via deploy/taskdef.json.
+  coord_web_service_secret = random_password.coord_web_service_secret.result
 
   s3_bucket_arn = module.blob.bucket_arn
 
@@ -220,6 +233,8 @@ module "web" {
   coord_url          = "https://${var.coord_subdomain}.${var.domain_name}"
   coord_admin_secret = random_password.coord_admin_secret.result # same value coord uses
   secret_key         = random_password.web_secret_key.result
+  # Same value coord uses — verifies the inbound gate-action webhook (T3).
+  coord_web_service_secret = random_password.coord_web_service_secret.result
 
   frontend_url = var.frontend_url
   backend_url  = "https://${var.web_subdomain}.${var.domain_name}"

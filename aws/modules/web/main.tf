@@ -61,6 +61,12 @@ variable "coord_admin_secret" {
   type      = string
   sensitive = true
 }
+variable "coord_web_service_secret" {
+  type      = string
+  sensitive = true
+  # Same value coord uses. Web verifies the inbound X-Coord-Service-Secret
+  # header on the gate-action notification webhook (T3) against this.
+}
 variable "secret_key" {
   type        = string
   sensitive   = true
@@ -135,6 +141,16 @@ resource "aws_secretsmanager_secret_version" "coord_admin_secret" {
   secret_string = var.coord_admin_secret
 }
 
+resource "aws_secretsmanager_secret" "coord_web_service_secret" {
+  name        = "qontinui/${var.environment}/web/coord_web_service_secret"
+  description = "Shared secret for the coord→web gate-action notification webhook (${var.environment}). Same value as coord/web_service_secret; duplicated here so the web task-exec role doesn't need cross-module IAM grants."
+}
+
+resource "aws_secretsmanager_secret_version" "coord_web_service_secret" {
+  secret_id     = aws_secretsmanager_secret.coord_web_service_secret.id
+  secret_string = var.coord_web_service_secret
+}
+
 resource "aws_secretsmanager_secret" "secret_key" {
   name        = "qontinui/${var.environment}/web/secret_key"
   description = "JWT signing secret for qontinui-web (${var.environment})."
@@ -179,6 +195,7 @@ data "aws_iam_policy_document" "task_exec_secrets" {
     resources = [
       aws_secretsmanager_secret.database_url.arn,
       aws_secretsmanager_secret.coord_admin_secret.arn,
+      aws_secretsmanager_secret.coord_web_service_secret.arn,
       aws_secretsmanager_secret.secret_key.arn,
       data.aws_secretsmanager_secret.redis_url.arn,
     ]
@@ -281,6 +298,11 @@ resource "aws_ecs_task_definition" "web" {
       secrets = [
         { name = "DATABASE_URL", valueFrom = aws_secretsmanager_secret.database_url.arn },
         { name = "COORD_ADMIN_SECRET", valueFrom = aws_secretsmanager_secret.coord_admin_secret.arn },
+        # Inbound gate-action webhook auth (T3). NOTE: the web service
+        # `ignore_changes`s its task_definition (deploys clone the live def +
+        # swap the image), so this bootstrap-def entry is for parity only — the
+        # running mount is added to the live task def at activation time.
+        { name = "COORD_WEB_SERVICE_SECRET", valueFrom = aws_secretsmanager_secret.coord_web_service_secret.arn },
         { name = "SECRET_KEY", valueFrom = aws_secretsmanager_secret.secret_key.arn },
         # REDIS_URL (rediss:// Upstash DSN) — the exec role is already granted
         # GetSecretValue on this secret above; mounting it here is what makes
