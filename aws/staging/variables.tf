@@ -132,9 +132,9 @@ variable "budget_alert_email" {
 # ─── Postgres ───────────────────────────────────────────────────────────
 
 variable "postgres_instance_class" {
-  description = "RDS instance class. db.t4g.micro is current sizing."
+  description = "RDS instance class. Upsized to db.t4g.small (2 GiB) after db.t4g.micro (1 GiB) OOM-crashed 3x in 24h (2026-06-08/09): FreeableMemory floored ~90 MiB and RDS auto-halved shared_buffers. Bump to db.t4g.medium (4 GiB) if crashes recur."
   type        = string
-  default     = "db.t4g.micro"
+  default     = "db.t4g.small"
 }
 
 variable "postgres_allocated_storage_gb" {
