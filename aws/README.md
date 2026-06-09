@@ -7,7 +7,7 @@ recreate data resources, so the names are preserved.
 
 | Service          | Local (compose) | AWS (production)                 |
 |------------------|-----------------|----------------------------------|
-| Postgres 16      | container       | RDS db.t4g.micro                 |
+| Postgres 16      | container       | RDS db.t4g.medium                |
 | Redis 7          | container       | ElastiCache cache.t4g.micro      |
 | MinIO / S3       | MinIO container | S3 bucket                        |
 | qontinui-coord   | container       | ECS Fargate (2 tasks, 0.25 vCPU) |
@@ -21,13 +21,13 @@ just a different `DATABASE_URL` / `REDIS_URL` / `coord_url`.
 
 | Item                           | Approx. |
 |--------------------------------|---------|
-| RDS db.t4g.micro (single AZ)   | ~$13    |
+| RDS db.t4g.medium (single AZ)  | ~$49    |
 | ElastiCache cache.t4g.micro    | ~$12    |
 | S3 (10 GB + minimal traffic)   | ~$1     |
 | ECS Fargate (0.25 vCPU, 24/7)  | ~$9     |
 | ALB                            | ~$16    |
 | CloudWatch logs                | ~$2     |
-| **Total when running**         | **~$53/mo** |
+| **Total when running**         | **~$89/mo** |
 
 When stopped (RDS + ElastiCache stopped, ECS scaled to 0): ~$3/mo for
 storage + ALB. The on/off ritual lives in `scripts/stop.sh` and
@@ -132,14 +132,15 @@ snapshot when needed.
 
 ## Why not Aurora / Neon / managed-anything-fancier
 
-* **Aurora Serverless v2** scales to 0.5 ACU minimum (~$45/mo idle), more
-  expensive than db.t4g.micro at current scale.
+* **Aurora Serverless v2** scales to 0.5 ACU minimum (~$45/mo idle),
+  comparable to db.t4g.medium but with less predictable cost under spikes.
 * **Neon** is the right answer for a *managed cloud product* (per
   business-model plan §1) but this environment is "user's own AWS" by
   design — Neon would mean the user pays a third party for what's already
   provisioned in their AWS account.
-* **RDS db.t4g.micro** is the cheapest fully-managed Postgres. Single-AZ
-  currently; flip to Multi-AZ when HA is needed.
+* **RDS db.t4g.medium** is cheap, fully-managed Postgres (upsized from micro
+  2026-06-09 after chronic 1GiB OOM). Single-AZ currently; flip to Multi-AZ
+  when HA is needed (note: Multi-AZ is for availability, not the OOM fix).
 
 When `qontinui.cloud` (the managed cloud product) launches, it runs on
 Neon + Upstash + Cloudflare Workers — not on this Terraform. This
