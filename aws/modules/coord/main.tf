@@ -472,6 +472,44 @@ resource "aws_iam_role_policy" "task_twin_auth_observer" {
   policy = data.aws_iam_policy_document.task_twin_auth_observer.json
 }
 
+# Digital-twin Ξ_InfraHealth observer (qontinui-coord `infra_health_observer.rs`,
+# coord #484, plan 2026-06-08-twin-infrastructure-health-performance-layer) — the
+# read-only CloudWatch/RDS/ELB/ECS perms its infrastructure-health & performance
+# drift slice needs. WITHOUT this grant the calls are AccessDenied and the
+# observer correctly degrades to blind (coverage<1 / drift_class=unknown, never a
+# false "no drift") — it ships dark until this lands. Read-only analogue of
+# `task_twin_infra_observer`/`task_twin_route_observer`. The observer calls
+# EXACTLY four actions: cloudwatch:GetMetricData (RDS FreeableMemory/CPU/
+# DatabaseConnections + ALB metrics), rds:DescribeEvents (the crash/recovery hard
+# signal), elasticloadbalancing:DescribeTargetHealth (coord TG target health), and
+# ecs:DescribeServices (running-vs-desired). None of the four carry resource-level
+# IAM scoping (CloudWatch GetMetricData + ELBv2/RDS Describe* are "*"-only, same as
+# the route/infra observers above); all are strictly read-only — no metric writes,
+# no RDS modify, no ECS update.
+data "aws_iam_policy_document" "task_twin_infra_health_observer" {
+  statement {
+    sid       = "TwinInfraHealthCloudWatchGetMetricData"
+    actions   = ["cloudwatch:GetMetricData"]
+    resources = ["*"]
+  }
+
+  statement {
+    sid = "TwinInfraHealthReadOnlyDescribes"
+    actions = [
+      "rds:DescribeEvents",
+      "elasticloadbalancing:DescribeTargetHealth",
+      "ecs:DescribeServices",
+    ]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_role_policy" "task_twin_infra_health_observer" {
+  name   = "qontinui-${var.environment}-coord-twin-infra-health-observer"
+  role   = aws_iam_role.task.id
+  policy = data.aws_iam_policy_document.task_twin_infra_health_observer.json
+}
+
 # ─── Task definition (BOOTSTRAP-ONLY) ─────────────────────────────────────
 #
 # This definition exists ONLY to satisfy the `task_definition` argument the
