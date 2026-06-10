@@ -57,6 +57,18 @@ resource "random_password" "coord_web_service_secret" {
   special = false
 }
 
+# Bearer token for the ALB-gated coord /metrics route (plan
+# 2026-06-09-mode-c-graduation-unblock-and-observability, WS5a). Matched
+# verbatim by an `http_header` condition on the HTTPS listener — requests
+# carrying `X-Metrics-Token: <value>` reach coord's Prometheus endpoint;
+# everything else on /metrics gets a fixed 403. The value is mirrored into
+# Secrets Manager (qontinui/<env>/coord/metrics_token, tunnel module) so
+# operators/agents can fetch it for ad-hoc scrapes.
+resource "random_password" "coord_metrics_token" {
+  length  = 64
+  special = false
+}
+
 # ─── Network ────────────────────────────────────────────────────────────
 
 module "network" {
@@ -298,6 +310,7 @@ module "tunnel" {
   coord_target_group = module.coord.target_group_arn
   web_subdomain      = var.web_subdomain
   web_target_group   = module.web.target_group_arn # web Fargate now active
+  metrics_token      = random_password.coord_metrics_token.result
 }
 
 # ─── Cost control (budget + SNS-email alert) ────────────────────────────
