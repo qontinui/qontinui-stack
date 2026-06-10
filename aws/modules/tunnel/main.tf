@@ -17,6 +17,11 @@ variable "web_target_group" {
   type        = string
   description = "Target group ARN for the web Fargate service. Web is no longer deferred (slim image + cloud-control overlay live as of plan 2026-05-17-web-image-slim); the listener rule below is unconditional."
 }
+variable "metrics_token" {
+  type        = string
+  sensitive   = true
+  description = "Shared token gating the coord /metrics route. Requests must send `X-Metrics-Token: <value>` to reach coord's Prometheus endpoint; all other /metrics requests get a fixed 403 instead of falling through to the open coord default action."
+}
 
 locals {
   fqdn     = "${var.coord_subdomain}.${var.domain_name}"
@@ -120,6 +125,78 @@ resource "aws_lb_listener_rule" "web" {
       values = [local.web_fqdn]
     }
   }
+}
+
+# ─── coord /metrics gate ────────────────────────────────────────────────
+#
+# The HTTPS listener's DEFAULT action forwards to coord, so without these
+# rules coord's full Prometheus surface (/metrics) is open to the internet.
+# Two path-pattern rules close that (plan
+# 2026-06-09-mode-c-graduation-unblock-and-observability, WS5a):
+#
+#   110  /metrics + X-Metrics-Token == <token>  → forward to coord TG
+#   111  /metrics (anything else)               → fixed 403
+#
+# Path-only (no host condition) on purpose: coord is reachable via every
+# hostname that isn't claimed by a web host rule (coord.<domain>, the raw
+# ALB DNS name, plus out-of-band production aliases like coord.qontinui.io
+# added during the staging→production domain transition). Gating by path
+# after the web host rules (priorities 90/100) covers all of them; web
+# hosts are matched earlier and keep their normal routing.
+resource "aws_lb_listener_rule" "coord_metrics_authed" {
+  listener_arn = aws_lb_listener.https.arn
+  priority     = 110
+
+  action {
+    type             = "forward"
+    target_group_arn = var.coord_target_group
+  }
+
+  condition {
+    path_pattern {
+      values = ["/metrics", "/metrics/*"]
+    }
+  }
+
+  condition {
+    http_header {
+      http_header_name = "X-Metrics-Token"
+      values           = [var.metrics_token]
+    }
+  }
+}
+
+resource "aws_lb_listener_rule" "coord_metrics_deny" {
+  listener_arn = aws_lb_listener.https.arn
+  priority     = 111
+
+  action {
+    type = "fixed-response"
+
+    fixed_response {
+      content_type = "text/plain"
+      message_body = "forbidden"
+      status_code  = "403"
+    }
+  }
+
+  condition {
+    path_pattern {
+      values = ["/metrics", "/metrics/*"]
+    }
+  }
+}
+
+# Operator/agent retrieval point for the metrics token (mirrors the
+# coord-module Secrets Manager idiom for shared inline secrets).
+resource "aws_secretsmanager_secret" "metrics_token" {
+  name        = "qontinui/${var.environment}/coord/metrics_token"
+  description = "X-Metrics-Token header value gating the ALB coord /metrics route (${var.environment}). Send it verbatim: curl -H \"X-Metrics-Token: $(aws secretsmanager get-secret-value ...)\" https://coord.<domain>/metrics"
+}
+
+resource "aws_secretsmanager_secret_version" "metrics_token" {
+  secret_id     = aws_secretsmanager_secret.metrics_token.id
+  secret_string = var.metrics_token
 }
 
 # ─── DNS ────────────────────────────────────────────────────────────────
