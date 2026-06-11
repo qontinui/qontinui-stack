@@ -24,6 +24,10 @@ variable "coord_service_name" {
   type        = string
   description = "ECS service name (AWS/ECS CPU/mem alarm dimension). From module.coord.service_name."
 }
+variable "coord_log_group_name" {
+  type        = string
+  description = "coord CloudWatch log group (plan-ingest metric filter source). From module.coord.log_group_name."
+}
 
 # coord down: no healthy targets behind the ALB.
 resource "aws_cloudwatch_metric_alarm" "coord_unhealthy" {
@@ -151,6 +155,54 @@ resource "aws_cloudwatch_metric_alarm" "coord_jetstream_err" {
   alarm_actions = [var.sns_topic_arn]
 }
 
+# coord plan-ingest worker inert: the worker runs (logs its 60s cycle line on
+# the leader) but scans zero rows — the silent-failure mode that left
+# plan-ingest a prod no-op (plan 2026-06-10-coord-plan-ingest-prod-noop-fix,
+# Phase 3 open item). Count-style metric filter: the cycle line
+# `plan_ingest_worker: cycle (scanned=347 transitions=0)` is plain text (not
+# JSON / not cleanly space-delimited), so CloudWatch value extraction can't
+# parse the scanned number; instead count lines that literally report
+# `(scanned=0 `. default_value=0 keeps the metric publishing zeros while
+# OTHER coord log traffic flows, so the alarm sits in OK (not
+# INSUFFICIENT_DATA) during healthy operation.
+resource "aws_cloudwatch_log_metric_filter" "coord_plan_ingest_scanned_zero" {
+  name           = "qontinui-${var.environment}-coord-plan-ingest-scanned-zero"
+  log_group_name = var.coord_log_group_name
+  pattern        = "\"plan_ingest_worker: cycle\" \"(scanned=0 \""
+
+  metric_transformation {
+    name          = "plan_ingest_scanned_zero"
+    namespace     = "QontinuiCoord"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+# Leader logs ~1 cycle line/min; >=30 zero-scan cycles in an hour = inert for
+# (at least) most of that hour while tolerating deploy/leader-turnover gaps.
+# LIMITATION (deliberate): a fully-dead worker emits NO cycle lines at all =
+# no matches (and, if coord stops logging entirely, missing data) = no alarm
+# from this watch. That total-silence mode is covered by the service-level
+# alarms above (no-healthy-hosts/5xx); this alarm targets the
+# logging-but-scanning-nothing mode specifically. treat_missing_data
+# notBreaching matches the repo's other app-level custom-metric alarm
+# (jetstream_err).
+resource "aws_cloudwatch_metric_alarm" "coord_plan_ingest_inert" {
+  alarm_name          = "qontinui-${var.environment}-coord-plan-ingest-inert"
+  alarm_description   = "coord plan-ingest worker inert: >=30 cycles with scanned=0 in 60 min (worker logging but scanning nothing)"
+  namespace           = "QontinuiCoord"
+  metric_name         = "plan_ingest_scanned_zero"
+  statistic           = "Sum"
+  period              = 3600
+  evaluation_periods  = 1
+  threshold           = 30
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = [var.sns_topic_arn]
+  ok_actions    = [var.sns_topic_arn]
+}
+
 output "alarm_names" {
   value = [
     aws_cloudwatch_metric_alarm.coord_unhealthy.alarm_name,
@@ -159,5 +211,6 @@ output "alarm_names" {
     aws_cloudwatch_metric_alarm.coord_cpu.alarm_name,
     aws_cloudwatch_metric_alarm.coord_mem.alarm_name,
     aws_cloudwatch_metric_alarm.coord_jetstream_err.alarm_name,
+    aws_cloudwatch_metric_alarm.coord_plan_ingest_inert.alarm_name,
   ]
 }
