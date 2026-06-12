@@ -17,7 +17,6 @@ import json
 import os
 import sys
 import tempfile
-import textwrap
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -56,6 +55,48 @@ def _holder(resource_key: str, machine_id: str, ttl: int = 200) -> dict:
         "resource_key": resource_key,
         "ttl_seconds": ttl,
     }
+
+
+class _FakeResponse:
+    """Minimal urlopen context-manager response."""
+
+    def __init__(self, payload: dict) -> None:
+        self._body = json.dumps(payload).encode("utf-8")
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self) -> "_FakeResponse":
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+
+def _req_headers_lower(req) -> dict:
+    """urllib capitalizes header keys; normalize for assertions."""
+    return {k.lower(): v for k, v in req.headers.items()}
+
+
+_PROXY_MCP = {
+    "mcpServers": {
+        "coord-mcp": {
+            "type": "http",
+            "url": "http://127.0.0.1:9876/coord-mcp",
+            "headers": {"X-Coord-Mcp-Proxy-Key": "nonce-abc123"},
+        }
+    }
+}
+
+_BEARER_MCP = {
+    "mcpServers": {
+        "coord-mcp": {
+            "type": "http",
+            "url": "https://coord.qontinui.io/mcp",
+            "headers": {"Authorization": "Bearer agent-jwt-xyz"},
+        }
+    }
+}
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +292,236 @@ class MachineJsonTests(unittest.TestCase):
                 os.environ, {"QONTINUI_MACHINE_JSON_PATH": str(p)}
             ):
                 self.assertIsNone(scbm._read_local_machine_id())
+
+
+class ResolveClaimsAuthTests(unittest.TestCase):
+    """``.mcp.json`` dual-shape classification (Phase 3 read-auth)."""
+
+    def setUp(self) -> None:
+        # Hermetic: a developer machine may export QONTINUI_MCP_JSON.
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("QONTINUI_MCP_JSON", None)
+
+    def _write_mcp(self, td: str, payload) -> Path:
+        p = Path(td) / ".mcp.json"
+        body = payload if isinstance(payload, str) else json.dumps(payload)
+        p.write_text(body, encoding="utf-8")
+        return p
+
+    def test_proxy_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            self._write_mcp(td, _PROXY_MCP)
+            auth = scbm.resolve_claims_auth(Path(td))
+        self.assertEqual(auth.mode, "proxy")
+        self.assertEqual(auth.proxy_base, "http://127.0.0.1:9876/coord-mcp")
+        self.assertEqual(
+            auth.headers, {"X-Coord-Mcp-Proxy-Key": "nonce-abc123"}
+        )
+
+    def test_bearer_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            self._write_mcp(td, _BEARER_MCP)
+            auth = scbm.resolve_claims_auth(Path(td))
+        self.assertEqual(auth.mode, "bearer")
+        self.assertIsNone(auth.proxy_base)
+        self.assertEqual(auth.headers, {"Authorization": "Bearer agent-jwt-xyz"})
+
+    def test_missing_file_is_anonymous(self) -> None:
+        # Explicit override pointing at a nonexistent file (hermetic — a
+        # cwd walk-up could find a real workspace .mcp.json above $TMP).
+        with tempfile.TemporaryDirectory() as td:
+            auth = scbm.resolve_claims_auth(
+                Path(td), str(Path(td) / "absent.mcp.json")
+            )
+        self.assertEqual(auth.mode, "anonymous")
+        self.assertEqual(auth.headers, {})
+
+    def test_malformed_json_is_anonymous(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            self._write_mcp(td, "{not json")
+            auth = scbm.resolve_claims_auth(Path(td))
+        self.assertEqual(auth.mode, "anonymous")
+
+    def test_unrecognized_shape_is_anonymous(self) -> None:
+        # coord-mcp entry present but with neither nonce nor bearer.
+        with tempfile.TemporaryDirectory() as td:
+            self._write_mcp(
+                td,
+                {
+                    "mcpServers": {
+                        "coord-mcp": {
+                            "type": "http",
+                            "url": "https://coord.qontinui.io/mcp",
+                            "headers": {},
+                        }
+                    }
+                },
+            )
+            auth = scbm.resolve_claims_auth(Path(td))
+        self.assertEqual(auth.mode, "anonymous")
+
+    def test_bearer_on_loopback_is_anonymous(self) -> None:
+        # Loopback URL without the proxy nonce never becomes bearer mode.
+        with tempfile.TemporaryDirectory() as td:
+            self._write_mcp(
+                td,
+                {
+                    "mcpServers": {
+                        "coord-mcp": {
+                            "type": "http",
+                            "url": "http://127.0.0.1:9876/coord-mcp",
+                            "headers": {"Authorization": "Bearer x"},
+                        }
+                    }
+                },
+            )
+            auth = scbm.resolve_claims_auth(Path(td))
+        self.assertEqual(auth.mode, "anonymous")
+
+    def test_walks_up_from_subdir(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            self._write_mcp(td, _PROXY_MCP)
+            sub = Path(td) / "a" / "b"
+            sub.mkdir(parents=True)
+            auth = scbm.resolve_claims_auth(sub)
+        self.assertEqual(auth.mode, "proxy")
+
+    def test_env_override_wins(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            # cwd has a proxy-shape file; env points at a bearer-shape one.
+            self._write_mcp(td, _PROXY_MCP)
+            other = Path(td) / "elsewhere"
+            other.mkdir()
+            env_file = other / "custom-mcp.json"
+            env_file.write_text(json.dumps(_BEARER_MCP), encoding="utf-8")
+            with mock.patch.dict(
+                os.environ, {"QONTINUI_MCP_JSON": str(env_file)}
+            ):
+                auth = scbm.resolve_claims_auth(Path(td))
+        self.assertEqual(auth.mode, "bearer")
+
+    def test_explicit_arg_beats_env(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            arg_file = Path(td) / "arg-mcp.json"
+            arg_file.write_text(json.dumps(_PROXY_MCP), encoding="utf-8")
+            with mock.patch.dict(
+                os.environ, {"QONTINUI_MCP_JSON": str(Path(td) / "nope.json")}
+            ):
+                auth = scbm.resolve_claims_auth(Path(td), str(arg_file))
+        self.assertEqual(auth.mode, "proxy")
+
+
+class FetchHoldersAuthTests(unittest.TestCase):
+    """Wire-level behavior of ``fetch_holders`` per auth mode (mocked urlopen)."""
+
+    _PAYLOAD = {"holders": [_holder("r:f.rs:sym", "OTHER")]}
+
+    def test_proxy_mode_hits_loopback_with_nonce(self) -> None:
+        auth = scbm.ClaimsAuth(
+            mode="proxy",
+            proxy_base="http://127.0.0.1:9876/coord-mcp",
+            headers={"X-Coord-Mcp-Proxy-Key": "nonce-abc123"},
+        )
+        with mock.patch(
+            "urllib.request.urlopen", return_value=_FakeResponse(self._PAYLOAD)
+        ) as m:
+            holders = scbm.fetch_holders("r", "f.rs", auth=auth)
+        self.assertEqual(len(holders), 1)
+        self.assertEqual(m.call_count, 1)
+        req = m.call_args[0][0]
+        self.assertTrue(
+            req.full_url.startswith(
+                "http://127.0.0.1:9876/coord-mcp/claims/list?"
+            ),
+            req.full_url,
+        )
+        self.assertIn("kind=symbol", req.full_url)
+        self.assertEqual(
+            _req_headers_lower(req).get("x-coord-mcp-proxy-key"),
+            "nonce-abc123",
+        )
+        self.assertEqual(m.call_args[1].get("timeout"), 2.5)
+
+    def test_bearer_mode_hits_coord_with_authorization(self) -> None:
+        auth = scbm.ClaimsAuth(
+            mode="bearer", headers={"Authorization": "Bearer agent-jwt-xyz"}
+        )
+        with mock.patch(
+            "urllib.request.urlopen", return_value=_FakeResponse(self._PAYLOAD)
+        ) as m:
+            holders = scbm.fetch_holders(
+                "r", "f.rs", coord_url="https://coord.example", auth=auth
+            )
+        self.assertEqual(len(holders), 1)
+        self.assertEqual(m.call_count, 1)
+        req = m.call_args[0][0]
+        self.assertTrue(
+            req.full_url.startswith("https://coord.example/coord/claims/list?"),
+            req.full_url,
+        )
+        self.assertEqual(
+            _req_headers_lower(req).get("authorization"), "Bearer agent-jwt-xyz"
+        )
+        self.assertEqual(m.call_args[1].get("timeout"), 2.5)
+
+    def test_no_auth_is_anonymous_direct(self) -> None:
+        with mock.patch(
+            "urllib.request.urlopen", return_value=_FakeResponse(self._PAYLOAD)
+        ) as m:
+            scbm.fetch_holders("r", "f.rs", coord_url="https://coord.example")
+        self.assertEqual(m.call_count, 1)
+        req = m.call_args[0][0]
+        self.assertTrue(
+            req.full_url.startswith("https://coord.example/coord/claims/list?")
+        )
+        hdrs = _req_headers_lower(req)
+        self.assertNotIn("authorization", hdrs)
+        self.assertNotIn("x-coord-mcp-proxy-key", hdrs)
+
+    def test_loopback_refused_falls_open_to_anonymous(self) -> None:
+        auth = scbm.ClaimsAuth(
+            mode="proxy",
+            proxy_base="http://127.0.0.1:9876/coord-mcp",
+            headers={"X-Coord-Mcp-Proxy-Key": "nonce-abc123"},
+        )
+        calls: list = []
+
+        def fake_urlopen(req, timeout=None):
+            calls.append(req)
+            if req.full_url.startswith("http://127.0.0.1:"):
+                raise scbm.urllib.error.URLError("connection refused")
+            return _FakeResponse(self._PAYLOAD)
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            holders = scbm.fetch_holders(
+                "r", "f.rs", coord_url="https://coord.example", auth=auth
+            )
+        self.assertEqual(len(holders), 1)
+        self.assertEqual(len(calls), 2)
+        # Fallback is anonymous direct-coord — no proxy nonce leaked.
+        fallback = calls[1]
+        self.assertTrue(
+            fallback.full_url.startswith("https://coord.example/coord/claims/list?")
+        )
+        self.assertNotIn("x-coord-mcp-proxy-key", _req_headers_lower(fallback))
+
+    def test_both_attempts_failing_raises(self) -> None:
+        auth = scbm.ClaimsAuth(
+            mode="proxy",
+            proxy_base="http://127.0.0.1:9876/coord-mcp",
+            headers={"X-Coord-Mcp-Proxy-Key": "n"},
+        )
+        with mock.patch(
+            "urllib.request.urlopen",
+            side_effect=scbm.urllib.error.URLError("down"),
+        ) as m:
+            with self.assertRaises(RuntimeError):
+                scbm.fetch_holders(
+                    "r", "f.rs", coord_url="https://coord.example", auth=auth
+                )
+        self.assertEqual(m.call_count, 2)
 
 
 class MainCliTests(unittest.TestCase):

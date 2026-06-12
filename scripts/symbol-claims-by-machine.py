@@ -26,8 +26,34 @@ Endpoint
         "kind": "symbol", "prefix": "...", "truncated": false
     }
 
-Empty list = nobody holds anything overlapping. The endpoint is read-only
-(no auth gate in coord today — same posture as ``/coord/claims/by-resource``).
+Empty list = nobody holds anything overlapping. The endpoint is read-only.
+
+Auth (2026-06-11-claims-read-auth-hardening, Phase 3)
+-----------------------------------------------------
+
+Coord's claims read endpoints (``/coord/claims/list`` and
+``/coord/claims/by-resource``) historically had no auth gate; enforcement
+is coming behind ``COORD_CLAIMS_READ_AUTH_REQUIRED``. This script now
+credentials its requests by reading the workspace ``.mcp.json`` (pure
+local file read — no network discovery) and branching on the coord-mcp
+server entry shape:
+
+* **Proxy shape** (device-provisioned sessions): ``url`` is a loopback
+  ``http://127.0.0.1:<port>/coord-mcp`` plus an ``X-Coord-Mcp-Proxy-Key``
+  header. The claims request is rewritten onto the runner's nonce-gated
+  read passthrough — ``<proxy_base>/claims/list?<query>`` — which injects
+  a live device JWT (no token on disk, never stale).
+* **Static-bearer shape** (agent-spawn sessions): a real coord ``url``
+  plus an ``Authorization: Bearer`` header. The claims URL stays pointed
+  direct at coord as before, with the bearer attached. (A narrower agent
+  identity must NOT be elevated through the device proxy.)
+* **Neither shape / missing / malformed ``.mcp.json``**: anonymous
+  direct-coord call (today's behavior, until enforcement arms).
+
+Every credentialed failure (loopback refused, non-200, …) fails open to
+the anonymous direct-coord call; if that also fails, the existing
+silent-fail (warn + exit 2) behavior applies. No retries beyond that
+single fallback; every request keeps ``timeout=2.5``.
 
 Usage
 -----
@@ -53,6 +79,7 @@ Exit codes:
 Environment overrides:
     COORD_HTTP_URL                  (default ``http://localhost:9870``)
     QONTINUI_MACHINE_JSON_PATH      (default ``~/.qontinui/machine.json``)
+    QONTINUI_MCP_JSON               (default: walk up from cwd for ``.mcp.json``)
 
 Design choices
 --------------
@@ -70,6 +97,7 @@ Design choices
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import subprocess
@@ -113,6 +141,107 @@ def _read_local_machine_id() -> str | None:
     except (OSError, json.JSONDecodeError):
         return None
     return data.get("device_id") or data.get("machine_id")
+
+
+# ---------------------------------------------------------------------------
+# Claims read auth (.mcp.json dual-shape; see module docstring)
+# ---------------------------------------------------------------------------
+
+
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+@dataclasses.dataclass
+class ClaimsAuth:
+    """How to credential claims read requests.
+
+    ``mode`` is one of:
+
+    * ``"proxy"``     — runner loopback passthrough; ``proxy_base`` is the
+      ``http://127.0.0.1:<port>/coord-mcp`` base and ``headers`` carries
+      the ``X-Coord-Mcp-Proxy-Key`` nonce.
+    * ``"bearer"``    — direct coord with ``headers`` carrying
+      ``Authorization: Bearer <jwt>``.
+    * ``"anonymous"`` — today's uncredentialed direct-coord call.
+    """
+
+    mode: str = "anonymous"
+    proxy_base: str | None = None
+    headers: dict[str, str] = dataclasses.field(default_factory=dict)
+
+
+_ANONYMOUS = ClaimsAuth()
+
+
+def _find_mcp_json(start: Path) -> Path | None:
+    """Walk from ``start`` upward looking for a ``.mcp.json`` file."""
+    try:
+        start = start.resolve()
+    except OSError:
+        return None
+    for d in (start, *start.parents):
+        candidate = d / ".mcp.json"
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def resolve_claims_auth(cwd: Path, mcp_json_override: str | None = None) -> ClaimsAuth:
+    """Classify the workspace ``.mcp.json`` coord-mcp entry (file read only).
+
+    Resolution order for the file: explicit override (``--mcp-json``) →
+    ``$QONTINUI_MCP_JSON`` → walk up from ``cwd``. Anything missing,
+    malformed, or shaped unexpectedly degrades to anonymous (fail open).
+    """
+    override = mcp_json_override or os.environ.get("QONTINUI_MCP_JSON")
+    path = Path(override) if override else _find_mcp_json(cwd)
+    if path is None:
+        return _ANONYMOUS
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return _ANONYMOUS
+    if not isinstance(data, dict):
+        return _ANONYMOUS
+    servers = data.get("mcpServers")
+    server = servers.get("coord-mcp") if isinstance(servers, dict) else None
+    if not isinstance(server, dict):
+        return _ANONYMOUS
+    url = server.get("url")
+    headers = server.get("headers")
+    if not isinstance(url, str) or not isinstance(headers, dict):
+        return _ANONYMOUS
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        host = parsed.hostname
+    except ValueError:
+        return _ANONYMOUS
+
+    nonce = headers.get("X-Coord-Mcp-Proxy-Key")
+    bearer = headers.get("Authorization")
+
+    if (
+        isinstance(nonce, str)
+        and nonce
+        and host in _LOOPBACK_HOSTS
+        and parsed.path.rstrip("/").endswith("/coord-mcp")
+    ):
+        # Device-provisioned session: runner loopback proxy + nonce.
+        return ClaimsAuth(
+            mode="proxy",
+            proxy_base=url.rstrip("/"),
+            headers={"X-Coord-Mcp-Proxy-Key": nonce},
+        )
+
+    if isinstance(bearer, str) and bearer and host not in _LOOPBACK_HOSTS:
+        # Agent-spawn session: static bearer, direct coord. Never route a
+        # narrower agent identity through the device proxy.
+        return ClaimsAuth(mode="bearer", headers={"Authorization": bearer})
+
+    return _ANONYMOUS
 
 
 # ---------------------------------------------------------------------------
@@ -185,25 +314,16 @@ def _scope_files(cwd: Path) -> tuple[Path | None, list[str]]:
 # ---------------------------------------------------------------------------
 
 
-def fetch_holders(
-    repo: str, rel_file: str, *, coord_url: str | None = None
-) -> list[dict[str, Any]]:
-    """GET ``/coord/claims/list?kind=symbol&prefix=<repo>:<rel-file>:``.
-
-    Raises ``RuntimeError`` on transport failure with a single-sentence
-    message suitable for stderr. Returns the raw ``holders`` list on
-    success (may be empty).
-    """
-    base = (coord_url or _coord_url()).rstrip("/")
-    prefix = f"{repo}:{rel_file}:"
-    qs = urllib.parse.urlencode({"kind": "symbol", "prefix": prefix})
-    url = f"{base}/coord/claims/list?{qs}"
+def _request_holders(url: str, headers: dict[str, str]) -> list[dict[str, Any]]:
+    """Single GET → parsed ``holders`` list. RuntimeError on any failure."""
     req = urllib.request.Request(url, method="GET")
+    for key, value in headers.items():
+        req.add_header(key, value)
     try:
         with urllib.request.urlopen(req, timeout=2.5) as resp:
             body = resp.read().decode("utf-8")
     except (urllib.error.URLError, TimeoutError, OSError) as e:
-        raise RuntimeError(f"coord {base} unreachable: {e}") from e
+        raise RuntimeError(f"claims endpoint {url.split('?')[0]} unreachable: {e}") from e
 
     try:
         parsed = json.loads(body)
@@ -214,6 +334,46 @@ def fetch_holders(
     if not isinstance(holders, list):
         raise RuntimeError("coord response missing 'holders' list")
     return holders
+
+
+def fetch_holders(
+    repo: str,
+    rel_file: str,
+    *,
+    coord_url: str | None = None,
+    auth: ClaimsAuth | None = None,
+) -> list[dict[str, Any]]:
+    """GET ``claims/list?kind=symbol&prefix=<repo>:<rel-file>:``.
+
+    ``auth`` (from :func:`resolve_claims_auth`) picks the credentialed
+    route: proxy mode rewrites onto the runner loopback passthrough with
+    the nonce header; bearer mode goes direct to coord with the
+    Authorization header; anonymous (or ``None``) is today's plain call.
+    A credentialed failure falls open ONCE to the anonymous direct call
+    (no further retries); if that fails too the last error is raised as
+    ``RuntimeError`` with a single-sentence message suitable for stderr.
+    Returns the raw ``holders`` list on success (may be empty).
+    """
+    base = (coord_url or _coord_url()).rstrip("/")
+    prefix = f"{repo}:{rel_file}:"
+    qs = urllib.parse.urlencode({"kind": "symbol", "prefix": prefix})
+    direct_url = f"{base}/coord/claims/list?{qs}"
+
+    attempts: list[tuple[str, dict[str, str]]] = []
+    if auth is not None and auth.mode == "proxy" and auth.proxy_base:
+        attempts.append((f"{auth.proxy_base}/claims/list?{qs}", auth.headers))
+    elif auth is not None and auth.mode == "bearer":
+        attempts.append((direct_url, auth.headers))
+    attempts.append((direct_url, {}))
+
+    last_err: RuntimeError | None = None
+    for url, headers in attempts:
+        try:
+            return _request_holders(url, headers)
+        except RuntimeError as e:
+            last_err = e
+    assert last_err is not None  # attempts is never empty
+    raise last_err
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +401,7 @@ def collect_conflicts(
     local_machine_id: str | None,
     *,
     coord_url: str | None = None,
+    auth: ClaimsAuth | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """For each rel_file, fetch claims and filter out the local machine's.
 
@@ -253,7 +414,7 @@ def collect_conflicts(
     errors: list[str] = []
     for rel_file in rel_files:
         try:
-            holders = fetch_holders(repo, rel_file, coord_url=coord_url)
+            holders = fetch_holders(repo, rel_file, coord_url=coord_url, auth=auth)
         except RuntimeError as e:
             errors.append(f"{rel_file}: {e}")
             continue
@@ -353,6 +514,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--mcp-json",
+        dest="mcp_json",
+        help=(
+            "Path to the workspace .mcp.json used to credential claims "
+            "reads (dual-shape: runner loopback proxy or static bearer). "
+            "Default: $QONTINUI_MCP_JSON, else walk up from cwd. "
+            "Missing/malformed = anonymous (fail open)."
+        ),
+    )
+    p.add_argument(
         "--json",
         action="store_true",
         help="Emit machine-readable JSON instead of a text table.",
@@ -406,6 +577,7 @@ def main(argv: list[str] | None = None) -> int:
         rel_files,
         local_id,
         coord_url=args.coord_url,
+        auth=resolve_claims_auth(cwd, args.mcp_json),
     )
 
     if args.json:
