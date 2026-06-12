@@ -71,7 +71,7 @@ resource "aws_lb" "main" {
   security_groups    = [var.alb_sg_id]
   subnets            = var.public_subnet_ids
 
-  idle_timeout = 60 # WebSockets stay alive via app-level pings; 60s is fine
+  idle_timeout = 180 # Long audit calls: web backend waits up to 90s for coord's auditor task (STARTER_PROFILE_WAIT_SECS=60s); 180s gives 90s of slack so the ALB doesn't tear the connection down before the backend can respond and emit a CORS-headered error. WebSockets stay alive via app-level pings independently.
 
   tags = { Name = "qontinui-${var.environment}-alb" }
 }
