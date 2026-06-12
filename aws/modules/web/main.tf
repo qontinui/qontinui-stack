@@ -239,6 +239,25 @@ data "aws_iam_policy_document" "task_cognito_linking" {
     ]
     resources = [var.cognito_user_pool_arn]
   }
+
+  # Group-admin grant. The web backend manages Cognito groups (org/role
+  # membership) — create/list/delete groups, enumerate users in a group, and
+  # add/remove a user to/from a group. Same pool ARN scope as the linking
+  # statement above; kept as a SEPARATE statement so the group-admin surface
+  # is independently auditable from the cross-IdP linking surface.
+  statement {
+    sid = "CognitoGroupAdmin"
+    actions = [
+      "cognito-idp:CreateGroup",
+      "cognito-idp:DeleteGroup",
+      "cognito-idp:GetGroup",
+      "cognito-idp:ListGroups",
+      "cognito-idp:ListUsersInGroup",
+      "cognito-idp:AdminAddUserToGroup",
+      "cognito-idp:AdminRemoveUserFromGroup",
+    ]
+    resources = [var.cognito_user_pool_arn]
+  }
 }
 
 resource "aws_iam_role_policy" "task_cognito_linking" {
