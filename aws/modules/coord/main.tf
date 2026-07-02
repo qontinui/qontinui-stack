@@ -510,6 +510,42 @@ resource "aws_iam_role_policy" "task_twin_infra_health_observer" {
   policy = data.aws_iam_policy_document.task_twin_infra_health_observer.json
 }
 
+# ECS Exec (SSM Session Manager) — the SANCTIONED path for one-off in-container
+# psql/diagnostics against the VPC-internal RDS. `enable_execute_command = true`
+# is already set on aws_ecs_service.coord (below), but exec ALSO needs these
+# ssmmessages channel actions on the TASK role — without them exec fails with
+# `TargetNotConnected` (which it did until this was added out-of-band). The
+# actions have no resource-level scoping, so `resources = ["*"]` is required.
+#
+# This is the safe replacement for `aws ecs run-task --overrides
+# command=["sh","-lc","psql ..."]`, which CANNOT override the image ENTRYPOINT
+# (`/app/qontinui-coord`) and therefore boots a full coord server that joins
+# leader election and holds the global lease forever — four such orphaned tasks
+# caused the 2026-06-30 leaderless outage (merge train + write-serving down).
+# See qontinui-coord #886 (coord now rejects unknown args instead of booting).
+#
+# `name` intentionally matches the inline policy created out-of-band during that
+# incident so `terraform apply` ADOPTS it in place (PutRolePolicy is an upsert):
+# no duplicate policy, and no window where exec loses the grant.
+data "aws_iam_policy_document" "task_ecs_exec" {
+  statement {
+    sid = "EcsExecSsmMessages"
+    actions = [
+      "ssmmessages:CreateControlChannel",
+      "ssmmessages:CreateDataChannel",
+      "ssmmessages:OpenControlChannel",
+      "ssmmessages:OpenDataChannel",
+    ]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_role_policy" "task_ecs_exec" {
+  name   = "ecs-exec-ssmmessages"
+  role   = aws_iam_role.task.id
+  policy = data.aws_iam_policy_document.task_ecs_exec.json
+}
+
 # ─── Task definition (BOOTSTRAP-ONLY) ─────────────────────────────────────
 #
 # This definition exists ONLY to satisfy the `task_definition` argument the
