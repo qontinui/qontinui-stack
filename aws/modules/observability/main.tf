@@ -203,6 +203,56 @@ resource "aws_cloudwatch_metric_alarm" "coord_plan_ingest_inert" {
   ok_actions    = [var.sns_topic_arn]
 }
 
+# coord PR-merge GitHub-App hydration down: the reconciler has been running
+# without an App client past the alert threshold (coord main 5cc2a8d). While
+# hydration is down, drift detection + the mergestate heal are dead and
+# DIRTY/UNKNOWN-cached PRs can silently freeze (incident coord#880) — a
+# service-level-healthy failure mode none of the ALB/ECS alarms above can see.
+# Coord's designed alert hook is a one-shot `tracing::error!` line containing
+# `pr_merge hydration has been DISABLED (no GitHub App client)` fired once per
+# outage after COORD_PR_HYDRATION_DOWN_ALERT_TICKS x 60s. (The companion
+# Prometheus gauge `pr_merge_hydration_down_seconds` on /metrics has no
+# scraper in this stack — /metrics is token-gated behind the ALB and nothing
+# collects it — so the log line is the pageable signal.) Term-match the
+# stable literal prefix; default_value=0 keeps the metric publishing zeros
+# while other coord log traffic flows, so the alarm sits in OK (not
+# INSUFFICIENT_DATA) during healthy operation.
+resource "aws_cloudwatch_log_metric_filter" "coord_pr_hydration_down" {
+  name           = "qontinui-${var.environment}-coord-pr-hydration-down"
+  log_group_name = var.coord_log_group_name
+  pattern        = "\"pr_merge hydration has been DISABLED\""
+
+  metric_transformation {
+    name          = "pr_merge_hydration_down"
+    namespace     = "QontinuiCoord"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+# One matching line in any 5-min window = page. LIMITATION (deliberate): the
+# app fires the line ONCE per outage, so the alarm returns to OK one period
+# later even if hydration is still down — the OK transition does NOT mean
+# recovered (that's why there are no ok_actions here, unlike
+# plan_ingest_inert). Treat the page as "go check GET /pr-merge/health
+# `hydration_enabled` / GITHUB_APP_* credentials"; recovery resets the app's
+# once-per-outage latch so a NEW outage pages again. treat_missing_data
+# notBreaching matches the repo's other log-filter alarm.
+resource "aws_cloudwatch_metric_alarm" "coord_pr_hydration_down" {
+  alarm_name          = "qontinui-${var.environment}-coord-pr-hydration-down"
+  alarm_description   = "coord PR-merge GitHub-App hydration DISABLED past threshold: drift detection + mergestate heal dead, PRs can silently freeze. Check GET /pr-merge/health hydration_enabled + GITHUB_APP_* creds. One-shot log line — OK transition is NOT recovery."
+  namespace           = "QontinuiCoord"
+  metric_name         = "pr_merge_hydration_down"
+  statistic           = "Sum"
+  period              = 300
+  evaluation_periods  = 1
+  threshold           = 1
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = [var.sns_topic_arn]
+}
+
 output "alarm_names" {
   value = [
     aws_cloudwatch_metric_alarm.coord_unhealthy.alarm_name,
@@ -212,5 +262,6 @@ output "alarm_names" {
     aws_cloudwatch_metric_alarm.coord_mem.alarm_name,
     aws_cloudwatch_metric_alarm.coord_jetstream_err.alarm_name,
     aws_cloudwatch_metric_alarm.coord_plan_ingest_inert.alarm_name,
+    aws_cloudwatch_metric_alarm.coord_pr_hydration_down.alarm_name,
   ]
 }
