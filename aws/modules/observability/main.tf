@@ -72,6 +72,40 @@ resource "aws_cloudwatch_metric_alarm" "coord_5xx" {
   alarm_actions = [var.sns_topic_arn]
 }
 
+# coord dropping connections: gateway-level 5xx the target-5xx alarm CANNOT see.
+# HTTPCode_Target_5XX_Count (coord_5xx above) counts only 5xx STATUS LINES the
+# target actually sent. A handler that panics unwinds the tokio worker with no
+# CatchPanic layer, so hyper closes the client connection WITHOUT a response
+# line — the ALB records that as HTTPCode_ELB_5XX_Count (a 502), NOT a target
+# 5xx. So a panic hot-loop is invisible to coord_5xx: the 2026-06-18->07-17
+# agent_logs row.get(8) panic emitted ~28k ELB 5xx/hour (~25-30% of ALL coord
+# requests) for a MONTH while coord_5xx sat in OK the whole time (target-5xx
+# stayed at 2-3/hr). This closes that gap. NOTE: HTTPCode_ELB_5XX_Count has no
+# per-target-group dimension and this ALB is shared with the web target group,
+# so the alarm is LOAD-BALANCER-WIDE (coord + web) — acceptable, since a gateway
+# 5xx storm from either service warrants a page. Threshold sits well above the
+# handful of connection resets a rolling deploy produces but far below any real
+# gateway-error storm; 2 periods requires it to be sustained.
+resource "aws_cloudwatch_metric_alarm" "coord_elb_5xx" {
+  alarm_name          = "qontinui-${var.environment}-coord-elb-5xx"
+  alarm_description   = "ALB emitting gateway 5xx (>=100 in 5 min for 2 periods): a target is dropping/resetting connections mid-request (classic symptom: a handler panic loop) — INVISIBLE to the target-5xx alarm. Grep the coord log group for 'panicked at'. LB-wide (coord+web share this ALB)."
+  namespace           = "AWS/ApplicationELB"
+  metric_name         = "HTTPCode_ELB_5XX_Count"
+  statistic           = "Sum"
+  period              = 300
+  evaluation_periods  = 2
+  threshold           = 100
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    LoadBalancer = var.alb_arn_suffix
+  }
+
+  alarm_actions = [var.sns_topic_arn]
+  ok_actions    = [var.sns_topic_arn]
+}
+
 # coord slow: p90 latency sustained high.
 resource "aws_cloudwatch_metric_alarm" "coord_latency" {
   alarm_name          = "qontinui-${var.environment}-coord-latency-p90"
@@ -253,15 +287,58 @@ resource "aws_cloudwatch_metric_alarm" "coord_pr_hydration_down" {
   alarm_actions = [var.sns_topic_arn]
 }
 
+# coord worker panicking: a tokio task unwinding on the request path. The
+# incident this alarm exists for (agent_logs.rs row.get(8) index drift,
+# 2026-06-18->07-17) panicked EVERY POST /agents/:id/log ~8x/second — ~14.5k
+# panics/30min, the single loudest signal in this log group — yet nothing
+# paged for a MONTH: the panic resets the connection (see coord_elb_5xx above,
+# a gateway 5xx not a target 5xx) and the runner producer swallowed the failure
+# with no log line and a bounded in-memory queue. A panicking worker is never
+# healthy in prod, whatever the endpoint, so term-match the stable Rust panic
+# prefix. default_value=0 keeps the metric publishing zeros while other coord
+# log traffic flows, so the alarm sits in OK (not INSUFFICIENT_DATA) when
+# healthy. Threshold 10/5min ignores an isolated one-off but trips within one
+# period on any hot-loop (which runs into the thousands per period).
+resource "aws_cloudwatch_log_metric_filter" "coord_worker_panic" {
+  name           = "qontinui-${var.environment}-coord-worker-panic"
+  log_group_name = var.coord_log_group_name
+  pattern        = "\"panicked at\""
+
+  metric_transformation {
+    name          = "worker_panic"
+    namespace     = "QontinuiCoord"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "coord_worker_panic" {
+  alarm_name          = "qontinui-${var.environment}-coord-worker-panic"
+  alarm_description   = "coord tokio worker(s) panicking (>=10 panic lines in 5 min): a task is unwinding on the request path — often a panic HOT-LOOP (thousands/period) that resets connections and is invisible to the target-5xx alarm. Grep the coord log group for 'panicked at' to find the file:line."
+  namespace           = "QontinuiCoord"
+  metric_name         = "worker_panic"
+  statistic           = "Sum"
+  period              = 300
+  evaluation_periods  = 1
+  threshold           = 10
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = [var.sns_topic_arn]
+  ok_actions    = [var.sns_topic_arn]
+}
+
 output "alarm_names" {
   value = [
     aws_cloudwatch_metric_alarm.coord_unhealthy.alarm_name,
     aws_cloudwatch_metric_alarm.coord_5xx.alarm_name,
+    aws_cloudwatch_metric_alarm.coord_elb_5xx.alarm_name,
     aws_cloudwatch_metric_alarm.coord_latency.alarm_name,
     aws_cloudwatch_metric_alarm.coord_cpu.alarm_name,
     aws_cloudwatch_metric_alarm.coord_mem.alarm_name,
     aws_cloudwatch_metric_alarm.coord_jetstream_err.alarm_name,
     aws_cloudwatch_metric_alarm.coord_plan_ingest_inert.alarm_name,
     aws_cloudwatch_metric_alarm.coord_pr_hydration_down.alarm_name,
+    aws_cloudwatch_metric_alarm.coord_worker_panic.alarm_name,
   ]
 }
