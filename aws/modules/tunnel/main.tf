@@ -23,21 +23,6 @@ variable "metrics_token" {
   description = "Shared token gating the coord /metrics route. Requests must send `X-Metrics-Token: <value>` to reach coord's Prometheus endpoint; all other /metrics requests get a fixed 403 instead of falling through to the open coord default action."
 }
 
-# Parallel-stand-up cutover toggle. When two envs share the SAME domain/zone
-# (us-east-1 + eu-central-1 during a region migration), only ONE of them may
-# own the coord/web traffic A-alias Route53 records at a time — otherwise the
-# second `terraform apply` would repoint live traffic at the new region's ALB
-# before it's ready. Phase 1 stands up the eu env with this false: it creates
-# its own ALB + ACM cert (validation CNAMEs are shared/idempotent via
-# allow_overwrite) but leaves the traffic records pointing at us-east-1. At
-# cutover, flip the eu env to true (allow_overwrite lets it take over the
-# records the us-east-1 env created) and the us-east-1 env to false.
-variable "manage_traffic_dns" {
-  type        = bool
-  default     = true
-  description = "When true (default, us-east-1 env), create the coord/web traffic A-alias Route53 records pointing at THIS env's ALB. Set false for a parallel stand-up (eu-central-1 env in Phase 1) so the ALB + ACM cert are created but traffic DNS still points at the other region's ALB until an explicit cutover flips this to true."
-}
-
 locals {
   fqdn     = "${var.coord_subdomain}.${var.domain_name}"
   web_fqdn = "${var.web_subdomain}.${var.domain_name}"
@@ -66,12 +51,11 @@ resource "aws_route53_record" "cert_validation" {
     }
   }
 
-  zone_id         = var.route53_zone_id
-  name            = each.value.name
-  type            = each.value.type
-  records         = [each.value.record]
-  ttl             = 60
-  allow_overwrite = true
+  zone_id = var.route53_zone_id
+  name    = each.value.name
+  type    = each.value.type
+  records = [each.value.record]
+  ttl     = 60
 }
 
 resource "aws_acm_certificate_validation" "coord" {
@@ -218,11 +202,9 @@ resource "aws_secretsmanager_secret_version" "metrics_token" {
 # ─── DNS ────────────────────────────────────────────────────────────────
 
 resource "aws_route53_record" "coord" {
-  count           = var.manage_traffic_dns ? 1 : 0
-  zone_id         = var.route53_zone_id
-  name            = local.fqdn
-  type            = "A"
-  allow_overwrite = true
+  zone_id = var.route53_zone_id
+  name    = local.fqdn
+  type    = "A"
 
   alias {
     name                   = aws_lb.main.dns_name
@@ -232,11 +214,9 @@ resource "aws_route53_record" "coord" {
 }
 
 resource "aws_route53_record" "web" {
-  count           = var.manage_traffic_dns ? 1 : 0
-  zone_id         = var.route53_zone_id
-  name            = local.web_fqdn
-  type            = "A"
-  allow_overwrite = true
+  zone_id = var.route53_zone_id
+  name    = local.web_fqdn
+  type    = "A"
 
   alias {
     name                   = aws_lb.main.dns_name
