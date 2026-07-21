@@ -266,6 +266,45 @@ resource "aws_iam_role_policy" "task_cognito_linking" {
   policy = data.aws_iam_policy_document.task_cognito_linking.json
 }
 
+# ECS Exec (SSM Session Manager) — mirrors modules/coord's task_ecs_exec.
+# `enable_execute_command = true` is already set on aws_ecs_service.web
+# (below), but exec ALSO needs these ssmmessages channel actions on the TASK
+# role. Without them the ExecuteCommandAgent starts (ECS reports the managed
+# agent `RUNNING`) yet the SSM control plane can never open its channel, so
+# every `aws ecs execute-command` into web fails `TargetNotConnected` — which
+# it did, permanently, until this was added. coord carried the identical
+# policy and worked; web did not and never has. The actions have no
+# resource-level scoping, so `resources = ["*"]` is required.
+#
+# Why web specifically needs it: web is the only container with `python` +
+# `psycopg2` + `DATABASE_URL`, so it is the sanctioned place to run one-off
+# read-only SQL against the VPC-internal RDS. coord's image is curl-only.
+#
+# This closes a real workaround hazard: with exec dead, the fallback is
+# `aws ecs run-task --overrides command=[...]`, which is safe on web (no
+# image ENTRYPOINT) but is NOT a general substitute — the same trick against
+# coord cannot override its `/app/qontinui-coord` ENTRYPOINT and boots a
+# lease-holding server (four orphaned tasks caused the 2026-06-30 leaderless
+# outage). Restoring exec on web removes the temptation to generalize it.
+data "aws_iam_policy_document" "task_ecs_exec" {
+  statement {
+    sid = "EcsExecSsmMessages"
+    actions = [
+      "ssmmessages:CreateControlChannel",
+      "ssmmessages:CreateDataChannel",
+      "ssmmessages:OpenControlChannel",
+      "ssmmessages:OpenDataChannel",
+    ]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_role_policy" "task_ecs_exec" {
+  name   = "ecs-exec-ssmmessages"
+  role   = aws_iam_role.task.id
+  policy = data.aws_iam_policy_document.task_ecs_exec.json
+}
+
 # ─── Task definition ────────────────────────────────────────────────────
 
 resource "aws_ecs_task_definition" "web" {
