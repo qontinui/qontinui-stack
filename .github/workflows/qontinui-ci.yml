@@ -1,0 +1,9 @@
+name: qontinui CI
+on: [push, pull_request]
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Placeholder
+        run: echo "qontinui CI placeholder — no framework detected; add real checks here."
