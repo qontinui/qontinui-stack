@@ -21,8 +21,9 @@ Exit codes:
     2   input error (path missing, not a file, no status block, etc.)
 
 Environment overrides:
-    QONTINUI_PLANS_DIR          (default ``D:/qontinui-root/plans``)
-    QONTINUI_PLANS_ARCHIVE_DIR  (default ``D:/qontinui-root/qontinui-dev-notes/plans``)
+    QONTINUI_PLANS_DIR          (default ``D:/qontinui-root/qontinui-dev-notes/plans``)
+    QONTINUI_PLANS_ARCHIVE_DIR  (legacy 2nd lookup path, retired 2026-07-22;
+                                same default as above — leave unset)
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ from typing import Iterable
 # Constants
 # ---------------------------------------------------------------------------
 
-DEFAULT_PLANS_DIR = "D:/qontinui-root/plans"
+DEFAULT_PLANS_DIR = "D:/qontinui-root/qontinui-dev-notes/plans"
 DEFAULT_ARCHIVE_DIR = "D:/qontinui-root/qontinui-dev-notes/plans"
 
 # Lifecycle words recognised inside the status blockquote, in match order.
@@ -248,7 +249,15 @@ def extract_lifecycle(status_block: str) -> tuple[str | None, str | None]:
 
 
 def _candidate_paths(stem: str, plans_dir: Path, archive_dir: Path) -> list[Path]:
-    return [plans_dir / f"{stem}.md", archive_dir / f"{stem}.md"]
+    # archive_dir is a retired second location (2026-07-22 consolidation) and
+    # now normally equals plans_dir — dedup so it isn't stat'd twice, while
+    # still honoring an explicitly-set override.
+    seen: list[Path] = []
+    for d in (plans_dir, archive_dir):
+        p = d / f"{stem}.md"
+        if p not in seen:
+            seen.append(p)
+    return seen
 
 
 def resolve_dep(
@@ -411,12 +420,12 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument(
         "--plans-dir",
         default=None,
-        help="Override in-progress plans dir (env: QONTINUI_PLANS_DIR).",
+        help="Override the plans dir (env: QONTINUI_PLANS_DIR).",
     )
     parser.add_argument(
         "--archive-dir",
         default=None,
-        help="Override shipped archive dir (env: QONTINUI_PLANS_ARCHIVE_DIR).",
+        help="Legacy 2nd lookup path, retired 2026-07-22 (env: QONTINUI_PLANS_ARCHIVE_DIR).",
     )
     parser.set_defaults(format="json")
 

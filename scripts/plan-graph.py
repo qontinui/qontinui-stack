@@ -36,8 +36,9 @@ Hiding terminal nodes:
     they're structurally on the path to a non-shipped descendant.
 
 Environment overrides (shared with ``resolve-plan-deps.py``):
-    QONTINUI_PLANS_DIR          (default ``D:/qontinui-root/plans``)
-    QONTINUI_PLANS_ARCHIVE_DIR  (default ``D:/qontinui-root/qontinui-dev-notes/plans``)
+    QONTINUI_PLANS_DIR          (default ``D:/qontinui-root/qontinui-dev-notes/plans``)
+    QONTINUI_PLANS_ARCHIVE_DIR  (legacy 2nd lookup path, retired 2026-07-22;
+                                same default as above — leave unset)
 
 Re-uses parser primitives (``find_status_block``, ``parse_depends_on``,
 ``extract_lifecycle``) from ``resolve-plan-deps.py`` (Phase 3.2) via direct
@@ -59,7 +60,7 @@ from typing import Iterable
 # Constants
 # ---------------------------------------------------------------------------
 
-DEFAULT_PLANS_DIR = "D:/qontinui-root/plans"
+DEFAULT_PLANS_DIR = "D:/qontinui-root/qontinui-dev-notes/plans"
 DEFAULT_ARCHIVE_DIR = "D:/qontinui-root/qontinui-dev-notes/plans"
 
 # Lifecycle words that mean the node is "done" for rendering-purposes. When
@@ -644,12 +645,12 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument(
         "--plans-dir",
         default=None,
-        help="Override in-progress plans dir (env: QONTINUI_PLANS_DIR).",
+        help="Override the plans dir (env: QONTINUI_PLANS_DIR).",
     )
     parser.add_argument(
         "--archive-dir",
         default=None,
-        help="Override shipped archive dir (env: QONTINUI_PLANS_ARCHIVE_DIR).",
+        help="Legacy 2nd lookup path, retired 2026-07-22 (env: QONTINUI_PLANS_ARCHIVE_DIR).",
     )
     parser.add_argument(
         "--ascii",
