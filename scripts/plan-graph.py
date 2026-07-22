@@ -2,7 +2,7 @@
 """Render the dependency DAG across all plans.
 
 Phase 3.3 of the 2026-05-21 coordination-improvements plan. Walks every
-``*.md`` plan in ``plans/`` + ``qontinui-dev-notes/plans/`` (env-overridable
+``*.md`` plan in ``qontinui-dev-notes/plans/`` (env-overridable
 per ``resolve-plan-deps.py``), builds a directed graph of ``Depends-On:``
 edges, and renders it as a text-tree, JSON, or Mermaid graph.
 
