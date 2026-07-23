@@ -18,12 +18,14 @@ Usage
 Exit codes:
     0   all declared deps are SHIPPED (or no Depends-On field)
     1   at least one dep is unsatisfied (missing, not-yet-shipped, terminal)
-    2   input error (path missing, not a file, no status block, etc.)
+    2   input error (path missing, not a file, plans dir missing, etc.)
 
 Environment overrides:
-    QONTINUI_PLANS_DIR          (default ``D:/qontinui-root/qontinui-dev-notes/plans``)
-    QONTINUI_PLANS_ARCHIVE_DIR  (legacy 2nd lookup path, retired 2026-07-22;
-                                same default as above — leave unset)
+    QONTINUI_PLANS_DIR          active plans dir
+                                (fallback: ``<workspace-root>/plans``)
+    QONTINUI_PLANS_ARCHIVE_DIR  optional archive directory — a real
+                                destination for archived plans; unset means
+                                single-directory layout (no default)
 """
 
 from __future__ import annotations
@@ -41,8 +43,12 @@ from typing import Iterable
 # Constants
 # ---------------------------------------------------------------------------
 
-DEFAULT_PLANS_DIR = "D:/qontinui-root/qontinui-dev-notes/plans"
-DEFAULT_ARCHIVE_DIR = "D:/qontinui-root/qontinui-dev-notes/plans"
+# The scripts live at ``<workspace-root>/qontinui-stack/scripts/``, so the
+# workspace root is two parents up from this file's directory. The fallback
+# plans dir matches the coord ``plan-discipline`` policy: ``QONTINUI_PLANS_DIR``
+# falls back to ``<workspace-root>/plans`` when unset.
+WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_PLANS_DIR = WORKSPACE_ROOT / "plans"
 
 # Lifecycle words recognised inside the status blockquote, in match order.
 # Multi-word entries MUST come before any prefix that would shadow them.
@@ -118,6 +124,48 @@ class Resolution:
 
 class InputError(Exception):
     """Raised for non-recoverable input problems → exit code 2."""
+
+
+# ---------------------------------------------------------------------------
+# Directory resolution (shared with plan-graph.py)
+# ---------------------------------------------------------------------------
+
+
+def resolve_plans_dir(cli_value: str | None) -> Path:
+    """Resolve the active plans dir: CLI flag → env → workspace fallback.
+
+    Precedence: ``cli_value`` → ``QONTINUI_PLANS_DIR`` →
+    ``<workspace-root>/plans``. Raises ``InputError`` (→ exit code 2) when
+    the resolved directory does not exist — never silently render an empty
+    result against a phantom directory.
+    """
+    raw = (
+        cli_value
+        or os.environ.get("QONTINUI_PLANS_DIR")
+        or str(DEFAULT_PLANS_DIR)
+    )
+    plans_dir = Path(raw).expanduser().resolve()
+    if not plans_dir.is_dir():
+        # ASCII-only message: this prints to stderr BEFORE the UTF-8
+        # reconfigure, so an em-dash would mojibake on cp1252 consoles.
+        raise InputError(
+            f"plans dir does not exist: {plans_dir} - set QONTINUI_PLANS_DIR "
+            "(or --plans-dir) to your active plans directory"
+        )
+    return plans_dir
+
+
+def resolve_archive_dir(cli_value: str | None) -> Path | None:
+    """Resolve the optional archive directory — a real destination for
+    archived plans; unset means single-directory layout.
+
+    Precedence: ``cli_value`` → ``QONTINUI_PLANS_ARCHIVE_DIR`` → ``None``
+    (no default). An explicitly-empty env var counts as unset.
+    """
+    raw = cli_value or os.environ.get("QONTINUI_PLANS_ARCHIVE_DIR")
+    if not raw:
+        return None
+    return Path(raw).expanduser().resolve()
 
 
 # ---------------------------------------------------------------------------
@@ -248,12 +296,16 @@ def extract_lifecycle(status_block: str) -> tuple[str | None, str | None]:
 # ---------------------------------------------------------------------------
 
 
-def _candidate_paths(stem: str, plans_dir: Path, archive_dir: Path) -> list[Path]:
-    # archive_dir is a retired second location (2026-07-22 consolidation) and
-    # now normally equals plans_dir — dedup so it isn't stat'd twice, while
-    # still honoring an explicitly-set override.
+def _candidate_paths(
+    stem: str, plans_dir: Path, archive_dir: Path | None
+) -> list[Path]:
+    # The optional archive directory is a real destination for archived
+    # plans: a dep lookup falls back to it only when it is configured.
+    # Unset means single-directory layout. Dedup so an archive that equals
+    # the plans dir isn't stat'd twice.
+    dirs = [plans_dir] if archive_dir is None else [plans_dir, archive_dir]
     seen: list[Path] = []
-    for d in (plans_dir, archive_dir):
+    for d in dirs:
         p = d / f"{stem}.md"
         if p not in seen:
             seen.append(p)
@@ -263,7 +315,7 @@ def _candidate_paths(stem: str, plans_dir: Path, archive_dir: Path) -> list[Path
 def resolve_dep(
     stem: str,
     plans_dir: Path,
-    archive_dir: Path,
+    archive_dir: Path | None,
 ) -> DepResolution:
     """Resolve a single dep stem to a status + location."""
     for candidate in _candidate_paths(stem, plans_dir, archive_dir):
@@ -307,7 +359,7 @@ def resolve_dep(
 def resolve_plan(
     plan_path: Path,
     plans_dir: Path,
-    archive_dir: Path,
+    archive_dir: Path | None,
 ) -> Resolution:
     if not plan_path.exists():
         raise InputError(f"plan file does not exist: {plan_path}")
@@ -378,20 +430,10 @@ def _format_human(resolution: Resolution) -> str:
     return "\n".join(out)
 
 
-def _resolve_dirs(args: argparse.Namespace) -> tuple[Path, Path]:
-    plans_dir_raw = (
-        args.plans_dir
-        or os.environ.get("QONTINUI_PLANS_DIR")
-        or DEFAULT_PLANS_DIR
-    )
-    archive_dir_raw = (
+def _resolve_dirs(args: argparse.Namespace) -> tuple[Path, Path | None]:
+    return resolve_plans_dir(args.plans_dir), resolve_archive_dir(
         args.archive_dir
-        or os.environ.get("QONTINUI_PLANS_ARCHIVE_DIR")
-        or DEFAULT_ARCHIVE_DIR
     )
-    plans_dir = Path(plans_dir_raw).expanduser().resolve()
-    archive_dir = Path(archive_dir_raw).expanduser().resolve()
-    return plans_dir, archive_dir
 
 
 def main(argv: Iterable[str] | None = None) -> int:
@@ -420,12 +462,19 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument(
         "--plans-dir",
         default=None,
-        help="Override the plans dir (env: QONTINUI_PLANS_DIR).",
+        help=(
+            "Override the active plans dir (env: QONTINUI_PLANS_DIR; "
+            "fallback: <workspace-root>/plans)."
+        ),
     )
     parser.add_argument(
         "--archive-dir",
         default=None,
-        help="Legacy 2nd lookup path, retired 2026-07-22 (env: QONTINUI_PLANS_ARCHIVE_DIR).",
+        help=(
+            "Optional archive directory — a real destination for archived "
+            "plans; unset means single-directory layout "
+            "(env: QONTINUI_PLANS_ARCHIVE_DIR)."
+        ),
     )
     parser.set_defaults(format="json")
 
@@ -435,9 +484,8 @@ def main(argv: Iterable[str] | None = None) -> int:
     if not plan_path.is_absolute():
         plan_path = plan_path.resolve()
 
-    plans_dir, archive_dir = _resolve_dirs(args)
-
     try:
+        plans_dir, archive_dir = _resolve_dirs(args)
         resolution = resolve_plan(plan_path, plans_dir, archive_dir)
     except InputError as exc:
         # Print a structured error so callers can still parse stdout/stderr.

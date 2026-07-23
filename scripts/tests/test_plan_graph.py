@@ -6,7 +6,7 @@ Runnable via either:
     python -m unittest qontinui-stack.scripts.tests.test_plan_graph
 
 Each test allocates its own temp directory of fixture plans so the assertions
-are hermetic and never depend on the operator's real ``D:/qontinui-root/plans``.
+are hermetic and never depend on the operator's real plans workspace.
 """
 
 from __future__ import annotations
@@ -46,6 +46,18 @@ pg = _load_module()
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+# Depends-On references must be date-prefixed plan-stem-shaped tokens —
+# ``_STEM_RE`` in resolve-plan-deps.py deliberately rejects bare words — so
+# any fixture stem that appears as a dep carries a date prefix. Dates are
+# chosen so lexicographic order matches the a < b < c < d naming.
+STEM_A = "2026-01-01-fixture-a"
+STEM_B = "2026-01-02-fixture-b"
+STEM_C = "2026-01-03-fixture-c"
+STEM_D = "2026-01-04-fixture-d"
+STEM_MISSING = "2026-01-05-does-not-exist"
+STEM_ALPHA = "2026-01-06-fixture-alpha"
+STEM_SHIPPED_DEP = "2026-01-07-fixture-shipped-dep"
 
 
 def _write_plan(
@@ -96,12 +108,15 @@ def _write_plan(
 
 def _run_cli(
     plans_dir: Path,
-    archive_dir: Path,
+    archive_dir: Path | None,
     *extra_args: str,
 ) -> tuple[int, str, str]:
     env = os.environ.copy()
+    env.pop("QONTINUI_PLANS_DIR", None)
+    env.pop("QONTINUI_PLANS_ARCHIVE_DIR", None)
     env["QONTINUI_PLANS_DIR"] = str(plans_dir)
-    env["QONTINUI_PLANS_ARCHIVE_DIR"] = str(archive_dir)
+    if archive_dir is not None:
+        env["QONTINUI_PLANS_ARCHIVE_DIR"] = str(archive_dir)
     cmd = [sys.executable, str(_SCRIPT_PATH), *extra_args]
     proc = subprocess.run(
         cmd,
@@ -184,40 +199,40 @@ class TestLinearChain(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.d = Path(self.tmp.name)
-        _write_plan(self.d, "a", "VETTED", deps=["b"])
-        _write_plan(self.d, "b", "VETTED", deps=["c"])
-        _write_plan(self.d, "c", "DRAFT")
+        _write_plan(self.d, STEM_A, "VETTED", deps=[STEM_B])
+        _write_plan(self.d, STEM_B, "VETTED", deps=[STEM_C])
+        _write_plan(self.d, STEM_C, "DRAFT")
 
     def test_graph_structure(self) -> None:
         graph = pg.build_graph(self.d, self.d)
-        self.assertEqual(graph.edges["a"], {"b"})
-        self.assertEqual(graph.edges["b"], {"c"})
-        self.assertEqual(graph.edges["c"], set())
+        self.assertEqual(graph.edges[STEM_A], {STEM_B})
+        self.assertEqual(graph.edges[STEM_B], {STEM_C})
+        self.assertEqual(graph.edges[STEM_C], set())
         self.assertEqual(graph.cycles, [])
 
     def test_text_renders_three_levels(self) -> None:
         rc, stdout, _ = _run_cli(self.d, self.d, "--format", "text")
         self.assertEqual(rc, 0)
         # All three nodes should appear, with a as the root.
-        self.assertIn("a  [VETTED]", stdout)
-        self.assertIn("b  [VETTED]", stdout)
-        self.assertIn("c  [DRAFT]", stdout)
+        self.assertIn(f"{STEM_A}  [VETTED]", stdout)
+        self.assertIn(f"{STEM_B}  [VETTED]", stdout)
+        self.assertIn(f"{STEM_C}  [DRAFT]", stdout)
         # a should appear ABOVE b and c in the render.
-        a_idx = stdout.index("a  [VETTED]")
-        b_idx = stdout.index("b  [VETTED]")
-        c_idx = stdout.index("c  [DRAFT]")
+        a_idx = stdout.index(f"{STEM_A}  [VETTED]")
+        b_idx = stdout.index(f"{STEM_B}  [VETTED]")
+        c_idx = stdout.index(f"{STEM_C}  [DRAFT]")
         self.assertLess(a_idx, b_idx)
         self.assertLess(b_idx, c_idx)
 
     def test_root_filter_to_b(self) -> None:
         rc, stdout, _ = _run_cli(
-            self.d, self.d, "--root", "b", "--format", "json"
+            self.d, self.d, "--root", STEM_B, "--format", "json"
         )
         self.assertEqual(rc, 0)
         payload = json.loads(stdout)
         stems = {n["stem"] for n in payload["nodes"]}
         # Subgraph from b = {b, c}. Should NOT include a.
-        self.assertEqual(stems, {"b", "c"})
+        self.assertEqual(stems, {STEM_B, STEM_C})
 
 
 # ---------------------------------------------------------------------------
@@ -230,27 +245,27 @@ class TestDiamond(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.d = Path(self.tmp.name)
-        _write_plan(self.d, "a", "VETTED", deps=["b", "c"])
-        _write_plan(self.d, "b", "VETTED", deps=["d"])
-        _write_plan(self.d, "c", "VETTED", deps=["d"])
-        _write_plan(self.d, "d", "DRAFT")
+        _write_plan(self.d, STEM_A, "VETTED", deps=[STEM_B, STEM_C])
+        _write_plan(self.d, STEM_B, "VETTED", deps=[STEM_D])
+        _write_plan(self.d, STEM_C, "VETTED", deps=[STEM_D])
+        _write_plan(self.d, STEM_D, "DRAFT")
 
     def test_graph_has_diamond_edges(self) -> None:
         graph = pg.build_graph(self.d, self.d)
-        self.assertEqual(graph.edges["a"], {"b", "c"})
-        self.assertEqual(graph.edges["b"], {"d"})
-        self.assertEqual(graph.edges["c"], {"d"})
-        self.assertEqual(graph.edges["d"], set())
+        self.assertEqual(graph.edges[STEM_A], {STEM_B, STEM_C})
+        self.assertEqual(graph.edges[STEM_B], {STEM_D})
+        self.assertEqual(graph.edges[STEM_C], {STEM_D})
+        self.assertEqual(graph.edges[STEM_D], set())
 
     def test_d_node_appears_once(self) -> None:
         # The JSON node-list must have exactly one entry for d (not two).
         rc, stdout, _ = _run_cli(self.d, self.d, "--format", "json")
         self.assertEqual(rc, 0)
         payload = json.loads(stdout)
-        d_nodes = [n for n in payload["nodes"] if n["stem"] == "d"]
+        d_nodes = [n for n in payload["nodes"] if n["stem"] == STEM_D]
         self.assertEqual(len(d_nodes), 1)
         # And there must be exactly 2 edges into d.
-        edges_to_d = [e for e in payload["edges"] if e["to"] == "d"]
+        edges_to_d = [e for e in payload["edges"] if e["to"] == STEM_D]
         self.assertEqual(len(edges_to_d), 2)
 
 
@@ -263,21 +278,21 @@ class TestCycle(unittest.TestCase):
     def test_two_node_cycle(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
-            _write_plan(d, "a", "DRAFT", deps=["b"])
-            _write_plan(d, "b", "DRAFT", deps=["a"])
+            _write_plan(d, STEM_A, "DRAFT", deps=[STEM_B])
+            _write_plan(d, STEM_B, "DRAFT", deps=[STEM_A])
             graph = pg.build_graph(d, d)
             self.assertEqual(len(graph.cycles), 1)
             cycle = graph.cycles[0]
             # Cycle is [..., start] where start equals cycle[0].
             self.assertEqual(cycle[0], cycle[-1])
             # Both members appear in the cycle.
-            self.assertEqual(set(cycle[:-1]), {"a", "b"})
+            self.assertEqual(set(cycle[:-1]), {STEM_A, STEM_B})
 
     def test_cycle_flagged_in_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
-            _write_plan(d, "a", "DRAFT", deps=["b"])
-            _write_plan(d, "b", "DRAFT", deps=["a"])
+            _write_plan(d, STEM_A, "DRAFT", deps=[STEM_B])
+            _write_plan(d, STEM_B, "DRAFT", deps=[STEM_A])
             rc, stdout, _ = _run_cli(d, d, "--format", "json")
             self.assertEqual(rc, 0)
             payload = json.loads(stdout)
@@ -286,8 +301,8 @@ class TestCycle(unittest.TestCase):
     def test_cycle_does_not_crash_text_render(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
-            _write_plan(d, "a", "DRAFT", deps=["b"])
-            _write_plan(d, "b", "DRAFT", deps=["a"])
+            _write_plan(d, STEM_A, "DRAFT", deps=[STEM_B])
+            _write_plan(d, STEM_B, "DRAFT", deps=[STEM_A])
             rc, stdout, _ = _run_cli(d, d, "--format", "text")
             self.assertEqual(rc, 0)
             self.assertIn("cycle", stdout.lower())
@@ -302,21 +317,21 @@ class TestMissing(unittest.TestCase):
     def test_missing_dep_flagged(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
-            _write_plan(d, "a", "VETTED", deps=["does-not-exist"])
+            _write_plan(d, STEM_A, "VETTED", deps=[STEM_MISSING])
             graph = pg.build_graph(d, d)
-            self.assertIn("does-not-exist", graph.missing)
+            self.assertIn(STEM_MISSING, graph.missing)
             self.assertEqual(
-                graph.nodes["does-not-exist"].status, pg.MISSING_STATUS
+                graph.nodes[STEM_MISSING].status, pg.MISSING_STATUS
             )
 
     def test_missing_in_json_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
-            _write_plan(d, "a", "VETTED", deps=["does-not-exist"])
+            _write_plan(d, STEM_A, "VETTED", deps=[STEM_MISSING])
             rc, stdout, _ = _run_cli(d, d, "--format", "json")
             self.assertEqual(rc, 0)
             payload = json.loads(stdout)
-            self.assertIn("does-not-exist", payload["missing"])
+            self.assertIn(STEM_MISSING, payload["missing"])
 
     def test_missing_root_returns_placeholder(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -362,12 +377,12 @@ class TestIncludeShipped(unittest.TestCase):
     def test_shipped_dep_of_anchor_still_visible(self) -> None:
         # When SHIPPED is on the path between an anchor and a leaf, it
         # should appear in the default render.
-        _write_plan(self.d, "alpha", "VETTED", deps=["shipped-dep"])
-        _write_plan(self.d, "shipped-dep", "SHIPPED")
+        _write_plan(self.d, STEM_ALPHA, "VETTED", deps=[STEM_SHIPPED_DEP])
+        _write_plan(self.d, STEM_SHIPPED_DEP, "SHIPPED")
         rc, stdout, _ = _run_cli(self.d, self.d, "--format", "text")
         self.assertEqual(rc, 0)
-        self.assertIn("alpha", stdout)
-        self.assertIn("shipped-dep", stdout)
+        self.assertIn(STEM_ALPHA, stdout)
+        self.assertIn(STEM_SHIPPED_DEP, stdout)
 
 
 # ---------------------------------------------------------------------------
@@ -379,8 +394,8 @@ class TestFormatJSON(unittest.TestCase):
     def test_json_roundtrips(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
-            _write_plan(d, "a", "VETTED", deps=["b"])
-            _write_plan(d, "b", "SHIPPED")
+            _write_plan(d, STEM_A, "VETTED", deps=[STEM_B])
+            _write_plan(d, STEM_B, "SHIPPED")
             rc, stdout, _ = _run_cli(d, d, "--format", "json")
             self.assertEqual(rc, 0)
             # Round-trip through json.loads + dumps must equal original.
@@ -397,8 +412,8 @@ class TestFormatMermaid(unittest.TestCase):
     def test_mermaid_renders_header_and_edge(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
-            _write_plan(d, "a", "VETTED", deps=["b"])
-            _write_plan(d, "b", "DRAFT")
+            _write_plan(d, STEM_A, "VETTED", deps=[STEM_B])
+            _write_plan(d, STEM_B, "DRAFT")
             rc, stdout, _ = _run_cli(d, d, "--format", "mermaid")
             self.assertEqual(rc, 0)
             self.assertIn("graph TD;", stdout)
@@ -459,6 +474,47 @@ class TestEdgeCases(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Optional archive dir (Model B: unset means single-directory layout)
+# ---------------------------------------------------------------------------
+
+
+class TestOptionalArchive(unittest.TestCase):
+    def test_archive_walked_when_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as t1, tempfile.TemporaryDirectory() as t2:
+            plans = Path(t1)
+            archive = Path(t2)
+            _write_plan(plans, "active-plan", "DRAFT")
+            _write_plan(archive, "archived-plan", "DRAFT")
+            graph = pg.build_graph(plans, archive)
+            self.assertIn("active-plan", graph.nodes)
+            self.assertIn("archived-plan", graph.nodes)
+
+    def test_archive_not_walked_when_unset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            plans = Path(tmp)
+            _write_plan(plans, "active-plan", "DRAFT")
+            graph = pg.build_graph(plans)  # archive_dir defaults to None
+            self.assertEqual(set(graph.nodes), {"active-plan"})
+
+    def test_cli_without_archive_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            plans = Path(tmp)
+            _write_plan(plans, "active-plan", "DRAFT")
+            rc, stdout, _ = _run_cli(plans, None, "--format", "json")
+            self.assertEqual(rc, 0)
+            payload = json.loads(stdout)
+            stems = {n["stem"] for n in payload["nodes"]}
+            self.assertEqual(stems, {"active-plan"})
+
+    def test_missing_plans_dir_exits_two_with_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ghost = Path(tmp) / "does-not-exist"
+            rc, stdout, stderr = _run_cli(ghost, None, "--format", "json")
+            self.assertEqual(rc, 2, msg=stdout + stderr)
+            self.assertIn("QONTINUI_PLANS_DIR", stderr)
+
+
+# ---------------------------------------------------------------------------
 # Subgraph: --root with predecessors-going-upward not in scope
 # ---------------------------------------------------------------------------
 
@@ -468,17 +524,17 @@ class TestRootSubgraph(unittest.TestCase):
         # a -> b -> c. --root b should include b and c only.
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
-            _write_plan(d, "a", "VETTED", deps=["b"])
-            _write_plan(d, "b", "VETTED", deps=["c"])
-            _write_plan(d, "c", "DRAFT")
+            _write_plan(d, STEM_A, "VETTED", deps=[STEM_B])
+            _write_plan(d, STEM_B, "VETTED", deps=[STEM_C])
+            _write_plan(d, STEM_C, "DRAFT")
             rc, stdout, _ = _run_cli(
-                d, d, "--root", "b", "--format", "json"
+                d, d, "--root", STEM_B, "--format", "json"
             )
             self.assertEqual(rc, 0)
             payload = json.loads(stdout)
             stems = {n["stem"] for n in payload["nodes"]}
-            self.assertEqual(stems, {"b", "c"})
-            self.assertNotIn("a", stems)
+            self.assertEqual(stems, {STEM_B, STEM_C})
+            self.assertNotIn(STEM_A, stems)
 
 
 if __name__ == "__main__":

@@ -9,9 +9,9 @@ The tests are written against ``unittest.TestCase`` so they work with either
 runner. pytest discovery picks them up automatically.
 
 All fixtures live under ``scripts/tests/fixtures/`` — the same directory acts
-as BOTH the "in-progress plans dir" and the "shipped archive dir" via env
+as BOTH the "active plans dir" and the "optional archive dir" via env
 overrides on the subprocess invocation, so the tests are hermetic and never
-touch the operator's real ``D:/qontinui-root/plans``.
+touch the operator's real plans workspace.
 """
 
 from __future__ import annotations
@@ -22,10 +22,12 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import textwrap
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 
 # ---------------------------------------------------------------------------
@@ -135,27 +137,50 @@ class TestFindStatusBlock(unittest.TestCase):
 
 
 class TestParseDependsOn(unittest.TestCase):
+    # Dep references must be date-prefixed plan-stem-shaped tokens
+    # (``_STEM_RE``) — bare words like ``foo`` are deliberately rejected.
+
     def test_no_field(self) -> None:
         block = "**Status: SHIPPED 2026-05-21.** Plain summary."
         self.assertEqual(rpd.parse_depends_on(block), [])
 
     def test_single_stem(self) -> None:
-        block = "**Status: VETTED 2026-05-21.** Depends-On: foo."
-        self.assertEqual(rpd.parse_depends_on(block), ["foo"])
+        block = "**Status: VETTED 2026-05-21.** Depends-On: 2026-05-20-foo-plan."
+        self.assertEqual(rpd.parse_depends_on(block), ["2026-05-20-foo-plan"])
 
     def test_multiple_stems(self) -> None:
+        block = (
+            "**Status: VETTED 2026-05-21.** Depends-On: 2026-05-20-foo-plan, "
+            "2026-05-20-bar-plan , 2026-05-20-baz-plan."
+        )
+        self.assertEqual(
+            rpd.parse_depends_on(block),
+            ["2026-05-20-foo-plan", "2026-05-20-bar-plan", "2026-05-20-baz-plan"],
+        )
+
+    def test_bare_words_rejected(self) -> None:
+        # Prose tokens without the date prefix are not stems.
         block = "**Status: VETTED 2026-05-21.** Depends-On: foo, bar , baz."
-        self.assertEqual(rpd.parse_depends_on(block), ["foo", "bar", "baz"])
+        self.assertEqual(rpd.parse_depends_on(block), [])
 
     def test_trailing_empty_token_dropped(self) -> None:
-        block = "**Status: VETTED 2026-05-21.** Depends-On: a, b , c ,"
-        self.assertEqual(rpd.parse_depends_on(block), ["a", "b", "c"])
+        block = (
+            "**Status: VETTED 2026-05-21.** Depends-On: 2026-05-20-a-plan, "
+            "2026-05-20-b-plan , 2026-05-20-c-plan ,"
+        )
+        self.assertEqual(
+            rpd.parse_depends_on(block),
+            ["2026-05-20-a-plan", "2026-05-20-b-plan", "2026-05-20-c-plan"],
+        )
 
     def test_token_stops_at_newline(self) -> None:
-        # Multi-line block: parsed continuation should not leak prose from
-        # subsequent paragraphs into the last token.
-        block = "**Status: VETTED.** Depends-On: foo\n\nUnrelated next paragraph."
-        self.assertEqual(rpd.parse_depends_on(block), ["foo"])
+        # Only the marker's physical line is consumed: a stem named in a
+        # later paragraph must not leak into the dep list.
+        block = (
+            "**Status: VETTED.** Depends-On: 2026-05-20-foo-plan\n\n"
+            "Unrelated paragraph mentions 2026-05-22-bar-plan."
+        )
+        self.assertEqual(rpd.parse_depends_on(block), ["2026-05-20-foo-plan"])
 
 
 class TestExtractLifecycle(unittest.TestCase):
@@ -338,6 +363,93 @@ class TestCLIExitCodes(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("(no Depends-On declared)", stdout)
         self.assertIn("all_satisfied = true", stdout)
+
+
+# ---------------------------------------------------------------------------
+# Directory resolution: active plans dir + OPTIONAL archive dir (Model B)
+# ---------------------------------------------------------------------------
+
+
+class TestDirectoryResolution(unittest.TestCase):
+    def _run_with_env(
+        self,
+        plan_path: Path,
+        env_overrides: dict[str, str],
+    ) -> tuple[int, str, str]:
+        """Run the script with ONLY the given plan-dir env vars set."""
+        env = os.environ.copy()
+        env.pop("QONTINUI_PLANS_DIR", None)
+        env.pop("QONTINUI_PLANS_ARCHIVE_DIR", None)
+        env.update(env_overrides)
+        proc = subprocess.run(
+            [sys.executable, str(_SCRIPT_PATH), str(plan_path)],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+
+    def _write_depending_plan(self, dir_path: Path) -> Path:
+        """Write a plan that depends on a fixture stem living elsewhere."""
+        path = dir_path / "2026-05-21-archive-lookup-probe.md"
+        path.write_text(
+            "# Plan\n\n"
+            "> **Status: VETTED 2026-05-21.** Probe. "
+            "Depends-On: 2026-05-20-fixture-shipped-dep.\n",
+            encoding="utf-8",
+        )
+        return path
+
+    def test_dep_resolves_from_archive_when_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            plans = Path(tmp)
+            plan = self._write_depending_plan(plans)
+            rc, stdout, stderr = self._run_with_env(
+                plan,
+                {
+                    "QONTINUI_PLANS_DIR": str(plans),
+                    "QONTINUI_PLANS_ARCHIVE_DIR": str(_FIXTURES_DIR),
+                },
+            )
+            self.assertEqual(rc, 0, msg=stdout + stderr)
+            payload = json.loads(stdout)
+            self.assertEqual(payload["depends_on"][0]["status"], "SHIPPED")
+
+    def test_archive_not_consulted_when_unset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            plans = Path(tmp)
+            plan = self._write_depending_plan(plans)
+            rc, stdout, stderr = self._run_with_env(
+                plan,
+                {"QONTINUI_PLANS_DIR": str(plans)},
+            )
+            self.assertEqual(rc, 1, msg=stdout + stderr)
+            payload = json.loads(stdout)
+            self.assertEqual(payload["depends_on"][0]["status"], "MISSING")
+
+    def test_missing_plans_dir_exits_two_with_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ghost = Path(tmp) / "does-not-exist"
+            rc, stdout, stderr = self._run_with_env(
+                _FIXTURES_DIR / "2026-05-21-fixture-plan-no-deps.md",
+                {"QONTINUI_PLANS_DIR": str(ghost)},
+            )
+            self.assertEqual(rc, 2, msg=stdout + stderr)
+            self.assertIn("QONTINUI_PLANS_DIR", stderr)
+
+    def test_empty_archive_env_counts_as_unset(self) -> None:
+        with mock.patch.dict(os.environ, {"QONTINUI_PLANS_ARCHIVE_DIR": ""}):
+            self.assertIsNone(rpd.resolve_archive_dir(None))
+
+    def test_in_process_lookup_without_archive(self) -> None:
+        # archive_dir=None → single-directory layout; fixture deps resolve.
+        result = rpd.resolve_plan(
+            _FIXTURES_DIR / "2026-05-21-fixture-plan-shipped-dep.md",
+            _FIXTURES_DIR,
+            None,
+        )
+        self.assertTrue(result.all_satisfied)
 
 
 if __name__ == "__main__":

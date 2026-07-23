@@ -2,9 +2,10 @@
 """Render the dependency DAG across all plans.
 
 Phase 3.3 of the 2026-05-21 coordination-improvements plan. Walks every
-``*.md`` plan in ``qontinui-dev-notes/plans/`` (env-overridable
-per ``resolve-plan-deps.py``), builds a directed graph of ``Depends-On:``
-edges, and renders it as a text-tree, JSON, or Mermaid graph.
+``*.md`` plan in the active plans dir — plus the optional archive dir when
+one is configured (env-overridable per ``resolve-plan-deps.py``) — builds a
+directed graph of ``Depends-On:`` edges, and renders it as a text-tree,
+JSON, or Mermaid graph.
 
 Edges
 -----
@@ -36,9 +37,11 @@ Hiding terminal nodes:
     they're structurally on the path to a non-shipped descendant.
 
 Environment overrides (shared with ``resolve-plan-deps.py``):
-    QONTINUI_PLANS_DIR          (default ``D:/qontinui-root/qontinui-dev-notes/plans``)
-    QONTINUI_PLANS_ARCHIVE_DIR  (legacy 2nd lookup path, retired 2026-07-22;
-                                same default as above — leave unset)
+    QONTINUI_PLANS_DIR          active plans dir
+                                (fallback: ``<workspace-root>/plans``)
+    QONTINUI_PLANS_ARCHIVE_DIR  optional archive directory — a real
+                                destination for archived plans; unset means
+                                single-directory layout (no default)
 
 Re-uses parser primitives (``find_status_block``, ``parse_depends_on``,
 ``extract_lifecycle``) from ``resolve-plan-deps.py`` (Phase 3.2) via direct
@@ -50,7 +53,6 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
-import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -60,8 +62,9 @@ from typing import Iterable
 # Constants
 # ---------------------------------------------------------------------------
 
-DEFAULT_PLANS_DIR = "D:/qontinui-root/qontinui-dev-notes/plans"
-DEFAULT_ARCHIVE_DIR = "D:/qontinui-root/qontinui-dev-notes/plans"
+# Directory resolution (active plans dir + optional archive dir) is shared
+# with resolve-plan-deps.py — see ``resolve_plans_dir`` / ``resolve_archive_dir``
+# imported below.
 
 # Lifecycle words that mean the node is "done" for rendering-purposes. When
 # such a node is also a leaf (no in-graph descendants), the default render
@@ -104,6 +107,9 @@ _rpd = _load_rpd()
 find_status_block = _rpd.find_status_block
 parse_depends_on = _rpd.parse_depends_on
 extract_lifecycle = _rpd.extract_lifecycle
+resolve_plans_dir = _rpd.resolve_plans_dir
+resolve_archive_dir = _rpd.resolve_archive_dir
+InputError = _rpd.InputError
 
 
 # ---------------------------------------------------------------------------
@@ -152,11 +158,16 @@ class Graph:
 # ---------------------------------------------------------------------------
 
 
-def _iter_plan_files(plans_dir: Path, archive_dir: Path) -> Iterable[Path]:
+def _iter_plan_files(
+    plans_dir: Path, archive_dir: Path | None
+) -> Iterable[Path]:
     seen_stems: set[str] = set()
-    # Walk in-progress plans first so they take precedence on stem collisions
-    # (matches resolve-plan-deps.py lookup order).
-    for d in (plans_dir, archive_dir):
+    # Walk active plans first so they take precedence on stem collisions
+    # (matches resolve-plan-deps.py lookup order). The optional archive dir
+    # is a real destination for archived plans and is walked only when
+    # configured — unset means single-directory layout.
+    dirs = [plans_dir] if archive_dir is None else [plans_dir, archive_dir]
+    for d in dirs:
         if not d.exists():
             continue
         for path in sorted(d.glob("*.md")):
@@ -188,8 +199,12 @@ def _parse_plan(path: Path) -> tuple[str, str, list[str]]:
     return stem, status, deps
 
 
-def build_graph(plans_dir: Path, archive_dir: Path) -> Graph:
-    """Walk both plan dirs, build a Graph with edges, missing, and cycles."""
+def build_graph(plans_dir: Path, archive_dir: Path | None = None) -> Graph:
+    """Walk the plan dir(s), build a Graph with edges, missing, and cycles.
+
+    ``archive_dir`` is consulted only when configured — ``None`` means
+    single-directory layout.
+    """
     graph = Graph()
 
     # First pass: register every on-disk plan as a node.
@@ -596,20 +611,10 @@ def _render_mermaid(graph: Graph) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _resolve_dirs(args: argparse.Namespace) -> tuple[Path, Path]:
-    plans_dir_raw = (
-        args.plans_dir
-        or os.environ.get("QONTINUI_PLANS_DIR")
-        or DEFAULT_PLANS_DIR
-    )
-    archive_dir_raw = (
+def _resolve_dirs(args: argparse.Namespace) -> tuple[Path, Path | None]:
+    return resolve_plans_dir(args.plans_dir), resolve_archive_dir(
         args.archive_dir
-        or os.environ.get("QONTINUI_PLANS_ARCHIVE_DIR")
-        or DEFAULT_ARCHIVE_DIR
     )
-    plans_dir = Path(plans_dir_raw).expanduser().resolve()
-    archive_dir = Path(archive_dir_raw).expanduser().resolve()
-    return plans_dir, archive_dir
 
 
 def main(argv: Iterable[str] | None = None) -> int:
@@ -645,12 +650,19 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument(
         "--plans-dir",
         default=None,
-        help="Override the plans dir (env: QONTINUI_PLANS_DIR).",
+        help=(
+            "Override the active plans dir (env: QONTINUI_PLANS_DIR; "
+            "fallback: <workspace-root>/plans)."
+        ),
     )
     parser.add_argument(
         "--archive-dir",
         default=None,
-        help="Legacy 2nd lookup path, retired 2026-07-22 (env: QONTINUI_PLANS_ARCHIVE_DIR).",
+        help=(
+            "Optional archive directory — a real destination for archived "
+            "plans; unset means single-directory layout "
+            "(env: QONTINUI_PLANS_ARCHIVE_DIR)."
+        ),
     )
     parser.add_argument(
         "--ascii",
@@ -664,7 +676,11 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     args = parser.parse_args(list(argv) if argv is not None else None)
 
-    plans_dir, archive_dir = _resolve_dirs(args)
+    try:
+        plans_dir, archive_dir = _resolve_dirs(args)
+    except InputError as exc:
+        print(f"plan-graph: {exc}", file=sys.stderr)
+        return 2
 
     # Reconfigure stdout to UTF-8 BEFORE building the graph so Unicode
     # detection in _supports_unicode picks up the upgraded encoding.
