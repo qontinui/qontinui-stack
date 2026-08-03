@@ -112,6 +112,61 @@ resource "aws_route_table_association" "private" {
   route_table_id = aws_route_table.private.id
 }
 
+# ─── VPC Endpoints ──────────────────────────────────────────────────────
+#
+# Without this, EVERY byte the Fargate tasks exchange with S3 leaves via the
+# NAT gateway and is billed at $0.045/GB of data processing on top of the NAT's
+# own ~$32/month. Measured over 2026-07-24 → 08-02 the NAT carried ~55 GB/day
+# (~85% of it inbound and near-constant day to day — the signature of machine
+# traffic, not human), i.e. ~$74/month of pure processing charges.
+#
+# A GATEWAY endpoint is the only endpoint type that is unconditionally worth
+# adding: no hourly charge, no per-GB charge, no volume at which it fails to pay
+# off. It captures more than "S3" suggests, because ECR image layers are served
+# from S3 — a large fraction of every container pull shifts off the NAT without
+# any ECR endpoint at all.
+#
+# INTERFACE endpoints (ecr.api, ecr.dkr, logs, secretsmanager) are deliberately
+# NOT here: each costs ~$0.01/hr/AZ (~$15/month across 2 AZs) PLUS $0.01/GB, so
+# the break-even is ~420 GB/month per service ($14.60 / ($0.045 - $0.010)) and
+# adding one below that INCREASES the bill. The account has no VPC flow logs, so
+# nothing currently attributes the NAT volume by destination — that measurement
+# is the prerequisite, not a formality.
+#
+# The ssmmessages/ssm/ec2messages family is excluded UNCONDITIONALLY, not on
+# cost grounds: those are network plumbing in form and an interactive-access
+# transport in effect (ECS Exec), and a cost change has no business widening
+# that surface.
+#
+# Plan: plans/2026-08-03-vpc-endpoints-nat-egress-baseline.md
+
+# This module takes only environment/vpc_cidr/az_count — there is no var.region
+# here, and adding one would mean changing the module call in aws/staging/main.tf
+# too. Resolve it from the provider instead, as modules/coord/main.tf already does.
+data "aws_region" "current" {}
+
+# NOTE: no aws_vpc_endpoint_policy. The default (full-access) endpoint policy is
+# the correct one here. A policy scoped to "our own buckets" would break the ECR
+# image pulls this endpoint exists to move off the NAT, because ECR layers live
+# in AWS-owned buckets (prod-<region>-starport-layer-bucket-*), not in this
+# account. Traffic through the endpoint is still gated by each caller's own IAM;
+# the endpoint changes the path, not the permissions.
+resource "aws_vpc_endpoint" "s3" {
+  vpc_id            = aws_vpc.main.id
+  service_name      = "com.amazonaws.${data.aws_region.current.name}.s3"
+  vpc_endpoint_type = "Gateway"
+
+  # Private table only. The public table routes via the IGW and pays no NAT
+  # processing, so associating it buys nothing. If az_count ever yields per-AZ
+  # private route tables, this must become a list.
+  route_table_ids = [aws_route_table.private.id]
+
+  tags = {
+    Name        = "qontinui-${var.environment}-s3-endpoint"
+    Environment = var.environment
+  }
+}
+
 # ─── Security Groups ────────────────────────────────────────────────────
 
 resource "aws_security_group" "alb" {
@@ -239,3 +294,4 @@ output "private_subnet_ids" { value = aws_subnet.private[*].id }
 output "alb_sg_id" { value = aws_security_group.alb.id }
 output "client_sg_id" { value = aws_security_group.client.id }
 output "data_plane_sg_id" { value = aws_security_group.data_plane.id }
+output "s3_endpoint_id" { value = aws_vpc_endpoint.s3.id }
