@@ -29,11 +29,13 @@ variable "az_count" {
 variable "domain_name" {
   description = "Base domain (e.g. qontinui.io). Coord ingress goes to <coord_subdomain>.<domain>."
   type        = string
+  default     = "staging.qontinui.io"
 }
 
 variable "route53_zone_id" {
   description = "Existing Route53 hosted zone id for var.domain_name."
   type        = string
+  default     = "Z02792161EHR967BO9804"
 }
 
 variable "coord_subdomain" {
@@ -45,12 +47,13 @@ variable "coord_subdomain" {
 variable "web_subdomain" {
   description = "Subdomain for the qontinui-web backend ALB ingress."
   type        = string
-  default     = "api"
+  default     = "web"
 }
 
 variable "frontend_url" {
   description = "Vercel frontend origin — used for the web backend's CORS allow-list and absolute links."
   type        = string
+  default     = "https://qontinui.io"
 }
 
 # ─── Web backend service ────────────────────────────────────────────────
@@ -64,6 +67,7 @@ variable "web_image_uri" {
 variable "migrator_image_uri" {
   description = "ECR URI of the canonical-DB migrator image (alembic upgrade head; built from origin/main qontinui-web alembic chain)."
   type        = string
+  default     = "047719635665.dkr.ecr.us-east-1.amazonaws.com/qontinui-migrator:staging"
 }
 
 variable "web_cpu" {
@@ -124,10 +128,6 @@ variable "budget_monthly_limit" {
   default     = "100"
 }
 
-variable "budget_alert_email" {
-  description = "Email for budget threshold alerts (SNS + direct). Confirm the SNS subscription email AWS sends."
-  type        = string
-}
 
 # ─── Postgres ───────────────────────────────────────────────────────────
 
@@ -233,11 +233,6 @@ variable "coord_desired_count" {
   default     = 2
 }
 
-variable "coord_github_webhook_secret" {
-  description = "Shared HMAC secret for GitHub webhooks. Stored in Secrets Manager."
-  type        = string
-  sensitive   = true
-}
 
 # ─── Cold-tier session output (Phase 8) ─────────────────────────────────
 

@@ -26,10 +26,6 @@ variable "redis_url" {
   type      = string
   sensitive = true
 }
-variable "github_webhook_secret" {
-  type      = string
-  sensitive = true
-}
 variable "coord_admin_secret" {
   type      = string
   sensitive = true
@@ -105,14 +101,22 @@ resource "aws_secretsmanager_secret_version" "redis_url" {
   secret_string = var.redis_url
 }
 
-resource "aws_secretsmanager_secret" "webhook_secret" {
-  name        = "qontinui/${var.environment}/coord/github_webhook_secret"
-  description = "GitHub webhook HMAC secret for qontinui-coord (${var.environment})"
-}
-
-resource "aws_secretsmanager_secret_version" "webhook_secret" {
-  secret_id     = aws_secretsmanager_secret.webhook_secret.id
-  secret_string = var.github_webhook_secret
+# GitHub webhook HMAC secret. Operator-staged out-of-band; this data source
+# resolves it by name at plan time.
+#
+# Why a data source, not an aws_secretsmanager_secret resource: identical
+# reasoning to coord_jwt_signing_key below. Terraform wires the ARN into the
+# task definition and never sees or stores the secret VALUE, so the value stops
+# living in terraform state and stops being a required root variable — which is
+# what lets an agent run `terraform plan` here at all.
+#
+# Rotation is therefore an operator action against Secrets Manager, NOT a
+# `terraform apply`. That is the deliberate trade this buys.
+#
+# The exec-role grant is unaffected: task_exec_secrets below grants on the
+# namespace glob `qontinui/${var.environment}/coord*`, not on this ARN.
+data "aws_secretsmanager_secret" "webhook_secret" {
+  name = "qontinui/${var.environment}/coord/github_webhook_secret"
 }
 
 resource "aws_secretsmanager_secret" "coord_admin_secret" {
@@ -607,7 +611,7 @@ resource "aws_ecs_task_definition" "coord" {
       secrets = [
         { name = "DATABASE_URL", valueFrom = aws_secretsmanager_secret.database_url.arn },
         { name = "REDIS_URL", valueFrom = aws_secretsmanager_secret.redis_url.arn },
-        { name = "GITHUB_WEBHOOK_SECRET", valueFrom = aws_secretsmanager_secret.webhook_secret.arn },
+        { name = "GITHUB_WEBHOOK_SECRET", valueFrom = data.aws_secretsmanager_secret.webhook_secret.arn },
         { name = "COORD_ADMIN_SECRET", valueFrom = aws_secretsmanager_secret.coord_admin_secret.arn },
         # Companion to qontinui-coord PR `feat(jwt): load signing key from
         # COORD_JWT_SIGNING_KEY env`. Eliminates the ephemeral-Fargate-FS

@@ -19,7 +19,6 @@ route53_zone_id = "Z01234567890ABCDEFGH"
 coord_image_uri = "<aws-account-id>.dkr.ecr.us-east-1.amazonaws.com/qontinui-coord:staging"
 
 # GitHub webhook shared secret. Use `openssl rand -hex 32` to generate.
-coord_github_webhook_secret = "REPLACE-ME"
 
 # Sizing — defaults are fine for staging. Bump for prod.
 # postgres_instance_class = "db.t4g.micro"

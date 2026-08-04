@@ -153,10 +153,9 @@ module "coord" {
   memory_mb     = var.coord_memory_mb
   desired_count = var.coord_desired_count
 
-  database_url          = module.postgres.connection_string
-  redis_url             = module.redis.connection_string
-  github_webhook_secret = var.coord_github_webhook_secret
-  coord_admin_secret    = random_password.coord_admin_secret.result
+  database_url       = module.postgres.connection_string
+  redis_url          = module.redis.connection_string
+  coord_admin_secret = random_password.coord_admin_secret.result
   # Shared with web for the gate-action notification webhook (T3). coord's
   # task-exec role already wildcards qontinui/${env}/coord*, so this needs no
   # IAM change; the coord container mounts it via deploy/taskdef.json.
@@ -320,7 +319,7 @@ module "cost_control" {
 
   environment   = var.environment
   monthly_limit = var.budget_monthly_limit
-  alert_email   = var.budget_alert_email
+  alert_email   = data.aws_ssm_parameter.budget_alert_email.insecure_value
 }
 
 # ─── Observability (CloudWatch alarms for coord) ────────────────────────
@@ -335,4 +334,52 @@ module "observability" {
   coord_cluster_name   = module.coord.cluster_name
   coord_service_name   = module.coord.service_name
   coord_log_group_name = module.coord.log_group_name
+}
+
+# ─── Operator-staged, out-of-region ─────────────────────────────────────
+#
+# budget_alert_email is PII (a personal address) and this repo is PUBLIC, so it
+# cannot be a committed default. It lives in the operator's SSM Parameter Store
+# in eu-central-1 — the established home for this class of value — which the
+# stack's own region (us-east-1) reaches via this alias.
+#
+# Staged once with:
+#   aws ssm put-parameter --region eu-central-1 #     --name /qontinui/ops/budget-alert-email --type String --value '<address>'
+#
+# String, not SecureString: PII, not a credential — SecureString would drag a
+# KMS decrypt grant into the cost-control module for no confidentiality gain.
+# Consumed via `insecure_value` (valid only for non-SecureString params) rather
+# than `.value`: `.value` is unconditionally sensitive, which re-classifies the
+# SNS subscription's endpoint and produces a perpetual cosmetic diff even when
+# the address is byte-identical. `insecure_value` is the accessor meant for
+# exactly this case — a String parameter holding non-secret data.
+# Deliberately NOT reusing /qontinui/operator/email, which sits in a credential
+# cluster; binding billing alerts to login material couples two lifecycles.
+provider "aws" {
+  alias  = "ssm"
+  region = "eu-central-1"
+}
+
+data "aws_ssm_parameter" "budget_alert_email" {
+  provider = aws.ssm
+  name     = "/qontinui/ops/budget-alert-email"
+}
+
+# ─── State migration (delete these once state is clean) ─────────────────
+#
+# The webhook secret moved from a terraform-managed resource to a data source
+# (modules/coord/main.tf). Without these blocks terraform would DESTROY the live
+# secret and break coord's webhook verification. `destroy = false` drops it from
+# state while leaving the AWS resource untouched.
+#
+# Root placement with the module.coord.* prefix is verified — `terraform
+# validate` accepts it — and keeps the state surgery in one reviewable file.
+removed {
+  from = module.coord.aws_secretsmanager_secret_version.webhook_secret
+  lifecycle { destroy = false }
+}
+
+removed {
+  from = module.coord.aws_secretsmanager_secret.webhook_secret
+  lifecycle { destroy = false }
 }
