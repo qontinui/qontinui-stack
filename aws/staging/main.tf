@@ -364,22 +364,3 @@ data "aws_ssm_parameter" "budget_alert_email" {
   provider = aws.ssm
   name     = "/qontinui/ops/budget-alert-email"
 }
-
-# ─── State migration (delete these once state is clean) ─────────────────
-#
-# The webhook secret moved from a terraform-managed resource to a data source
-# (modules/coord/main.tf). Without these blocks terraform would DESTROY the live
-# secret and break coord's webhook verification. `destroy = false` drops it from
-# state while leaving the AWS resource untouched.
-#
-# Root placement with the module.coord.* prefix is verified — `terraform
-# validate` accepts it — and keeps the state surgery in one reviewable file.
-removed {
-  from = module.coord.aws_secretsmanager_secret_version.webhook_secret
-  lifecycle { destroy = false }
-}
-
-removed {
-  from = module.coord.aws_secretsmanager_secret.webhook_secret
-  lifecycle { destroy = false }
-}
