@@ -1,4 +1,41 @@
-# Cross-machine sccache (shared S3)
+# Cross-machine sccache (shared S3) — ⛔ RETIRED 2026-07-23, DO NOT FOLLOW
+
+> **STOP. This procedure is retired and following it will break every cargo
+> build on the machine.** The shared-S3 sccache backend was cut over to
+> machine-default **local disk** on 2026-07-23 after it was proven to cause a
+> fleet-wide build stall: S3 round-trips ran at 3–4 s/op, and because sccache
+> 0.15 has no client-side dispatch timeout, clients arrived faster than the
+> single server could drain and piled up (175 `sccache.exe` against 1 `rustc.exe`
+> observed, cache hit rate 3.71%). The cross-machine sharing this document was
+> written to deliver **was never realized** — measured cross-worktree hit rate
+> was 0%.
+>
+> **Why this file still exists, and why it is dangerous.** The AWS inventory
+> below (bucket, ARN, IAM user, rotation procedure) describes infrastructure
+> that is still provisioned and may still need decommissioning, so the record is
+> worth keeping. But the *procedure* sections are an active hazard: sccache
+> latches its storage backend at **server start**, from the environment of
+> whichever client happens to spawn it. So a single operator exporting
+> `SCCACHE_BUCKET` per "Per-machine setup" below re-pins the **machine-wide,
+> cross-repo** cache to S3 for every repo until that daemon dies — reproducing
+> the outage. That is not hypothetical: it recurred on 2026-08-04 exactly this
+> way.
+>
+> **Do not export `SCCACHE_BUCKET`, `SCCACHE_REGION`, or `SCCACHE_S3_KEY_PREFIX`
+> on any machine in this fleet.** Two shipped guards will now block or degrade a
+> build that tries — `qontinui-claude-config/.claude/hooks/sccache-backend-guard.sh`
+> (PreToolUse, blocks) and `cargo-guard.sh::maybe_degrade_on_s3_backend()`
+> (degrades to direct rustc and says why) — but the guards are a backstop, not a
+> licence to try.
+>
+> The verification script this document used to point at
+> (`scripts/verify-sccache-cross-machine.sh`) **has been deleted**: it exported
+> the bucket itself, so merely running it re-injected the regression.
+>
+> Full record: `qontinui-dev-notes/plans/2026-07-23-sccache-client-pileup-root-cause.md`
+> (original cutover) and
+> `qontinui-dev-notes/plans/2026-08-04-sccache-daemon-wedge-and-s3-regression.md`
+> (the recurrence, the latch-at-start proof, and the shipped guards).
 
 Phase 2.1 of `plans/2026-05-21-coordination-improvements.md`. Migrates the
 rustc compile-unit cache from the in-stack MinIO bucket (`qontinui-sccache`)
@@ -149,11 +186,21 @@ Then run a trivial cargo build (`cargo check` in any workspace member) and
 inspect `sccache --show-stats`. The S3 `Requests sent` counter should
 increment.
 
-## Verifying the cross-machine win
+## Verifying the cross-machine win — ⛔ SCRIPT DELETED
 
-Phase 2.3 ships a repeatable mechanism so the cycle-time payoff is *measured*,
+> **`scripts/verify-sccache-cross-machine.sh` no longer exists.** It was removed
+> on 2026-08-14 because it `export`ed `SCCACHE_BUCKET` / `SCCACHE_REGION`
+> itself — so running it re-pinned the machine-wide sccache daemon to the S3
+> backend and re-created the fleet-wide stall. The remainder of this section is
+> preserved only as a record of what was measured in May 2026; **none of the
+> commands below are runnable, and none should be recreated.**
+>
+> The win it set out to prove never materialized: the measured cross-worktree
+> hit rate was 0%, which is why the backend was cut over to local disk.
+
+Phase 2.3 shipped a repeatable mechanism so the cycle-time payoff is *measured*,
 not eyeballed once (memory: `feedback_build_verification_over_manual_observation`).
-The script is `scripts/verify-sccache-cross-machine.sh`.
+The script was `scripts/verify-sccache-cross-machine.sh` (deleted).
 
 It has two roles run on two machines against the **same source state** with the
 same `SCCACHE_*` / `AWS_*` env exported (see *Per-machine setup* above):
