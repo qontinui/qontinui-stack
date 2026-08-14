@@ -161,9 +161,17 @@ resource "aws_vpc_endpoint" "s3" {
   # private route tables, this must become a list.
   route_table_ids = [aws_route_table.private.id]
 
+  # Name only. `Environment` is already supplied by the provider's `default_tags`
+  # (aws/staging/providers.tf), so declaring it here too made this the ONE resource
+  # in the repo that sets a default tag at resource level — and that is not
+  # cosmetic. On `terraform import` the provider records `tags` as live-minus-
+  # default_tags, i.e. `{Name}`, while the config asked for `{Name, Environment}`,
+  # so the imported endpoint planned a permanent 1-to-change that no apply could
+  # settle. Dropping it leaves `tags_all` — and therefore the live endpoint —
+  # byte-identical. (Found importing this endpoint, 2026-08-15; plan
+  # 2026-08-04-stack-terraform-state-reconciliation P2.)
   tags = {
-    Name        = "qontinui-${var.environment}-s3-endpoint"
-    Environment = var.environment
+    Name = "qontinui-${var.environment}-s3-endpoint"
   }
 }
 

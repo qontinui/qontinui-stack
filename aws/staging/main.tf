@@ -296,7 +296,7 @@ module "cross_idp_linking" {
   region           = var.region
   user_pool_arn    = var.cognito_user_pool_arn
   user_pool_id     = element(split("/", var.cognito_user_pool_arn), 1)
-  signup_allowlist = var.signup_allowlist
+  signup_allowlist = data.aws_ssm_parameter.signup_allowlist.insecure_value
 }
 
 # ─── Tunnel (ALB + ACM + Route53) ───────────────────────────────────────
@@ -368,4 +368,30 @@ provider "aws" {
 data "aws_ssm_parameter" "budget_alert_email" {
   provider = aws.ssm
   name     = "/qontinui/ops/budget-alert-email"
+}
+
+# signup_allowlist is the same class of value and moves here for the same reason,
+# plus a sharper one: it was a root variable defaulting to "", and the module's
+# own documentation says an empty allowlist means enforcement DISABLED
+# (fail-open). The live Lambda carries a real three-address allowlist, set
+# out-of-band, so an untargeted `terraform apply` would have silently opened
+# self-service federated signup on the production Cognito pool — presented in the
+# plan summary as an innocuous "1 to change" on a Lambda. Sourcing it from SSM
+# makes the live value the configured value, so the diff is gone and the gate
+# cannot be dropped by an apply that was never about signup.
+#
+# Staged once with:
+#   aws ssm put-parameter --region eu-central-1 \
+#     --name /qontinui/ops/signup-allowlist --type String --value '<a,b,c>'
+#
+# String + insecure_value for the same reasons as the address above: these are
+# personal addresses (PII) rather than credentials, and `.value` is
+# unconditionally sensitive, which would re-classify the Lambda's environment
+# block and produce a perpetual cosmetic diff. The module input stays
+# `sensitive = true`, so the addresses are still redacted in plan output — which
+# matters in a PUBLIC repo whose CI prints plans.
+# (plan 2026-08-04-stack-terraform-state-reconciliation, P3.)
+data "aws_ssm_parameter" "signup_allowlist" {
+  provider = aws.ssm
+  name     = "/qontinui/ops/signup-allowlist"
 }

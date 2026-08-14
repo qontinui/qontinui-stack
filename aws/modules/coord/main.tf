@@ -222,7 +222,10 @@ data "aws_partition" "current" {}
 # such addition was previously made out-of-band to the live role and never
 # reflected in terraform, so a full `terraform apply` would STRIP the role
 # back to the 5 secrets terraform knew about and break coord. (See plan
-# 2026-05-30-qontinui-stack-terraform-state-reconciliation §1.2/§3-B1.)
+# 2026-08-04-stack-terraform-state-reconciliation. This used to cite
+# 2026-05-30-qontinui-stack-terraform-state-reconciliation §1.2/§3-B1, which does
+# not exist and never did — see the note on the citation at the task definition
+# below.)
 #
 # Granting on coord's two secret namespaces auto-covers any future coord
 # secret WITHOUT a terraform change, so the role can never strip-drift again:
@@ -561,8 +564,18 @@ resource "aws_iam_role_policy" "task_ecs_exec" {
 # merge thereafter. Its staleness is therefore harmless by design — the floating
 # `:staging` image, 3-env, 5-secret shape below is a placeholder, never live
 # traffic. Do NOT try to keep it in sync with the live revision; that's CI's job.
-# (See plan 2026-05-30-qontinui-stack-terraform-state-reconciliation §3-A1 +
-# Open-Q1.)
+#
+# CITATION REPOINTED 2026-08-15. Three comments in this file cited plan
+# `2026-05-30-qontinui-stack-terraform-state-reconciliation` (§1.2, §3-A1,
+# §3-B1, Open-Q1). No such plan exists — not in the plans directory, not in
+# qontinui-dev-notes/plans, not archived. It was cited but never written, so its
+# conclusions were never implemented: an untargeted `terraform plan` still read
+# `4 to add, 2 to change, 2 to destroy` on 2026-08-14. The real reconciliation is
+# plan `2026-08-04-stack-terraform-state-reconciliation`, which supersedes the
+# dangling reference and left this file's contract intact — the bootstrap-only
+# task definition below is still bootstrap-only, and it now plans clean because
+# `coord_image_uri` regained a real default rather than because anything here
+# changed. (See that plan; and do not re-cite the 2026-05-30 stem.)
 resource "aws_ecs_task_definition" "coord" {
   family                   = "qontinui-${var.environment}-coord"
   cpu                      = var.cpu
@@ -790,8 +803,11 @@ resource "aws_ecs_service" "coord" {
   # entirely by CI. `desired_count` is owned by the stop/start replica scripts
   # (same rationale). So `terraform apply` stays a human-gated provisioning op
   # that never touches the running revision or the replica count.
-  # (Mirrors module.web; see plan
-  # 2026-05-30-qontinui-stack-terraform-state-reconciliation §3-A1.)
+  # (Mirrors module.web — verified live 2026-08-15: a targeted apply of
+  # module.web.aws_ecs_task_definition.web registered revision :539 while the web
+  # service stayed pointed at :538, so the seam holds on both services. See plan
+  # 2026-08-04-stack-terraform-state-reconciliation; this used to cite the
+  # nonexistent 2026-05-30 stem.)
   lifecycle {
     ignore_changes = [task_definition, desired_count]
   }

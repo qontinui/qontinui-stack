@@ -14,6 +14,18 @@ variable "db_name" { type = string }
 variable "multi_az" { type = bool }
 variable "backup_retention_days" { type = number }
 
+variable "performance_insights_enabled" {
+  description = "Enable RDS Performance Insights. Defaults true: the only live composition of this module is aws/staging, which IS production and has PI on."
+  type        = bool
+  default     = true
+}
+
+variable "performance_insights_retention_days" {
+  description = "PI retention. 7 is the free tier and what the live instance carries; anything else is billable. Ignored when performance_insights_enabled is false."
+  type        = number
+  default     = 7
+}
+
 resource "random_password" "master" {
   length  = 32
   special = true
@@ -108,8 +120,14 @@ resource "aws_db_instance" "main" {
   apply_immediately          = false
   auto_minor_version_upgrade = true
 
-  performance_insights_enabled = false # staging — enable in prod for $7/mo
-  monitoring_interval          = 0     # staging — enable enhanced mon in prod
+  # Performance Insights. This directory IS production (see aws/staging/main.tf),
+  # PI is already enabled live and already being paid for, so the previous
+  # hardcoded `false` was simply wrong — an untargeted apply would have turned it
+  # off. Promoted to a variable rather than flipping the literal so a genuinely
+  # non-production composition of this module can still choose.
+  performance_insights_enabled          = var.performance_insights_enabled
+  performance_insights_retention_period = var.performance_insights_enabled ? var.performance_insights_retention_days : null
+  monitoring_interval                   = 0 # enhanced monitoring off; PI covers the need
 
   enabled_cloudwatch_logs_exports = ["postgresql", "upgrade"]
 

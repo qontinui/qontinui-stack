@@ -9,3 +9,12 @@ crash.log
 # Real tfvars carry secrets; only the .example is checked in.
 *.tfvars
 !*.tfvars.example
+# ...with one deliberate carve-out. staging/production.auto.tfvars holds exactly
+# one non-secret value — first_superuser_email, an address already committed in
+# staging/terraform.tfvars.example — and exists so `terraform plan` runs with no
+# tfvars and no -var, which is the property plan
+# 2026-08-04-terraform-secretless-input-surface shipped and which a defaultless
+# required variable would otherwise break. Keep it secret-free; anything that IS
+# a secret belongs in Secrets Manager or SSM and reaches terraform as a data
+# source, per that plan.
+!staging/production.auto.tfvars

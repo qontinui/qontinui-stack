@@ -70,8 +70,10 @@ variable "first_superuser_email" {
   #     change exists to fix — the failure would be invisible until someone
   #     needed the recovery path and found it missing.
   # Defaultless fails LOUDLY at plan time instead, forcing an explicit choice.
-  # Matches how `signup_allowlist` below treats the other operator-identity
-  # value in this file; the concrete-default variables here (route53_zone_id,
+  # The other operator-identity value in this root, `signup_allowlist`, reached
+  # the same conclusion and went further: having no correct default, it stopped
+  # being a variable at all and now comes from SSM (see below, and main.tf's
+  # "Operator-staged, out-of-region" block). The concrete-default variables here (route53_zone_id,
   # cognito_user_pool_arn) are infrastructure identifiers, not identities that
   # confer privilege. The real value lives in terraform.tfvars.example as
   # documentation, and in the operator's own gitignored tfvars as behaviour.
@@ -92,9 +94,24 @@ variable "first_superuser_email" {
 # ─── Web backend service ────────────────────────────────────────────────
 
 variable "web_image_uri" {
-  description = "ECR URI of the qontinui-web-backend image. Push first (built from qontinui-web origin/main — strategy proxy lives there)."
+  description = <<-EOT
+    ECR URI of the qontinui-web-backend image, used to render
+    module.web's aws_ecs_task_definition.web. Ongoing deploys do NOT come from
+    here: CI (qontinui-web/.github/workflows/staging-web-deploy.yml) describes
+    this family's latest revision, swaps in the SHA-pinned image it just built,
+    and registers a new one — see the TF/CI seam comment in modules/web/main.tf.
+
+    Defaults to the floating `:staging` tag, which the deploy pipeline moves onto
+    every image it pushes, matching migrator_image_uri directly above. It was
+    `""` until 2026-08-15; that was the entire reason `terraform plan` showed
+    `aws_ecs_task_definition.web` "must be replaced" forever — state held the
+    floating tag, config resolved to the empty string, and the two could never
+    agree. An empty default also does not do what its old comment claimed: plan
+    accepts `image = ""` silently, so a missed push surfaces at apply time as a
+    confusing failure rather than at plan time as a clear one.
+  EOT
   type        = string
-  default     = ""
+  default     = "047719635665.dkr.ecr.us-east-1.amazonaws.com/qontinui-web-backend:staging"
 }
 
 variable "migrator_image_uri" {
@@ -139,19 +156,19 @@ variable "cognito_user_pool_arn" {
   default     = "arn:aws:cognito-idp:us-east-1:047719635665:userpool/us-east-1_rgTB9dbZ1"
 }
 
-variable "signup_allowlist" {
-  description = <<-EOT
-    Comma-separated, case-insensitive emails permitted to self-service /
-    federate sign-up — the PreSignUp handler's invitation-only gate
-    (module.cross_idp_linking). Empty = enforcement DISABLED (fail-open).
-    Admin-created users always bypass the gate. SENSITIVE: do NOT commit real
-    customer emails to terraform.tfvars; supply at apply time via
-    `-var 'signup_allowlist=...'` or a gitignored secret tfvars.
-  EOT
-  type        = string
-  default     = ""
-  sensitive   = true
-}
+# signup_allowlist is no longer a variable. It moved to SSM
+# (/qontinui/ops/signup-allowlist, eu-central-1) and reaches
+# module.cross_idp_linking as a data source — see the "Operator-staged,
+# out-of-region" block in main.tf.
+#
+# Removed rather than kept-and-ignored on purpose. As a variable it defaulted to
+# "", and "" means enforcement DISABLED (fail-open) in the PreSignUp handler. The
+# live pool has always carried a real allowlist set out-of-band, so ANY apply run
+# without `-var signup_allowlist=...` would have silently dropped the
+# invitation-only gate on production — a security regression triggered by
+# forgetting a flag, which is exactly the shape of failure a default should never
+# have. There is no correct default for this value, so it stops being a variable.
+# (plan 2026-08-04-stack-terraform-state-reconciliation, P3.)
 
 # ─── Cost control ───────────────────────────────────────────────────────
 
@@ -165,9 +182,24 @@ variable "budget_monthly_limit" {
 # ─── Postgres ───────────────────────────────────────────────────────────
 
 variable "postgres_instance_class" {
-  description = "RDS instance class. Upsized db.t4g.micro (1GiB) -> db.t4g.medium (4GiB) 2026-06-09 after chronic OOM (FreeableMemory floor ~90MiB, 4 crashes/36h, RDS auto-halving shared_buffers). 4x memory clears the OOM with shared_buffers + page-cache headroom."
+  description = <<-EOT
+    RDS instance class. History: db.t4g.micro (1GiB) -> db.t4g.medium (4GiB)
+    2026-06-09 after chronic OOM (FreeableMemory floor ~90MiB, 4 crashes/36h,
+    RDS auto-halving shared_buffers).
+
+    Then -> db.m6g.xlarge (16GiB, 4 vCPU) out-of-band, i.e. by a console or CLI
+    ModifyDBInstance rather than an apply. The date is not established: RDS's
+    event history only retains 14 days and shows no class change in that window
+    (checked 2026-08-15). Reconciled into config here, because terraform's
+    default was still db.t4g.medium and an untargeted `terraform plan` therefore
+    read as a 4x DOWNSIZE of production Postgres, with a reboot, presented as an
+    innocuous "1 to change".
+
+    Keep this value equal to live. If you resize, resize here and apply — an
+    out-of-band resize re-arms exactly the trap this line documents.
+  EOT
   type        = string
-  default     = "db.t4g.medium"
+  default     = "db.m6g.xlarge"
 }
 
 variable "postgres_allocated_storage_gb" {
@@ -227,8 +259,16 @@ variable "coord_image_uri" {
     be re-applied for image changes.
   EOT
   type        = string
-  # Default left empty so a missed push surfaces immediately at apply time.
-  default = ""
+  # Defaults to the floating `:staging` tag the push script always moves, exactly
+  # as the description above says is safe, and matching migrator_image_uri. This
+  # was `""` until 2026-08-15 with the comment "left empty so a missed push
+  # surfaces immediately at apply time" — it did not do that. `terraform plan`
+  # accepts `image = ""` without complaint, so nothing surfaced at plan time;
+  # what it DID produce was a permanent `aws_ecs_task_definition.coord` "must be
+  # replaced" (state held `:staging`, config resolved to `""`), which is one of
+  # the two destroys plan 2026-08-04-stack-terraform-state-reconciliation exists
+  # to clear.
+  default = "047719635665.dkr.ecr.us-east-1.amazonaws.com/qontinui-coord:staging"
 }
 
 variable "coord_cpu" {
