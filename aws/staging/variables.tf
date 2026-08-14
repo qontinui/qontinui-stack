@@ -57,9 +57,36 @@ variable "frontend_url" {
 }
 
 variable "first_superuser_email" {
-  description = "Email address of the bootstrap superuser that qontinui-web's init_db seeds at startup (a shell auth.users row with is_superuser=true; cognito_sub is stamped on by verified email at that operator's first Cognito login). This is the non-HTTP first-admin path — without it a deployed environment that reaches zero superusers is stranded. An address, not a credential: wired as a plain container environment variable, never through Secrets Manager."
+  description = "Email address of the bootstrap superuser that qontinui-web's init_db seeds at startup (a shell auth.users row with is_superuser=true; cognito_sub is stamped on by verified email at that operator's first Cognito login). This is the non-HTTP first-admin path — without it a deployed environment that reaches zero superusers is stranded. An address, not a credential: wired as a plain container environment variable, never through Secrets Manager. DEFAULTLESS ON PURPOSE — see below."
   type        = string
-  default     = "josh@qontinui.io"
+
+  # No default, deliberately, and NOT `default = \"\"` either. This variable
+  # confers a superuser grant, so both silent outcomes are unacceptable:
+  #   - a concrete default silently seeds THIS operator's address into any
+  #     environment stood up from a copy of this root, handing a superuser row
+  #     to a mailbox that environment's owner does not control;
+  #   - an empty default silently makes the seed inert (init_db.py:55 is
+  #     `if settings.FIRST_SUPERUSER_EMAIL:`), which is exactly the state this
+  #     change exists to fix — the failure would be invisible until someone
+  #     needed the recovery path and found it missing.
+  # Defaultless fails LOUDLY at plan time instead, forcing an explicit choice.
+  # Matches how `signup_allowlist` below treats the other operator-identity
+  # value in this file; the concrete-default variables here (route53_zone_id,
+  # cognito_user_pool_arn) are infrastructure identifiers, not identities that
+  # confer privilege. The real value lives in terraform.tfvars.example as
+  # documentation, and in the operator's own gitignored tfvars as behaviour.
+
+  validation {
+    # init_db.py:58 matches `User.email == FIRST_SUPERUSER_EMAIL` case-SENSITIVELY
+    # against a column declared `unique=True` (models/user.py:36-37), while every
+    # organically-created row is lowercased first (cognito_provision.py:_extract_email
+    # does `.strip().lower()`). So a case variant misses the `if not user:` guard,
+    # then trips the unique constraint on insert; the IntegrityError propagates out
+    # of init_db and main.py's `except Exception: raise` aborts startup — an ECS
+    # boot loop from a config typo. Reject the typo here instead.
+    condition     = var.first_superuser_email == lower(var.first_superuser_email)
+    error_message = "first_superuser_email must be lowercase: qontinui-web's init_db matches auth.users.email case-sensitively against a unique column, so a case variant crashes web startup on boot."
+  }
 }
 
 # ─── Web backend service ────────────────────────────────────────────────

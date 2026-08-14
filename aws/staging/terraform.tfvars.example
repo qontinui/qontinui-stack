@@ -7,12 +7,18 @@ environment     = "staging"
 domain_name     = "qontinui.io"
 route53_zone_id = "Z01234567890ABCDEFGH"
 
-# Bootstrap superuser. qontinui-web's init_db seeds this email as the FIRST
-# superuser at app startup (shell auth.users row with is_superuser=true;
-# cognito_sub is stamped on at that operator's first Cognito login by verified
-# email). There is no HTTP bootstrap route — set this before the first apply or
-# the environment has no way to reach a superuser. An address, not a
-# credential; it is a plain container env var, not a secret.
+# Bootstrap superuser — REQUIRED, no default. qontinui-web's init_db seeds this
+# email as the FIRST superuser at app startup (shell auth.users row with
+# is_superuser=true; cognito_sub is stamped on at that operator's first Cognito
+# login, and only if the IdP asserts email_verified). There is no HTTP bootstrap
+# route any more, so this is the environment's only non-DB way to reach a
+# superuser — `terraform plan` will refuse to run until you set it.
+#
+# Set it to an address YOU control in THIS environment. Copying this root to a
+# new environment and leaving someone else's address here seeds them a superuser.
+# Must be lowercase: init_db's lookup is case-sensitive against a unique column,
+# so a case variant crashes web startup on boot (a validation block rejects it).
+# An address, not a credential; it is a plain container env var, not a secret.
 first_superuser_email = "josh@qontinui.io"
 
 # Coord image. This value is used ONLY on the initial `terraform apply`

@@ -106,7 +106,17 @@ variable "cognito_user_pool_arn" {
 # container's `environment` list, NOT in `secrets`.
 variable "first_superuser_email" {
   type        = string
-  description = "Email address of the bootstrap superuser seeded by qontinui-web's init_db at startup. An address, not a credential — wired via plain environment, never Secrets Manager."
+  description = "Email address of the bootstrap superuser seeded by qontinui-web's init_db at startup. An address, not a credential — wired via plain environment, never Secrets Manager. Must be lowercase (see validation)."
+
+  validation {
+    # Case-sensitive lookup (init_db.py:58) against a unique column
+    # (models/user.py:36-37), while real rows are lowercased on insert
+    # (cognito_provision.py). A case variant misses the `if not user:` guard,
+    # trips the unique constraint, and main.py re-raises — aborting startup.
+    # Enforced at BOTH levels so a different composition root cannot skip it.
+    condition     = var.first_superuser_email == lower(var.first_superuser_email)
+    error_message = "first_superuser_email must be lowercase: qontinui-web's init_db matches auth.users.email case-sensitively against a unique column, so a case variant crashes web startup on boot."
+  }
 }
 
 # ─── Security group rule: ALB → web on 8000 ─────────────────────────────
