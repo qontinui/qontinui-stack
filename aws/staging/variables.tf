@@ -56,6 +56,12 @@ variable "frontend_url" {
   default     = "https://qontinui.io"
 }
 
+variable "first_superuser_email" {
+  description = "Email address of the bootstrap superuser that qontinui-web's init_db seeds at startup (a shell auth.users row with is_superuser=true; cognito_sub is stamped on by verified email at that operator's first Cognito login). This is the non-HTTP first-admin path — without it a deployed environment that reaches zero superusers is stranded. An address, not a credential: wired as a plain container environment variable, never through Secrets Manager."
+  type        = string
+  default     = "josh@qontinui.io"
+}
+
 # ─── Web backend service ────────────────────────────────────────────────
 
 variable "web_image_uri" {

@@ -7,6 +7,14 @@ environment     = "staging"
 domain_name     = "qontinui.io"
 route53_zone_id = "Z01234567890ABCDEFGH"
 
+# Bootstrap superuser. qontinui-web's init_db seeds this email as the FIRST
+# superuser at app startup (shell auth.users row with is_superuser=true;
+# cognito_sub is stamped on at that operator's first Cognito login by verified
+# email). There is no HTTP bootstrap route — set this before the first apply or
+# the environment has no way to reach a superuser. An address, not a
+# credential; it is a plain container env var, not a secret.
+first_superuser_email = "josh@qontinui.io"
+
 # Coord image. This value is used ONLY on the initial `terraform apply`
 # that creates the task definition for the first time. Ongoing coord
 # deploys SHA-pin a fresh task-definition revision via

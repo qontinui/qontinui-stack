@@ -271,6 +271,11 @@ module "web" {
   # not-in-TF) Cognito pool for explicit user-driven link/unlink. Grant scoped
   # to ONLY this ARN inside the web module.
   cognito_user_pool_arn = var.cognito_user_pool_arn
+
+  # Bootstrap superuser seeded by web's init_db at startup. This is the
+  # non-HTTP first-admin path — the deployed environment's only way to reach a
+  # superuser once the unauthenticated bootstrap routes are deleted.
+  first_superuser_email = var.first_superuser_email
 }
 
 # ─── Cross-IdP account linking — PreSignUp auto-link Lambda ──────────────

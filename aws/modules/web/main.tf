@@ -95,6 +95,20 @@ variable "cognito_user_pool_arn" {
   description = "ARN of the (manually-managed, NOT-in-Terraform) Cognito user pool the web task administers for cross-IdP account linking. The web task role is granted admin user-management cognito-idp actions scoped to ONLY this pool ARN. Pool us-east-1_rgTB9dbZ1 lives in us-east-1/047719635665 and is referenced by ARN, never imported."
 }
 
+# Email address of the bootstrap superuser. qontinui-web's
+# backend/app/db/init_db.py seeds the FIRST superuser at app startup — but only
+# when FIRST_SUPERUSER_EMAIL is set; unset, the seed is inert and a deployed
+# environment that reaches zero superusers has no way back in. It creates a
+# shell auth.users row with is_superuser=true; on that operator's first Cognito
+# login, app/services/cognito_provision.py stamps cognito_sub onto the row by
+# verified email so they inherit the grant. This is an ADDRESS, not a
+# credential — it authenticates nothing on its own — so it belongs in the
+# container's `environment` list, NOT in `secrets`.
+variable "first_superuser_email" {
+  type        = string
+  description = "Email address of the bootstrap superuser seeded by qontinui-web's init_db at startup. An address, not a credential — wired via plain environment, never Secrets Manager."
+}
+
 # ─── Security group rule: ALB → web on 8000 ─────────────────────────────
 # The shared client_sg only opens port 9870 (coord) from the ALB by default
 # — see modules/network/main.tf "client_from_alb_9870". Web listens on
@@ -351,6 +365,10 @@ resource "aws_ecs_task_definition" "web" {
         # container's lifetime; resets on task replacement. S3 is the future
         # direction; not blocking for two-account Strategy smoke.
         { name = "STORAGE_BACKEND", value = "local" },
+        # Bootstrap superuser seed (app/db/init_db.py, called from
+        # app/main.py startup). Unset, the seed is a no-op. An email ADDRESS,
+        # not a credential — deliberately plain `environment`, not `secrets`.
+        { name = "FIRST_SUPERUSER_EMAIL", value = var.first_superuser_email },
       ]
 
       secrets = [
