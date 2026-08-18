@@ -16,3 +16,6 @@ seeds/
 *.tfstate
 *.tfstate.*
 .terraform/
+
+# Git-Bash crash dumps — never commit
+*.stackdump
