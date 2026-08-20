@@ -1,6 +1,15 @@
 # Local Terraform state and backend lock — should always be remote.
 .terraform/
 .terraform.lock.hcl
+# ...with one carve-out: staging's DEPENDENCY lock is checked in, and it is not
+# a "backend lock" at all — it pins provider versions + checksums. Without it CI
+# re-resolves `~> 5.70` / `~> 3.6` / `~> 2.4` against the registry on every run,
+# so a future provider release can turn qontinui-ci.yml red with no commit to
+# this repo. That workflow is the only thing satisfying coord's candidate CI for
+# qontinui-stack, so a spontaneous red wedges one of COORD_MERGE_SLOTS. It
+# carries linux_amd64 AND windows_amd64 checksums (`terraform providers lock
+# -platform=...`) so `-lockfile=readonly` holds on CI and on the operator box.
+!staging/.terraform.lock.hcl
 *.tfstate
 *.tfstate.*
 *.tfplan

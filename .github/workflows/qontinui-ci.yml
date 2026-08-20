@@ -1,9 +1,86 @@
 name: qontinui CI
+
+# DO NOT NARROW THIS TRIGGER. coord's merge train pushes `merge-candidate/<uuid>`
+# and waits `awaiting-ci` for check-runs on that ref. A `pull_request`-only
+# workflow can never satisfy it: the train times out at COORD_MERGE_CI_TIMEOUT
+# (1800s), requeues forever, and permanently consumes one of COORD_MERGE_SLOTS
+# (default 3) — a standing 33% tax on fleet merge concurrency whose symptom
+# points at innocent repos. This workflow is currently the ONLY thing satisfying
+# candidate CI for qontinui-stack.
 on: [push, pull_request]
+
+# Explicitly read-only. This repo is PUBLIC and its terraform state holds 12
+# plaintext secret values, so nothing here may ever acquire AWS credentials —
+# see the note on the validate job below.
+permissions:
+  contents: read
+
 jobs:
-  noop:
+  terraform:
+    name: terraform fmt + validate
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - name: Placeholder
-        run: echo "qontinui CI placeholder — no framework detected; add real checks here."
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+          terraform_wrapper: false
+
+      # Both checks below are CREDENTIAL-FREE and STATE-FREE by construction:
+      # `fmt` reads source only, and `init -backend=false` deliberately does not
+      # configure the S3 backend, so no state object is fetched and no AWS
+      # principal is needed.
+      #
+      # This is the boundary the whole Phase 3b design rests on. The FULL
+      # `terraform plan` — the one that actually detects drift — is NOT run
+      # here and must never be: a plan refreshes the 12
+      # `aws_secretsmanager_secret_version` resources, and the S3 state object
+      # itself carries their values in plaintext, so `-refresh=false` does not
+      # help either. Any principal that can run it holds the production DSN, the
+      # RDS master password, the coord admin secret, the web service secret, the
+      # Redis auth token and the metrics token. Fork PRs correctly receive no
+      # secrets, so such a job would be dead exactly where review matters most,
+      # and `pull_request_target` is forbidden outright — it would hand
+      # fork-authored code the secret-bearing context.
+      #
+      # The plan runs instead as a scheduled job on a box that ALREADY holds
+      # those credentials, posting only a classification to coord:
+      # `scripts/terraform-plan-drift.py` -> `POST /coord/infra/plan-drift`.
+      # Plan: 2026-08-15-terraform-plan-infra-observer-phase-3b.
+      - name: terraform fmt
+        run: terraform fmt -check -recursive aws/
+
+      # `-lockfile=readonly` makes this job HERMETIC: it installs exactly the
+      # provider versions + checksums in the checked-in
+      # aws/staging/.terraform.lock.hcl and fails rather than silently resolving
+      # something newer. Without it a future hashicorp/aws 5.x release could turn
+      # this workflow red with no commit to the repo — and this workflow is what
+      # satisfies coord's candidate CI, so that red wedges a merge slot.
+      - name: terraform init (no backend, locked)
+        run: terraform -chdir=aws/staging init -backend=false -input=false -lockfile=readonly
+
+      - name: terraform validate
+        run: terraform -chdir=aws/staging validate
+
+  drift-classifier:
+    name: python script unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install pytest
+        run: python -m pip install --quiet pytest
+      # The WHOLE scripts/tests/ directory, not just the drift classifier: the
+      # `noop` placeholder this job replaced meant test_plan_graph.py,
+      # test_resolve_plan_deps.py and test_symbol_claims_by_machine.py had never
+      # been run by CI at all. All of them are credential-free — the drift tests
+      # run the classifier over synthetic `terraform show -json` documents, never
+      # a real plan. One asserts the scrubbing invariant (no before/after value
+      # can reach a posted record), which is worth having on every push.
+      - name: pytest
+        run: python -m pytest scripts/tests/ -q
