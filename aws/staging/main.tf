@@ -357,7 +357,11 @@ module "observability" {
 # than `.value`: `.value` is unconditionally sensitive, which re-classifies the
 # SNS subscription's endpoint and produces a perpetual cosmetic diff even when
 # the address is byte-identical. `insecure_value` is the accessor meant for
-# exactly this case — a String parameter holding non-secret data.
+# exactly this case — a String parameter holding non-secret data. "Non-secret"
+# means "not a credential", not "safe to print": the module input carries
+# `sensitive = true`, so the address is redacted in plan output the same way
+# signup_allowlist's is. Marking it there rather than reaching for `.value`
+# here keeps the redaction and leaves the cosmetic diff closed.
 # Deliberately NOT reusing /qontinui/operator/email, which sits in a credential
 # cluster; binding billing alerts to login material couples two lifecycles.
 provider "aws" {
@@ -389,7 +393,9 @@ data "aws_ssm_parameter" "budget_alert_email" {
 # unconditionally sensitive, which would re-classify the Lambda's environment
 # block and produce a perpetual cosmetic diff. The module input stays
 # `sensitive = true`, so the addresses are still redacted in plan output — which
-# matters in a PUBLIC repo whose CI prints plans.
+# matters in a PUBLIC repo whose CI prints plans. modules/cost-control's
+# alert_email is now marked the same way; it was the odd one out until
+# 2026-08-21.
 # (plan 2026-08-04-stack-terraform-state-reconciliation, P3.)
 data "aws_ssm_parameter" "signup_allowlist" {
   provider = aws.ssm

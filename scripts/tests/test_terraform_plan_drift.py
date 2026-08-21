@@ -28,17 +28,33 @@ tpd = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(tpd)
 
 
-def _rc(address: str, rtype: str, actions: list[str], before=None, after=None, after_unknown=None):
-    return {
-        "address": address,
-        "type": rtype,
-        "change": {
-            "actions": actions,
-            "before": before,
-            "after": after,
-            "after_unknown": after_unknown or {},
-        },
+def _rc(
+    address: str,
+    rtype: str,
+    actions: list[str],
+    before=None,
+    after=None,
+    after_unknown=None,
+    before_sensitive=None,
+    after_sensitive=None,
+):
+    """Build one ``resource_changes[]`` entry.
+
+    ``before_sensitive`` / ``after_sensitive`` are inserted ONLY when supplied,
+    so the fixtures that predate them keep their exact shape. Real terraform
+    always emits both — see :class:`SensitiveAttributeShapeTests`.
+    """
+    change = {
+        "actions": actions,
+        "before": before,
+        "after": after,
+        "after_unknown": after_unknown or {},
     }
+    if before_sensitive is not None:
+        change["before_sensitive"] = before_sensitive
+    if after_sensitive is not None:
+        change["after_sensitive"] = after_sensitive
+    return {"address": address, "type": rtype, "change": change}
 
 
 class ClassifyChangeTests(unittest.TestCase):
@@ -383,6 +399,122 @@ class PayloadTests(unittest.TestCase):
         # distinction being asserted.
         with self.assertRaises(OSError):
             tpd.post_to_coord("http://127.0.0.1:1", "tok", [], 1.0)
+
+
+class SensitiveAttributeShapeTests(unittest.TestCase):
+    """``sensitive = true`` does not change the shape this classifier reads.
+
+    Context: ``variable "alert_email"`` in ``aws/modules/cost-control`` was
+    marked ``sensitive = true`` so the operator's address stops rendering
+    verbatim in plan diffs (``docs/terraform-state-secret-inventory.md``, "What
+    follows from it" 1). The obvious worry is that the marker redacts the JSON
+    this script parses and silently degrades every classification on the
+    resource to "nothing changed".
+
+    It does not, and that is worth pinning rather than assuming. Measured on
+    terraform v1.9.8 against a config with a ``sensitive = true`` variable
+    flowing into a resource attribute, ``terraform show -json`` emits::
+
+        "after":           {"input": {"endpoint": "operator@example.com"}},
+        "before_sensitive": false,
+        "after_sensitive":  {"input": {"endpoint": true}}
+
+    The literal stays in ``before``/``after``; sensitivity is reported in a
+    PARALLEL structure. Only the human-rendered plan prints
+    ``(sensitive value)``. So ``changed_attributes`` — which diffs
+    ``before``/``after`` and reads ``after_unknown`` — is unaffected, and the
+    JSON plan document remains as secret-bearing as it always was, which is the
+    reason this script never runs in CI.
+
+    Note the asymmetric types in that sample: ``before_sensitive`` is the bool
+    ``false`` on a create while ``after_sensitive`` is a dict. Anything that
+    later starts consulting these keys has to handle both.
+    """
+
+    #: The real shape, as emitted for
+    #: `module.cost_control.aws_sns_topic_subscription.budget_email`.
+    def _subscription_update(self):
+        return _rc(
+            "module.cost_control.aws_sns_topic_subscription.budget_email",
+            "aws_sns_topic_subscription",
+            ["update"],
+            before={"endpoint": "old-operator@example.com", "protocol": "email"},
+            after={"endpoint": "new-operator@example.com", "protocol": "email"},
+            before_sensitive={"endpoint": True},
+            after_sensitive={"endpoint": True},
+        )
+
+    def test_a_sensitive_attribute_is_still_detected_as_changed(self):
+        attrs = tpd.changed_attributes(self._subscription_update()["change"])
+        self.assertEqual(attrs, ["endpoint"])
+
+    def test_the_parallel_sensitivity_keys_are_not_read_as_attribute_names(self):
+        # `before_sensitive` / `after_sensitive` are siblings of `before` /
+        # `after` inside `change`, not attributes of the resource. Reading them
+        # as attribute names would post two invented names to coord on every
+        # single resource in the plan.
+        attrs = tpd.changed_attributes(self._subscription_update()["change"])
+        self.assertNotIn("before_sensitive", attrs)
+        self.assertNotIn("after_sensitive", attrs)
+
+    def test_a_bool_valued_before_sensitive_does_not_raise(self):
+        # `"before_sensitive": false` is what terraform emits for a create.
+        attrs = tpd.changed_attributes(
+            _rc(
+                "module.cost_control.aws_sns_topic_subscription.budget_email",
+                "aws_sns_topic_subscription",
+                ["create"],
+                before=None,
+                after={"endpoint": "operator@example.com", "protocol": "email"},
+                before_sensitive=False,
+                after_sensitive={"endpoint": True},
+            )["change"]
+        )
+        self.assertEqual(attrs, ["endpoint", "protocol"])
+
+    def test_the_subscription_classifies_the_same_as_before_the_marker(self):
+        # An email endpoint change is an ordinary in-place change:
+        # `aws_sns_topic_subscription` is in neither SERVING_RESOURCE_TYPES nor
+        # SECURITY_SENSITIVE_CREATE_TYPES, and no (type, attribute) pair for it
+        # is in NEGATING_ATTRIBUTES. The marker must not have moved that.
+        records = tpd.classify_plan({"resource_changes": [self._subscription_update()]})
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["classification"], tpd.IN_PLACE_CHANGE)
+        self.assertEqual(records[0]["attribute"], "endpoint")
+        self.assertTrue(records[0]["terraform_owned"])
+
+    def test_no_address_reaches_the_record_or_the_payload(self):
+        # The scrubbing invariant, restated for PII rather than for a secret:
+        # the JSON is NOT redacted, so the address is right there in the fixture
+        # and must still have nowhere to go.
+        records = tpd.classify_plan({"resource_changes": [self._subscription_update()]})
+        payload = tpd.payload_for(records, 1.0)
+        for blob in (repr(records), repr(payload)):
+            self.assertNotIn("old-operator@example.com", blob)
+            self.assertNotIn("new-operator@example.com", blob)
+
+    def test_a_budget_notification_change_is_not_summarised_away(self):
+        # The address also reaches both `aws_budgets_budget.monthly`
+        # notification blocks. Same conclusion, different resource type.
+        records = tpd.classify_plan(
+            {
+                "resource_changes": [
+                    _rc(
+                        "module.cost_control.aws_budgets_budget.monthly",
+                        "aws_budgets_budget",
+                        ["update"],
+                        before={"notification": [{"subscriber_email_addresses": ["a@example.com"]}]},
+                        after={"notification": [{"subscriber_email_addresses": ["b@example.com"]}]},
+                        before_sensitive={"notification": [{"subscriber_email_addresses": [True]}]},
+                        after_sensitive={"notification": [{"subscriber_email_addresses": [True]}]},
+                    )
+                ]
+            }
+        )
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["classification"], tpd.IN_PLACE_CHANGE)
+        self.assertEqual(records[0]["attribute"], "notification")
+        self.assertNotIn("a@example.com", repr(records))
 
 
 class SeverityParityTests(unittest.TestCase):

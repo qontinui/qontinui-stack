@@ -7,7 +7,28 @@ variable "monthly_limit" {
   type    = string
   default = "100" # USD
 }
-variable "alert_email" { type = string }
+# PII, and this repo is PUBLIC. The address reaches three attributes below:
+# `aws_sns_topic_subscription.budget_email.endpoint` and both
+# `aws_budgets_budget.monthly` notification blocks' `subscriber_email_addresses`.
+# Terraform redacts only what it KNOWS is sensitive, so without this marker the
+# operator's address rendered verbatim in every `terraform plan` diff that
+# touched the subscription — recorded as an open residual in
+# docs/terraform-state-secret-inventory.md, "What follows from it" 1.
+#
+# That stopped being a terminal-only exposure with Phase 3b: a scheduled
+# `scripts/terraform-plan-drift.py` now runs a FULL plan and machine-processes
+# it, and terraform's own stderr is printed verbatim when it exits non-zero.
+# The classification it posts to coord carries attribute NAMES only, so the
+# marker is about the plan rendering, not the payload.
+#
+# Same treatment as `variable "signup_allowlist"` in modules/cross-idp-linking,
+# which is the same class of value and was already marked. The asymmetry between
+# the two is what the inventory flagged.
+variable "alert_email" {
+  type        = string
+  description = "Address AWS Budgets and the SNS topic send the budget alert to. Operator PII, not a credential: staged out-of-band in SSM (/qontinui/ops/budget-alert-email) and supplied by the composition root, never a committed default in this public repo."
+  sensitive   = true
+}
 variable "alert_threshold_percent" {
   type    = number
   default = 80
@@ -104,4 +125,12 @@ resource "aws_budgets_budget" "monthly" {
 
 output "budget_name" { value = aws_budgets_budget.monthly.name }
 output "sns_topic_arn" { value = aws_sns_topic.budget.arn }
-output "alert_email" { value = var.alert_email }
+# `sensitive = true` is REQUIRED, not decorative: a root module re-exporting an
+# unmarked child output that carries a sensitive value is a plan-time error
+# ("Output refers to sensitive values"). Nothing consumes this output today, so
+# marking it keeps the module's own plan honest AND keeps that guard armed for
+# whoever wires it up next.
+output "alert_email" {
+  value     = var.alert_email
+  sensitive = true
+}

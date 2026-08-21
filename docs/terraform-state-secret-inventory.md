@@ -144,15 +144,26 @@ every consumer that interpolates the generator's `.result`.
    `qontinui-stack` is public. A plan refreshes all 12, and the S3 state object
    already contains them, so `-refresh=false` does not help. Terraform redacts
    attributes it knows are `sensitive`, which is a mitigation and not a
-   guarantee — and the unmarked-attribute case is **not hypothetical here**:
-   `aws_sns_topic_subscription.budget_email` (`aws/modules/cost-control/main.tf`)
+   guarantee — and the unmarked-attribute case was **not hypothetical here**:
+   ~~`aws_sns_topic_subscription.budget_email` (`aws/modules/cost-control/main.tf`)
    has `endpoint = var.alert_email`, and `variable "alert_email"` is declared
    without `sensitive = true`, so the operator's address renders unredacted in
    any plan diff touching it. (The asymmetry looks deliberate —
    `variable "signup_allowlist"` in `aws/modules/cross-idp-linking` *is* marked
    sensitive and does get redacted — but it is a present PII residual, not a
-   future risk.) `pull_request_target` is forbidden outright: it would hand
-   fork-authored code the secret-bearing context.
+   future risk.)~~
+   **RESOLVED 2026-08-21.** `variable "alert_email"` and the module's
+   `output "alert_email"` now both carry `sensitive = true`, so the address
+   renders as `(sensitive value)` in every plan diff that touches the
+   subscription or either `aws_budgets_budget.monthly` notification block, and
+   the asymmetry with `signup_allowlist` is closed. Struck through rather than
+   deleted, because the finding is the evidence for the sentence above it: the
+   redaction is only ever as good as somebody having marked the attribute, so
+   this is a class that recurs the next time a value is added without the
+   marker, not a defect that was retired. It changes nothing about the
+   conclusion — the 12 generated values in the table are what keep the plan out
+   of CI, and none of them moved. `pull_request_target` is forbidden outright:
+   it would hand fork-authored code the secret-bearing context.
 2. **`.github/workflows/qontinui-ci.yml` is credential-free and stays that
    way.** It runs `terraform fmt -check -recursive` and
    `terraform init -backend=false` + `validate` — source-only checks that need
