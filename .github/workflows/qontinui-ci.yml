@@ -64,6 +64,26 @@ jobs:
       - name: terraform validate
         run: terraform -chdir=aws/staging validate
 
+      # Same credential-free, state-free class as the two checks above: it reads
+      # `aws/**/*.tf` and nothing else. It lives in THIS job rather than with the
+      # python tests because it is a terraform source check and its failure is
+      # addressed by editing a `.tf` file.
+      #
+      # It exists because `validate` cannot see the thing it checks. Terraform
+      # redacts a plan diff only for attributes somebody marked `sensitive`, and
+      # PR #70 found the operator's personal address rendering verbatim in every
+      # plan diff of this PUBLIC repo because one `variable` block was missing
+      # the marker — through `fmt`, `validate` and a green test suite. The note
+      # that fix left in docs/terraform-state-secret-inventory.md says the class
+      # "recurs the next time a value is added without the marker". This is what
+      # catches the next one.
+      #
+      # Stdlib only, deliberately: `python3` is preinstalled on ubuntu-latest, so
+      # this needs no `setup-python` and no `pip install`. Keep it that way — a
+      # dependency here is a supply-chain edge on a credential-free job.
+      - name: terraform sensitivity lint
+        run: python3 scripts/terraform-sensitive-lint.py aws
+
   drift-classifier:
     name: python script unit tests
     runs-on: ubuntu-latest

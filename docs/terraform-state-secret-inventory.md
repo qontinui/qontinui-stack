@@ -1,8 +1,12 @@
 # What is in terraform state, and why it cannot leave
 
-**Status: current as of 2026-08-20.** Produced as P1 of plan
+**Status: current as of 2026-08-24.** Produced as P1 of plan
 `2026-08-15-terraform-plan-infra-observer-phase-3b`, which needed a decision on
-whether the full-`terraform plan` drift observer could safely run in CI.
+whether the full-`terraform plan` drift observer could safely run in CI. The
+evidence sections and the disposition table are unchanged since 2026-08-20 and
+were re-checked against `origin/main` on 2026-08-24; what has moved is "What
+follows from it" 1, twice — the unmarked-attribute residual was fixed (#70) and
+then given a CI guard.
 
 **Answer: it cannot, and the reason is durable.** Every one of the 12
 `aws_secretsmanager_secret_version` values in `aws/` is generated *by terraform*
@@ -164,10 +168,39 @@ every consumer that interpolates the generator's `.result`.
    conclusion — the 12 generated values in the table are what keep the plan out
    of CI, and none of them moved. `pull_request_target` is forbidden outright:
    it would hand fork-authored code the secret-bearing context.
+
+   **GUARDED 2026-08-24.** The recurrence named above now has a check:
+   `scripts/terraform-sensitive-lint.py`, run by the `terraform` CI job. It is
+   source-only and credential-free — it reads `aws/**/*.tf` and nothing else —
+   because nothing that could catch this was allowed to exist here before: `fmt`
+   is whitespace, `validate` does not model sensitivity, and the drift
+   classifier's tests never look at `aws/`. All three were green while the
+   address was rendering. The three rules are *flow* invariants, not guesses at
+   whether a name looks secret (a name heuristic fires on `domain_name` and
+   misses `signup_allowlist`):
+
+   | Rule | Fires when |
+   |---|---|
+   | `insecure-value-needs-sensitive-sink` | a `module` argument reads `.insecure_value` — the accessor that deliberately drops the marker, see §4's note on why it is used — and the child `variable` is not `sensitive` |
+   | `sensitive-input-needs-sensitive-source` | a bare `var.x` feeds a `sensitive` child input while `variable "x"` in the caller is unmarked (sensitivity flows forward from an origin; it does not travel back from a sink) |
+   | `sensitive-var-needs-sensitive-output` | an `output` re-exports a `sensitive` variable of the same module unmarked — terraform errors on this for a **root** output only, which is exactly why the `output "alert_email"` half of the fix needed a lint |
+
+   The first rule reproduces the finding above: run against `b37f460^` it
+   reports `aws/staging/main.tf:327` and exits 1. That is asserted, not
+   described — `scripts/tests/test_terraform_sensitive_lint.py`
+   (`PullRequest70Tests`) reconstructs the pre-fix shape, the intermediate state
+   where only the variable got marked, and the shape as merged, and
+   `RealTreeTests` runs the checker over this repo's actual `aws/`.
+
+   This shrinks the class; it does not retire it. The rules see values that
+   reach a module boundary. A value interpolated straight into a resource
+   attribute inside one module, never crossing a boundary and never named by a
+   variable, has no antecedent for any of them to fire on.
 2. **`.github/workflows/qontinui-ci.yml` is credential-free and stays that
-   way.** It runs `terraform fmt -check -recursive` and
-   `terraform init -backend=false` + `validate` — source-only checks that need
-   no AWS principal and fetch no state — plus the drift classifier's unit tests.
+   way.** It runs `terraform fmt -check -recursive`,
+   `terraform init -backend=false` + `validate`, and the sensitivity lint above
+   — source-only checks that need no AWS principal and fetch no state — plus the
+   drift classifier's unit tests.
 3. **The drift observer runs out of CI.** `scripts/terraform-plan-drift.py`
    runs on a box that already holds these credentials and POSTs only a
    classification to coord's `POST /coord/infra/plan-drift`. It introduces no
