@@ -29,6 +29,67 @@
 # <host> is the PC's LAN IP (typically 192.168.x.x), exposed to MSI laptop
 # and the third machine over LAN. Topology plan §9 Phase 2 covers exposure.
 
+# ═══════════════════════════════════════════════════════════════════════════
+# `pids_limit: 4096` on every service — why, and why that number.
+#
+# 2026-08-27 incident: no process in the Docker VM could fork(). Every
+# `docker exec` returned EAGAIN, no container could start, and all 16
+# containers rendered `(unhealthy)`. Cause: `qontinui-canonical-coord` alone
+# held **190,840** PIDs — 99.3% of the VM's `/proc/sys/kernel/threads-max`
+# (192,146) — while every other container sat at <= 68. `docker inspect`
+# showed `PidsLimit=<nil>` on all of them: nothing bounded any cgroup, so one
+# container's leak consumed the whole shared kernel task table and took its
+# twelve blameless neighbours down with it.
+#
+# coord PR #1671 fixed the LEAK: the image now runs under
+# `ENTRYPOINT ["/usr/bin/tini","-s","--",…]` so the orphans of coord's ~148
+# `git` invocations get reaped instead of accumulating as zombies. That is
+# the right fix and it is not duplicated here.
+#
+# This is the other half. **A reaper prevents THAT leak; a pids_limit
+# contains ANY future one.** Without a cgroup bound the blast radius of the
+# next unbounded-task bug — in any service, from any image we do not write —
+# is still "the entire VM".
+#
+# Why 4096, argued rather than picked:
+#
+#   * ~60x steady state. Measured again 2026-08-29 via `docker stats`: the
+#     busiest container in this stack was 68 PIDs (sccache); postgres 18,
+#     nats 17-19, jaeger 18, bazel-remote 34, minio 30, redis 6. The same
+#     <= 68 held for every container during the incident. The healthy
+#     working set is two orders of magnitude below this cap.
+#   * ~8x coord's worst legitimate burst. coord fans out to ~148 concurrent
+#     `git` invocations in a merge-train window; at 1-3 tasks apiece that is
+#     ~450, plus its own tokio runtime on this 32-core VM (~40-70 threads)
+#     — call it ~520 tasks. 4096 does not throttle that, which is the point:
+#     a bound that clips legitimate work would be traded away the first time
+#     it fired.
+#   * 2.1% of `threads-max` (4096 / 192,146). One container can no longer
+#     reach even a fiftieth of the kernel task table.
+#   * The AGGREGATE is the invariant that actually matters, and it only
+#     holds if the bound is universal: 13 services x 4096 = 53,248 = **27.7%**
+#     of `threads-max`. Even a simultaneous stack-wide worst case leaves the
+#     VM able to fork — which is exactly what 2026-08-27 took away.
+#
+# Applied to every service, not just coord. Bounding only the container that
+# leaked last time protects against a repeat, not against the class, and the
+# aggregate ceiling above is the whole containment argument. The number is
+# defensible per-service because the <= 68 measurement covers all of them;
+# the one service with a larger DECLARED legitimate ceiling is postgres
+# (`max_connections=200` -> ~215 backends plus background workers), and 4096
+# is still ~19x that.
+#
+# **A starting point to calibrate, not a constant to defend.** Plan
+# 2026-08-27-fleet-telemetry-has-no-saturation-dimension-but-memory Phase 1
+# adds `pids_used` / `pids_max` to the sample schema precisely so this number
+# stops being an estimate — and this setting is what makes `pids_max`
+# non-NULL on the `container` lane at all. Without it that lane reports NULL
+# forever and Phase 2's saturation ratio renders `unknown`: correct, but
+# blind, which is that plan's own complaint.
+#
+# Takes effect at the next container CREATE (`docker compose up -d` will
+# recreate; a running container is not retroactively bounded).
+# ═══════════════════════════════════════════════════════════════════════════
 services:
   # ───────────────────────────────────────────────────────────────────────
   # PostgreSQL 16 + pgvector — canonical durable state.
@@ -37,6 +98,10 @@ services:
     image: pgvector/pgvector:pg16
     container_name: qontinui-canonical-postgres
     restart: unless-stopped
+    # PID containment — see the block above `services:` for the argument.
+    # `max_connections=200` below is the largest declared legitimate demand
+    # in this stack (~215 tasks with background workers); 4096 is ~19x it.
+    pids_limit: 4096
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-qontinui_user}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-qontinui_dev_password}
@@ -75,6 +140,8 @@ services:
     image: redis:7-alpine
     container_name: qontinui-canonical-redis
     restart: unless-stopped
+    # PID containment — see the block above `services:`. Measured 6 PIDs.
+    pids_limit: 4096
     ports:
       - "${REDIS_PORT:-6380}:6379"
     volumes:
@@ -109,6 +176,8 @@ services:
     image: minio/minio:latest
     container_name: qontinui-canonical-minio
     restart: unless-stopped
+    # PID containment — see the block above `services:`. Measured 30 PIDs.
+    pids_limit: 4096
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
@@ -147,6 +216,9 @@ services:
   minio-init:
     image: minio/mc:latest
     container_name: qontinui-canonical-minio-init
+    # PID containment — see the block above `services:`. One-shot `mc` shell;
+    # bounded anyway so the aggregate ceiling covers every service, not most.
+    pids_limit: 4096
     depends_on:
       minio:
         condition: service_healthy
@@ -183,6 +255,8 @@ services:
       dockerfile: qontinui-stack/migrator/Dockerfile
     image: qontinui-canonical-migrator:latest
     container_name: qontinui-canonical-migrator
+    # PID containment — see the block above `services:`. One-shot alembic.
+    pids_limit: 4096
     depends_on:
       postgres:
         condition: service_healthy
@@ -222,6 +296,8 @@ services:
     image: qontinui-canonical-migrator:latest
     container_name: qontinui-canonical-alembic-status
     restart: unless-stopped
+    # PID containment — see the block above `services:`. Measured 38 PIDs.
+    pids_limit: 4096
     depends_on:
       postgres:
         condition: service_healthy
@@ -265,6 +341,9 @@ services:
     image: qontinui-canonical-sccache:latest
     container_name: qontinui-canonical-sccache
     restart: unless-stopped
+    # PID containment — see the block above `services:`. Measured 68 PIDs,
+    # the highest steady-state reading in the stack; 4096 is ~60x it.
+    pids_limit: 4096
     depends_on:
       minio:
         condition: service_healthy
@@ -333,6 +412,8 @@ services:
     image: muxinc/bazel-remote:latest
     container_name: qontinui-canonical-bazel-remote
     restart: unless-stopped
+    # PID containment — see the block above `services:`. Measured 34 PIDs.
+    pids_limit: 4096
     depends_on:
       minio:
         condition: service_healthy
@@ -388,6 +469,8 @@ services:
     image: nats:2.10-alpine
     container_name: qontinui-canonical-nats-1
     restart: unless-stopped
+    # PID containment — see the block above `services:`. Measured 19 PIDs.
+    pids_limit: 4096
     command:
       - "--config=/etc/nats/nats-1.conf"
     environment:
@@ -411,6 +494,8 @@ services:
     image: nats:2.10-alpine
     container_name: qontinui-canonical-nats-2
     restart: unless-stopped
+    # PID containment — see the block above `services:`. Measured 18 PIDs.
+    pids_limit: 4096
     command:
       - "--config=/etc/nats/nats-2.conf"
     environment:
@@ -431,6 +516,8 @@ services:
     image: nats:2.10-alpine
     container_name: qontinui-canonical-nats-3
     restart: unless-stopped
+    # PID containment — see the block above `services:`. Measured 17 PIDs.
+    pids_limit: 4096
     command:
       - "--config=/etc/nats/nats-3.conf"
     environment:
@@ -472,6 +559,8 @@ services:
     image: jaegertracing/all-in-one:1.62.0
     container_name: qontinui-canonical-jaeger
     restart: unless-stopped
+    # PID containment — see the block above `services:`. Measured 18 PIDs.
+    pids_limit: 4096
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
       # Cap the in-memory store so a runaway trace volume can't OOM the box.
@@ -513,6 +602,27 @@ services:
     image: qontinui-canonical-coord:latest
     container_name: qontinui-canonical-coord
     restart: unless-stopped
+    # PID containment — the service this bound exists for. See the full
+    # argument in the block above `services:`.
+    #
+    # This is the container that reached 190,840 PIDs on 2026-08-27 and took
+    # the VM's fork() with it. coord#1671's tini entrypoint stops THAT leak
+    # (orphaned `git` grandchildren) at the image level, correctly, for both
+    # compose and ECS. This bounds the cgroup so the NEXT one — in coord or
+    # in any image here we do not author — cannot leave the container.
+    #
+    # Sized not to clip coord's own work: ~148 concurrent `git` invocations
+    # in a merge-train window, ~1-3 tasks each, plus its tokio runtime, is
+    # ~520 tasks worst case. 4096 leaves ~8x headroom over that and is still
+    # only 2.1% of the VM's 192,146 `threads-max`.
+    #
+    # ECS is deliberately NOT the twin of this line: `pidsLimit` is not
+    # supported on Fargate, and it does not need to be — each Fargate task
+    # gets its own microVM, so a coord PID leak there cannot starve a
+    # sibling. The shared-kernel blast radius is a compose-stack property.
+    # Verify with `docker inspect qontinui-canonical-coord --format
+    # '{{.HostConfig.PidsLimit}}'` after the next recreate.
+    pids_limit: 4096
     # `migrator: service_completed_successfully` makes a migrator
     # failure (multi-head divergence, broken DDL, transient PG hiccup)
     # block coord startup loudly, instead of letting coord come up
