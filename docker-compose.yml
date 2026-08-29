@@ -90,6 +90,34 @@
 # Takes effect at the next container CREATE (`docker compose up -d` will
 # recreate; a running container is not retroactively bounded).
 # ═══════════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BUILD SECRETS
+#
+# `dn_token` — a GitHub PAT with Contents:Read on the PRIVATE
+# qontinui/qontinui-dev-notes repo. `qontinui-coord/Dockerfile` clones that
+# repo at build time to bake in the strategy substrate, and declares the
+# mount `required=true`, so a coord build without it cannot succeed.
+#
+# The credential stays OPERATOR-HELD. This file wires the plumbing only:
+#   * default path `./secrets/dn_token`, which `.gitignore` excludes;
+#   * `DN_TOKEN_FILE` points at a file the operator already keeps elsewhere.
+# Stage it once, e.g.:
+#   aws secretsmanager get-secret-value \
+#     --secret-id qontinui/staging/dev_notes_token \
+#     --region us-east-1 --query SecretString --output text > ./secrets/dn_token
+#
+# Compose resolves a build secret only for the service being built, so an
+# absent file does NOT affect any other service: `docker compose config` and
+# `docker compose up postgres redis minio` all still succeed (measured with
+# Compose/Docker 29.4.0, 2026-08-29). Only `build coord` fails, and it fails
+# naming the resolved path it could not stat rather than the opaque
+# `secret dn_token: not found`.
+# ═══════════════════════════════════════════════════════════════════════════
+secrets:
+  dn_token:
+    file: ${DN_TOKEN_FILE:-./secrets/dn_token}
+
 services:
   # ───────────────────────────────────────────────────────────────────────
   # PostgreSQL 16 + pgvector — canonical durable state.
@@ -595,6 +623,16 @@ services:
     build:
       context: ../qontinui-coord
       dockerfile: Dockerfile
+      # The coord image clones the PRIVATE qontinui-dev-notes repo at build
+      # time (Dockerfile RUN --mount=type=secret,id=dn_token,required=true),
+      # so the build needs a GitHub PAT. Without this stanza every
+      # `docker compose build coord` fails 100% of the time with
+      # `failed to solve: secret dn_token: not found` — which is what made
+      # the /verify-web on-ramp structurally inoperable for everyone. The
+      # token itself is operator-held and never committed: see the top-level
+      # `secrets:` block above `services:`.
+      secrets:
+        - dn_token
     # Cutover 2026-05-16: unpinned from :pre-phase5-pinned to :latest after
     # canonical-PG upgrade (wave_7_01_merge_heads single head) completed via
     # Session B's reconcile-then-stamp program. :pre-phase5-pinned image preserved

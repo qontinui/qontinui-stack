@@ -19,3 +19,9 @@ seeds/
 
 # Git-Bash crash dumps — never commit
 *.stackdump
+
+# Build secrets staged for `docker compose build coord` — the coord image
+# clones the private qontinui-dev-notes repo and needs a GitHub PAT at
+# /run/secrets/dn_token. Operator-held, never committed. Override the path
+# with DN_TOKEN_FILE to keep the token outside the repo entirely.
+secrets/
