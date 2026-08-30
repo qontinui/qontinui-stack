@@ -595,6 +595,8 @@ services:
     build:
       context: ../qontinui-coord
       dockerfile: Dockerfile
+      secrets:
+        - dn_token
     # Cutover 2026-05-16: unpinned from :pre-phase5-pinned to :latest after
     # canonical-PG upgrade (wave_7_01_merge_heads single head) completed via
     # Session B's reconcile-then-stamp program. :pre-phase5-pinned image preserved
@@ -763,6 +765,17 @@ volumes:
     name: qontinui_canonical_nats_2_data
   canonical_nats_3_data:
     name: qontinui_canonical_nats_3_data
+
+# ───────────────────────────────────────────────────────────────────────────
+# Secrets — file-backed, consumed only at build time via
+# `--mount=type=secret` in qontinui-coord/Dockerfile (dn_token: a GitHub PAT
+# for the mirrors bootstrap). Never baked into an image layer or exposed as
+# an env var at runtime. Default path resolves under this compose file's
+# directory; override with DN_TOKEN_FILE if the operator keeps it elsewhere.
+# ───────────────────────────────────────────────────────────────────────────
+secrets:
+  dn_token:
+    file: ${DN_TOKEN_FILE:-./secrets/dn_token}
 
 # Default network (`qontinui-stack_default`) is created automatically and
 # isolates this stack from the legacy qontinui-web stack. Connections from

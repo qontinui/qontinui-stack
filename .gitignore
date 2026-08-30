@@ -19,3 +19,7 @@ seeds/
 
 # Git-Bash crash dumps — never commit
 *.stackdump
+
+# Operator secret files consumed by docker-compose.yml's `secrets:` block
+# (e.g. dn_token, a GitHub PAT). Never commit.
+secrets/
