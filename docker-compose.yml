@@ -768,10 +768,22 @@ volumes:
 
 # ───────────────────────────────────────────────────────────────────────────
 # Secrets — file-backed, consumed only at build time via
-# `--mount=type=secret` in qontinui-coord/Dockerfile (dn_token: a GitHub PAT
-# for the mirrors bootstrap). Never baked into an image layer or exposed as
-# an env var at runtime. Default path resolves under this compose file's
-# directory; override with DN_TOKEN_FILE if the operator keeps it elsewhere.
+# `--mount=type=secret` in qontinui-coord/Dockerfile. Never baked into an image
+# layer or exposed as an env var at runtime. Default path resolves under this
+# compose file's directory; override with DN_TOKEN_FILE if the operator keeps it
+# elsewhere.
+#
+# `dn_token` — a GitHub PAT with Contents:Read on the PRIVATE
+# qontinui/qontinui-dev-notes repo. Its ONE use (qontinui-coord/Dockerfile:141)
+# is to clone that repo into /srv/dev-notes as coord's STRATEGY SUBSTRATE
+# (STRATEGY_SUBSTRATE_PATH). It has nothing to do with the merge-train git
+# mirrors — those live in the `canonical_coord_mirrors` volume declared above
+# and need no build secret.
+#
+# An ABSENT file has no blast radius: compose resolves a build secret only for
+# the service actually being built, so `docker compose config` and `up` of any
+# other service still succeed. Only `build coord` fails, naming the path it
+# could not stat (measured, Docker/Compose 29.4.0, 2026-08-30).
 # ───────────────────────────────────────────────────────────────────────────
 secrets:
   dn_token:
