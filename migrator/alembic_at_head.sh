@@ -12,14 +12,34 @@
 # The script reuses the migrator image's existing alembic install +
 # embedded `alembic/versions/` chain. `alembic current` prints the
 # DB's stamped revision; `alembic heads` prints the chain head(s).
-# The script fails (non-zero exit, with a one-line diagnostic on
-# stderr that docker captures into the healthcheck log) on any of:
+# The script fails (non-zero exit, with a diagnostic on stderr that
+# docker captures into the healthcheck log) on any of:
 #
-#   - alembic current is empty (DB never stamped).
-#   - alembic heads count != 1 (multi-head divergence — the same
-#     condition that broke the migrator on 2026-05-07).
-#   - alembic current != chain head (DB is at an old revision; the
-#     migrator must run, or did run and silently failed).
+#   - UNDETERMINED: `alembic current` failed, so nothing at all is known
+#     about the DB's stamp. Two shapes:
+#       * the DB is stamped at a revision this image's chain does not
+#         contain (alembic says "Can't locate revision identified by
+#         '<rev>'") — reported as a distinct, named diagnostic, because
+#         the usual cause is a stale image rather than a broken DB;
+#       * anything else — reported generically, quoting alembic's own
+#         message and its exit status.
+#   - UNDETERMINED: `alembic heads` failed, so the chain head is unknown.
+#     `heads` reads only the filesystem, so this means a broken chain
+#     (missing down_revision, import error), never a DB condition.
+#   - UNHEALTHY: alembic current is empty (DB never stamped). This may
+#     ONLY be claimed when `alembic current` SUCCEEDED and printed no
+#     revision token — an empty result from a FAILED command is UNKNOWN,
+#     not evidence that the DB is unstamped.
+#   - UNHEALTHY: alembic heads count != 1 (multi-head divergence — the
+#     same condition that broke the migrator on 2026-05-07).
+#   - UNHEALTHY: alembic current != chain head (DB is at an old
+#     revision; the migrator must run, or did run and silently failed).
+#   - FATAL: DATABASE_URL is not set (exit 2).
+#
+# Docker's healthcheck has three states (starting/healthy/unhealthy) and
+# there is nowhere to map UNDETERMINED except non-zero — we cannot
+# assert health. So UNDETERMINED still exits 1; what it must not do is
+# assert a cause that was never established.
 #
 # Idempotent on the happy path (no DB writes; just two `alembic` CLI
 # invocations that read filesystem + alembic_version table).
@@ -29,6 +49,9 @@
 # multi-step logic with diagnostic output. A standalone script is
 # also easier to test manually (`docker exec
 # qontinui-canonical-alembic-status /alembic_at_head.sh`).
+#
+# Regression test: scripts/tests/test_alembic_at_head.py, run by CI's
+# `python -m pytest scripts/tests/ -q` job.
 
 set -eu
 
@@ -37,29 +60,105 @@ if [ -z "${DATABASE_URL:-}" ]; then
   exit 2
 fi
 
-cd /app
+# The alembic project root inside the image. Overridable ONLY so the
+# regression test can run this exact script outside the container; in
+# the image nothing sets it and the default is used.
+cd "${ALEMBIC_STATUS_APP_DIR:-/app}"
 
-# alembic current — first non-INFO line is the rev (or empty if DB
-# isn't stamped). The output format on a stamped DB is e.g.:
-#   INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
-#   INFO  [alembic.runtime.migration] Will assume transactional DDL.
+# Scratch dir for alembic's two streams. Each invocation's stdout and
+# stderr are captured to files rather than discarded, so a failure's own
+# message can be quoted back in the diagnostic.
+work="$(mktemp -d 2>/dev/null || true)"
+if [ -z "$work" ] || [ ! -d "$work" ]; then
+  work="${TMPDIR:-/tmp}/alembic-status.$$"
+  mkdir -p "$work"
+fi
+trap 'rm -rf "$work"' EXIT
+
+# Echo alembic's own words back, minus the INFO preamble, indented under
+# the headline. Bounded so a traceback cannot flood the healthcheck log.
+emit_alembic_diagnostics() {
+  cat "$1" "$2" \
+    | sed -e 's/^FAILED: //' -e 's/^ERROR  *\[[^]]*\] //' \
+    | grep -v '^INFO ' \
+    | grep -v '^[[:space:]]*$' \
+    | awk '!seen[$0]++' \
+    | head -n 5 \
+    | sed 's/^/  alembic: /' >&2
+}
+
+cur_out="$work/current.out"
+cur_err="$work/current.err"
+
+# Run alembic on its own so its OWN exit status is observable. In a
+# pipeline `sh` reports only the LAST command's status, so the previous
+# `alembic current | awk` shape reported awk's 0 and erased alembic's
+# 255. Nothing is filtered until the status has been captured.
+cur_status=0
+alembic current >"$cur_out" 2>"$cur_err" || cur_status=$?
+
+if [ "$cur_status" -ne 0 ]; then
+  # `alembic current` failed. Nothing is known about alembic_version's
+  # contents — in particular this is NEVER evidence that the DB is
+  # unstamped, so it must not fall through to the "empty" branch below.
+  #
+  # One failure has a specific, actionable cause worth naming: the DB is
+  # stamped at a revision that is not in this image's embedded chain,
+  # which normally means the image predates the revision.
+  stale_rev="$(cat "$cur_out" "$cur_err" \
+    | sed -n "s/.*Can't locate revision identified by '\([^']*\)'.*/\1/p" \
+    | head -n 1)"
+  # Defensive: only trust something that actually looks like a revision
+  # id; otherwise fall back to the generic branch rather than printing
+  # an empty or garbled id.
+  case "$stale_rev" in
+    '' | *[!A-Za-z0-9_.-]*) stale_rev='' ;;
+  esac
+
+  if [ -n "$stale_rev" ]; then
+    printf "[alembic-status] UNDETERMINED: DB is stamped at '%s', which this image's chain does not contain (image may be stale)\n" \
+      "$stale_rev" >&2
+    printf '  alembic current exit: %s\n' "$cur_status" >&2
+  else
+    printf '[alembic-status] UNDETERMINED: `alembic current` failed (exit %s); DB state unknown.\n' \
+      "$cur_status" >&2
+  fi
+  emit_alembic_diagnostics "$cur_out" "$cur_err"
+  exit 1
+fi
+
+# alembic current succeeded — first lowercase-anchored line is the rev.
+# The output format on a stamped DB is e.g.:
 #   a6f606408ecb (head)
-# We want the trailing rev token, head marker stripped.
-cur="$(alembic current 2>/dev/null \
-  | awk '/^[a-z0-9_]+/{print $1; exit}' \
-  || true)"
+# The lowercase anchor is safe HERE (and only here) because the status
+# check above already ruled out the error output: `FAILED:` is written
+# to stdout, and would otherwise slip past this filter unseen.
+cur="$(awk '/^[a-z0-9_]+/{print $1; exit}' <"$cur_out" || true)"
 
 if [ -z "$cur" ]; then
   echo "[alembic-status] UNHEALTHY: alembic_version is empty (DB never stamped)" >&2
   exit 1
 fi
 
-# alembic heads — count how many head lines appear. >1 means multi-head
-# divergence. The chain head is the single head's rev id (first column
-# of the matching line).
-heads_lines="$(alembic heads 2>/dev/null \
-  | awk '/^[a-z0-9_]+/{print $1}' \
-  || true)"
+heads_out="$work/heads.out"
+heads_err="$work/heads.err"
+
+# Same treatment for heads. It reads only the embedded chain, so it
+# cannot fail from DB state — but a broken chain can still fail it, and
+# that must not silently become "0 heads".
+heads_status=0
+alembic heads >"$heads_out" 2>"$heads_err" || heads_status=$?
+
+if [ "$heads_status" -ne 0 ]; then
+  printf '[alembic-status] UNDETERMINED: `alembic heads` failed (exit %s); chain head unknown.\n' \
+    "$heads_status" >&2
+  emit_alembic_diagnostics "$heads_out" "$heads_err"
+  exit 1
+fi
+
+# Count how many head lines appear. >1 means multi-head divergence. The
+# chain head is the single head's rev id (first column of the line).
+heads_lines="$(awk '/^[a-z0-9_]+/{print $1}' <"$heads_out" || true)"
 
 heads_count=0
 if [ -n "$heads_lines" ]; then
