@@ -34,7 +34,9 @@
 #     same condition that broke the migrator on 2026-05-07).
 #   - UNHEALTHY: alembic current != chain head (DB is at an old
 #     revision; the migrator must run, or did run and silently failed).
-#   - FATAL: DATABASE_URL is not set (exit 2).
+#   - FATAL: DATABASE_URL is not set, or the alembic project root cannot
+#     be entered (exit 2). Both are "this script cannot run at all",
+#     distinct from any verdict about the DB.
 #
 # Docker's healthcheck has three states (starting/healthy/unhealthy) and
 # there is nowhere to map UNDETERMINED except non-zero — we cannot
@@ -63,7 +65,15 @@ fi
 # The alembic project root inside the image. Overridable ONLY so the
 # regression test can run this exact script outside the container; in
 # the image nothing sets it and the default is used.
-cd "${ALEMBIC_STATUS_APP_DIR:-/app}"
+#
+# `if ! cd` rather than a bare `cd`: under `set -e` a failed `cd` exits 1
+# carrying only sh's own message — an unlabelled unhealthy verdict from
+# the one script whose entire purpose is to name what it established.
+app_dir="${ALEMBIC_STATUS_APP_DIR:-/app}"
+if ! cd "$app_dir"; then
+  echo "[alembic-status] FATAL: cannot enter alembic project root '${app_dir}'" >&2
+  exit 2
+fi
 
 # Scratch dir for alembic's two streams. Each invocation's stdout and
 # stderr are captured to files rather than discarded, so a failure's own

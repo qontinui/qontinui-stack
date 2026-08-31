@@ -271,9 +271,14 @@ services:
   # container stays alive for healthchecks. Its docker healthcheck
   # (/alembic_at_head.sh) compares `alembic current` (DB-stamped rev)
   # to `alembic heads` (chain head from the embedded alembic/versions/).
-  # The check fails on: empty alembic_version, multi-head divergence
-  # (the 2026-05-07 failure mode), or current != head (post-migration
-  # silent-failure fallout).
+  # The check reports UNHEALTHY on: empty alembic_version, multi-head
+  # divergence (the 2026-05-07 failure mode), or current != head
+  # (post-migration silent-failure fallout) — and UNDETERMINED when an
+  # `alembic` invocation itself FAILED, so nothing about the DB was
+  # established. Docker has no third state, so UNDETERMINED is also a
+  # non-zero exit: an unhealthy sidecar does NOT on its own mean one of
+  # the three conditions above holds — read the message, which names
+  # which branch fired. The script header is the authoritative list.
   #
   # Why a sidecar instead of augmenting postgres's healthcheck:
   #   - postgres is the postgres image; it doesn't have alembic or the

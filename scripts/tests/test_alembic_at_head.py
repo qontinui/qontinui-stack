@@ -180,7 +180,7 @@ class _Result:
 # produces the same run. Several tests assert different properties of the same
 # run; memoising keeps this file at one subprocess per distinct scenario rather
 # than one per assertion.
-_RUN_CACHE: dict[tuple[str, str | None], "_Result"] = {}
+_RUN_CACHE: dict[tuple[str, str | None, str | None], "_Result"] = {}
 
 
 @unittest.skipIf(_SH is None, "no POSIX sh on PATH")
@@ -191,13 +191,16 @@ class _ScriptCase(unittest.TestCase):
         self,
         shim: str,
         database_url: str | None = "postgresql://u:p@db:5432/qontinui_db",
+        app_dir: str | None = None,
     ) -> _Result:
-        key = (shim, database_url)
+        key = (shim, database_url, app_dir)
         if key not in _RUN_CACHE:
-            _RUN_CACHE[key] = self._run_script_uncached(shim, database_url)
+            _RUN_CACHE[key] = self._run_script_uncached(shim, database_url, app_dir)
         return _RUN_CACHE[key]
 
-    def _run_script_uncached(self, shim: str, database_url: str | None) -> _Result:
+    def _run_script_uncached(
+        self, shim: str, database_url: str | None, app_dir: str | None = None
+    ) -> _Result:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
@@ -214,7 +217,7 @@ class _ScriptCase(unittest.TestCase):
         env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
         # The image's alembic project root. Overridden so the shipped script
         # can run verbatim outside the container, where /app does not exist.
-        env["ALEMBIC_STATUS_APP_DIR"] = str(appdir)
+        env["ALEMBIC_STATUS_APP_DIR"] = str(appdir) if app_dir is None else app_dir
         if database_url is None:
             env.pop("DATABASE_URL", None)
         else:
@@ -358,6 +361,23 @@ class FatalTests(_ScriptCase):
         res = self.run_script(_SHIM_AT_HEAD, database_url=None)
         self.assertEqual(res.returncode, 2, res.output)
         self.assertIn("FATAL: DATABASE_URL is not set", res.output)
+
+    def test_unenterable_app_dir_is_a_labelled_fatal(self):
+        """A bare `cd` under `set -e` exits 1 carrying only sh's own wording.
+
+        Docker would then record an unhealthy sidecar whose message names no
+        cause — the same class of unlabelled verdict this script exists to
+        eliminate. It is FATAL (exit 2), not UNHEALTHY: nothing was measured.
+        """
+        res = self.run_script(_SHIM_AT_HEAD, app_dir="/nonexistent/alembic/root")
+        self.assertEqual(res.returncode, 2, res.output)
+        self.assertIn(
+            "[alembic-status] FATAL: cannot enter alembic project root "
+            "'/nonexistent/alembic/root'",
+            res.output,
+        )
+        self.assertNotIn("UNHEALTHY", res.output)
+        self.assertNotIn("UNDETERMINED", res.output)
 
 
 class ShippedScriptTests(unittest.TestCase):

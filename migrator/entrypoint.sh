@@ -10,6 +10,13 @@
 # no-op. A probe that fails leaves its rev empty, which falls through to
 # `alembic upgrade head`, which then fails loudly. That is deliberate:
 # the migrator's job is to run the upgrade and let it speak for itself.
+#
+# This script is the image ENTRYPOINT for BOTH the local compose
+# `migrator` one-shot and the ECS migrator task (aws/modules/migrator),
+# so its log lines land in `docker compose logs` and in CloudWatch.
+#
+# Regression test: scripts/tests/test_migrator_entrypoint.py, run by
+# CI's `python -m pytest scripts/tests/ -q` job.
 
 set -eu
 
@@ -18,7 +25,20 @@ if [ -z "${DATABASE_URL:-}" ]; then
   exit 2
 fi
 
-cd /app
+# The alembic project root inside the image. Overridable ONLY so the
+# regression test can drive this exact script outside the container,
+# where /app does not exist; nothing in the image or the ECS task
+# definition sets it. Mirrors ALEMBIC_STATUS_APP_DIR in the sibling
+# healthcheck script, which is the same image's other entry point.
+#
+# `if ! cd` rather than a bare `cd`: under `set -e` a failed `cd` exits 1
+# carrying only sh's own message, i.e. an unlabelled failure from a
+# script whose remaining output is uniformly `[migrator]`-tagged.
+app_dir="${MIGRATOR_APP_DIR:-/app}"
+if ! cd "$app_dir"; then
+  echo "[migrator] FATAL: cannot enter alembic project root '${app_dir}'" >&2
+  exit 2
+fi
 
 # Capture each probe's OWN exit status and its output (stderr merged in,
 # rather than discarded to /dev/null). A pipeline reports only its LAST
@@ -57,7 +77,18 @@ log_alembic_failure() {
     | sed 's/^/[migrator]   alembic: /'
 }
 
-echo "[migrator] DATABASE_URL host=$(printf '%s' "$DATABASE_URL" | sed -E 's|.*@([^/]+)/.*|\1|')"
+# Only host:port is logged, never the DSN — it carries the password. The
+# previous form was `sed -E 's|.*@([^/]+)/.*|\1|'`, a SUBSTITUTION, which
+# echoes its input unchanged when the pattern does not match: a DSN with
+# credentials but no trailing `/<database>` (e.g.
+# `postgresql://u:pw@host:5432`) printed the whole string, password
+# included, into the compose log and into CloudWatch. `sed -n …p` prints
+# ONLY on a match, so an unparseable DSN now says so instead.
+#
+# The greedy `.*@` deliberately anchors on the LAST `@`, so a password
+# containing `@` cannot leak its tail through the host capture.
+db_host="$(printf '%s' "$DATABASE_URL" | sed -n -E 's|.*@([^/?]+).*|\1|p')"
+echo "[migrator] DATABASE_URL host=${db_host:-<unparsed>}"
 
 if [ "$current_status" -ne 0 ]; then
   echo "[migrator] alembic current: FAILED (exit ${current_status}) — DB revision unknown"
