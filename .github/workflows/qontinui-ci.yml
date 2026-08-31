@@ -1,13 +1,43 @@
 name: qontinui CI
 
-# DO NOT NARROW THIS TRIGGER. coord's merge train pushes `merge-candidate/<uuid>`
-# and waits `awaiting-ci` for check-runs on that ref. A `pull_request`-only
-# workflow can never satisfy it: the train times out at COORD_MERGE_CI_TIMEOUT
-# (1800s), requeues forever, and permanently consumes one of COORD_MERGE_SLOTS
+# DO NOT DELETE THE `push:` TRIGGER, and do not narrow it past the branch list
+# below. coord's merge train pushes `merge-candidate/<uuid>` and waits
+# `awaiting-ci` for check-runs on that ref. A `pull_request`-only workflow can
+# never satisfy it: the train times out at COORD_MERGE_CI_TIMEOUT (1800s),
+# requeues forever, and permanently consumes one of COORD_MERGE_SLOTS
 # (default 3) — a standing 33% tax on fleet merge concurrency whose symptom
 # points at innocent repos. This workflow is currently the ONLY thing satisfying
 # candidate CI for qontinui-stack.
-on: [push, pull_request]
+#
+# The three `merge-candidate*` prefixes are coord's authoritative list
+# (`ci_observer.rs` CANDIDATE_BRANCH_PREFIXES_EXACT). Omitting one wedges the
+# train. `main` must stay too: coord's head-baseline axis needs a `push`
+# trigger that CAN fire on the default branch (`ci_baseline.rs`, the
+# `qontinui-dev-notes` note at the `no_candidate_producer` doc comment).
+#
+# WHY THIS IS SCOPED RATHER THAN THE `on: [push, pull_request]` IT REPLACED.
+# An UNFILTERED `push:` also fired on every PR head branch, so every PR ran
+# this workflow TWICE against the same head SHA — two runs of identical work
+# competing for the same hosted-runner pool, and the PR pinned at
+# mergeStateStatus=UNSTABLE until the slower duplicate drained. Measured on
+# PR #76 (2026-08-31): head SHA 9763836e carried run 33358773746 (push, 693s)
+# and run 33358792294 (pull_request, 1219s) for jobs that execute in 13-16s;
+# the PR was held ~20 minutes. A `concurrency:` block does NOT fix this —
+# `github.ref` differs by event (`refs/heads/<branch>` vs `refs/pull/<n>/merge`)
+# so the two runs land in different groups; qontinui-docs and qontinui-gym
+# carry `cancel-in-progress: true` and still emit both runs at one SHA.
+# Plan: 2026-08-31-devops-unfiltered-push-trigger-duplicates-every-pr-ci-run.
+#
+# `pull_request:` is deliberately left UNFILTERED so stacked PRs based on a
+# long-lived integration branch still get CI (the runner #651/#652 class).
+on:
+  push:
+    branches:
+      - main
+      - 'merge-candidate/**'
+      - 'merge-candidate-spec/**'
+      - 'merge-candidate-batch/**'
+  pull_request:
 
 # Explicitly read-only. This repo is PUBLIC and its terraform state holds 12
 # plaintext secret values, so nothing here may ever acquire AWS credentials —
