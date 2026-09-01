@@ -86,6 +86,7 @@ guard is to make working-tree contamination visible.
 | `COORD_URL` | `http://localhost:9870` | Coord service URL. Override for staging/CI. |
 | `QONTINUI_AGENT_ID` | unset | Caller identity (UUID). Takes precedence over `~/.qontinui/machine.json`. Useful when the same machine runs multiple agents. |
 | `QONTINUI_COORD_GUARD` | unset | Set to `skip` to bypass the check entirely. |
+| `GIT_GUARD_COMMAND` | unset | The git command line being guarded (the `--command` argument is the same input). **Observation-only** — nothing about the claim verdict or the exit code reads it. It feeds the branch-provenance POST below, which is simply not made when it is absent. |
 
 ## Identity resolution
 
@@ -109,6 +110,55 @@ The guard reads from:
 ```
 GET <COORD_URL>/coord/claims/by-resource?kind=worktree&key=<urlencoded-abs-path>
 ```
+
+### Branch-provenance observation (write)
+
+Plan `2026-08-28-shared-checkout-branch-provenance-and-reclaim-signal`, Phase 3.
+
+```
+POST <COORD_URL>/coord/trees/branch-events
+{ "device_id": "<uuid>",
+  "repo": "<basename of the target checkout>",
+  "branch": "<the branch being created / switched to>",
+  "agent_session_id": "<omitted when unknown>",
+  "created_via": "checkout_guard_observed" }
+```
+
+This records the fact that a branch was created or switched to in a
+primary/shared checkout, so coord can join `(repo, branch)` to
+`repo_branches`/`pr_events` and answer *whose branch is this, and did its PR
+ever conclude* — the `git reflog` + `gh pr view` archaeology that plan was
+written after doing by hand.
+
+Four things about it are load-bearing:
+
+- **It is an observation, never a gate.** It adds no refuse path and no exit
+  code. A 404, an unreachable coord, an unparseable command — all of them land
+  in the same fail-open shape as the claim GET's arms: one breadcrumb, and
+  nothing surfaced to the session.
+- **It is bearer-less and device-scoped on purpose**, mirroring
+  `POST /coord/trees/upsert` (the runner's tree publisher). This hook must work
+  with no runner up, so there is no JWT to mint. Do not add an
+  `Authorization` header — it would make the write fail closed on exactly the
+  boxes the event exists to cover.
+- **It skips coord-allocated worktrees** (any path under `agent-worktrees/`).
+  Those already report their branch through `POST /agents/allocate` into
+  `coord.agent_worktrees.branch`; a second event for the same checkout would
+  double-count a row Phase 4 joins on.
+- **It fires only for a branch create/switch.** `git checkout .`,
+  `git checkout -- <path>`, `pull`, `rebase`, `stash pop|apply` and
+  `reset --hard` produce nothing: none of them creates or switches a branch.
+
+It runs in the background with both file descriptors detached, so it costs the
+caller no wall-clock time and cannot hold a caller's stdout pipe open. Its
+outcome is recorded in the breadcrumb log as
+`EVENT reason=branch-event-posted … http=<code|unreachable>`.
+
+**A missing event is UNKNOWN, never "nobody checked anything out."** A caller
+that passes no command (the shell functions above), a harness with no hook
+installed, or raw git outside any tool all produce no event — the same
+absence-is-not-zero discipline the fleet's `silent-empty-is-unknown` policy
+states elsewhere.
 
 The corresponding **acquire** endpoint is, at the time of writing,
 unprefixed:
