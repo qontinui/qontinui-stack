@@ -11,6 +11,23 @@
 # `alembic upgrade head`, which then fails loudly. That is deliberate:
 # the migrator's job is to run the upgrade and let it speak for itself.
 #
+# That no-op is the ONE place a logging-only probe may SUPPRESS the
+# upgrade, so it fires only on an UNAMBIGUOUS reading: exactly one
+# stamped revision AND exactly one chain head. Either probe reporting
+# more than one leaves its rev empty and falls through to the upgrade,
+# for the same reason a failed probe does. Reading only the first row
+# would let two real conditions exit 0 having done nothing:
+#
+#   - a MULTI-HEAD chain (the 2026-05-07 failure mode the sibling
+#     healthcheck already guards) whose first head happens to be where
+#     the DB is stamped — `alembic upgrade head` would have said
+#     "Multiple head revisions are present";
+#   - a BRANCHED DB stamped at several revisions, of which the first
+#     matches the head.
+#
+# In ECS the migrator task is the only signal there is, so a silent
+# exit 0 there reports a deploy as migrated when it is not.
+#
 # This script is the image ENTRYPOINT for BOTH the local compose
 # `migrator` one-shot and the ECS migrator task (aws/modules/migrator),
 # so its log lines land in `docker compose logs` and in CloudWatch.
@@ -51,17 +68,40 @@ current_output="$(alembic current 2>&1)" || current_status=$?
 heads_status=0
 heads_output="$(alembic heads 2>&1)" || heads_status=$?
 
-# A revision id is lowercase alnum/underscore, so the anchor also drops
-# alembic's INFO preamble now that stderr is merged into these streams.
-current_rev=""
+# Collect EVERY revision-shaped row rather than the first, so an
+# ambiguous reading is COUNTABLE instead of invisible. A revision id is
+# lowercase alnum/underscore, so the anchor also drops alembic's INFO
+# preamble now that stderr is merged into these streams.
+current_revs=""
+current_count=0
 if [ "$current_status" -eq 0 ]; then
-  current_rev="$(printf '%s\n' "$current_output" \
-    | awk '/\(head\)/{print $1; exit} /^[a-z0-9_]+/{rev=$1} END{if (rev) print rev}')"
+  current_revs="$(printf '%s\n' "$current_output" | awk '/^[a-z0-9_]+/{print $1}')"
+  if [ -n "$current_revs" ]; then
+    current_count=$(printf '%s\n' "$current_revs" | wc -l | tr -d ' ')
+  fi
+fi
+
+# `alembic heads` marks each head with `(head)`; count the marks.
+heads_revs=""
+heads_count=0
+if [ "$heads_status" -eq 0 ]; then
+  heads_revs="$(printf '%s\n' "$heads_output" | awk '/\(head\)/{print $1}')"
+  if [ -n "$heads_revs" ]; then
+    heads_count=$(printf '%s\n' "$heads_revs" | wc -l | tr -d ' ')
+  fi
+fi
+
+# Only a count of exactly 1 yields a rev to compare. Anything else — a
+# failed probe, nothing stamped, or an ambiguous multi-row reading —
+# leaves the rev empty, which is what makes the no-op below unreachable.
+current_rev=""
+if [ "$current_count" -eq 1 ]; then
+  current_rev="$current_revs"
 fi
 
 head_rev=""
-if [ "$heads_status" -eq 0 ]; then
-  head_rev="$(printf '%s\n' "$heads_output" | awk '/\(head\)/{print $1; exit}')"
+if [ "$heads_count" -eq 1 ]; then
+  head_rev="$heads_revs"
 fi
 
 # Echo alembic's own words back, minus the INFO preamble and its
@@ -93,6 +133,9 @@ echo "[migrator] DATABASE_URL host=${db_host:-<unparsed>}"
 if [ "$current_status" -ne 0 ]; then
   echo "[migrator] alembic current: FAILED (exit ${current_status}) — DB revision unknown"
   log_alembic_failure "$current_output"
+elif [ "$current_count" -gt 1 ]; then
+  echo "[migrator] alembic current: ${current_count} revisions stamped (expected 1) — DB is branched"
+  printf '%s\n' "$current_revs" | sed 's/^/[migrator]   current: /'
 else
   echo "[migrator] alembic current: ${current_rev:-<none>}"
 fi
@@ -100,6 +143,9 @@ fi
 if [ "$heads_status" -ne 0 ]; then
   echo "[migrator] alembic head:    FAILED (exit ${heads_status}) — chain head unknown"
   log_alembic_failure "$heads_output"
+elif [ "$heads_count" -gt 1 ]; then
+  echo "[migrator] alembic head:    ${heads_count} heads (expected 1) — chain has diverged"
+  printf '%s\n' "$heads_revs" | sed 's/^/[migrator]   head: /'
 else
   echo "[migrator] alembic head:    ${head_rev:-<none>}"
 fi

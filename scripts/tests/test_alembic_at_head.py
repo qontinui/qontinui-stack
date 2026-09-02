@@ -147,6 +147,23 @@ fi
 exit 0
 """
 
+# A DB stamped at more than one revision at once. The FIRST row is the chain
+# head, so a first-row reading reports `OK: at head …` — a false healthy from
+# the one surface whose whole purpose is to be believed.
+_SHIM_BRANCHED_DB = f"""#!/bin/sh
+if [ "$1" = "current" ]; then
+  echo "INFO  [alembic.runtime.migration] Context impl PostgresqlImpl." >&2
+  echo "{_IMAGE_HEAD} (head)"
+  echo "7c5e4d3b2a1f (head)"
+  exit 0
+fi
+if [ "$1" = "heads" ]; then
+  echo "{_IMAGE_HEAD} (head)"
+  exit 0
+fi
+exit 0
+"""
+
 # `heads` reads only the filesystem, so it cannot fail from DB state — but a
 # broken chain still fails it, and that must not become "0 heads".
 _SHIM_HEADS_BROKEN = """#!/bin/sh
@@ -224,11 +241,20 @@ class _ScriptCase(unittest.TestCase):
             env["DATABASE_URL"] = database_url
 
         assert _SH is not None
+        # Explicit utf-8 rather than `text=True`: the script's own diagnostics
+        # carry em-dashes, and `text=True` decodes with the LOCALE encoding —
+        # cp1252 on a Windows console, ASCII under a bare `LC_ALL=C`. Either
+        # mangles or raises on a line this suite is meant to read. Assertions
+        # below stay ASCII-only for the same reason, but the decode must not
+        # corrupt what it is asserting against. (Carried over from the sibling
+        # test_migrator_entrypoint.py, which was written with this fix and is
+        # where the hazard was first written down.)
         proc = subprocess.run(
             [_SH, str(_SCRIPT)],
             env=env,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=60,
         )
         return _Result(proc)
@@ -332,6 +358,23 @@ class DivergenceTests(_ScriptCase):
         self.assertIn("head: cr01a2b3c4d5", res.output)
         self.assertIn("head: 7c5e4d3b2a1f", res.output)
         self.assertNotEqual(res.returncode, 0)
+
+    def test_branched_db_is_not_reduced_to_its_first_revision(self):
+        """Row 1 equals the chain head, so this used to report a false healthy."""
+        res = self.run_script(_SHIM_BRANCHED_DB)
+        # ASCII-only, so the assertion does not itself depend on the decode.
+        self.assertIn("UNHEALTHY: DB is stamped at 2 revisions (expected 1", res.output)
+        self.assertIn("the DB is branched)", res.output)
+        self.assertIn(f"current: {_IMAGE_HEAD}", res.output)
+        self.assertIn("current: 7c5e4d3b2a1f", res.output)
+        self.assertNotIn("OK: at head", res.output)
+        self.assertNotEqual(res.returncode, 0)
+
+    def test_branched_db_is_not_reported_as_never_stamped(self):
+        """It is stamped — twice. The empty claim stays reserved for empty."""
+        res = self.run_script(_SHIM_BRANCHED_DB)
+        self.assertNotIn("DB never stamped", res.output)
+        self.assertNotIn("UNDETERMINED", res.output)
 
     def test_behind_head_still_reported(self):
         res = self.run_script(_SHIM_BEHIND_HEAD)

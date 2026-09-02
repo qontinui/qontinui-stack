@@ -32,6 +32,11 @@
 #     not evidence that the DB is unstamped.
 #   - UNHEALTHY: alembic heads count != 1 (multi-head divergence — the
 #     same condition that broke the migrator on 2026-05-07).
+#   - UNHEALTHY: `alembic current` printed more than one revision (the DB
+#     is branched — stamped at several revisions at once). Reading only
+#     the first row would let a branched DB whose first row happens to
+#     equal the chain head report OK, i.e. a FALSE HEALTHY from the one
+#     surface whose whole purpose is to be believed.
 #   - UNHEALTHY: alembic current != chain head (DB is at an old
 #     revision; the migrator must run, or did run and silently failed).
 #   - FATAL: DATABASE_URL is not set, or the alembic project root cannot
@@ -137,18 +142,35 @@ if [ "$cur_status" -ne 0 ]; then
   exit 1
 fi
 
-# alembic current succeeded — first lowercase-anchored line is the rev.
-# The output format on a stamped DB is e.g.:
+# alembic current succeeded — the lowercase-anchored lines are the revs
+# it is stamped at. The output format on a stamped DB is e.g.:
 #   a6f606408ecb (head)
 # The lowercase anchor is safe HERE (and only here) because the status
 # check above already ruled out the error output: `FAILED:` is written
 # to stdout, and would otherwise slip past this filter unseen.
-cur="$(awk '/^[a-z0-9_]+/{print $1; exit}' <"$cur_out" || true)"
+#
+# Collect EVERY revision row, not just the first, and count them — the
+# same treatment `heads` gets below, and for the same reason: a count
+# other than 1 is a real condition, and taking row 1 makes it invisible.
+cur_revs="$(awk '/^[a-z0-9_]+/{print $1}' <"$cur_out" || true)"
 
-if [ -z "$cur" ]; then
+cur_count=0
+if [ -n "$cur_revs" ]; then
+  cur_count=$(printf '%s\n' "$cur_revs" | wc -l | tr -d ' ')
+fi
+
+if [ "$cur_count" -eq 0 ]; then
   echo "[alembic-status] UNHEALTHY: alembic_version is empty (DB never stamped)" >&2
   exit 1
 fi
+
+if [ "$cur_count" -ne 1 ]; then
+  echo "[alembic-status] UNHEALTHY: DB is stamped at ${cur_count} revisions (expected 1 — the DB is branched)" >&2
+  printf '%s\n' "$cur_revs" | awk '{print "  current: " $0}' >&2
+  exit 1
+fi
+
+cur="$cur_revs"
 
 heads_out="$work/heads.out"
 heads_err="$work/heads.err"

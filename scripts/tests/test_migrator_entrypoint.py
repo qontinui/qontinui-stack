@@ -51,6 +51,8 @@ _SCRIPT = _REPO_ROOT / "migrator" / "entrypoint.sh"
 _STAMPED_REV = "coord_specq_01_speculative_ci_status"
 # The single head of that stale image's embedded chain.
 _IMAGE_HEAD = "coord_handoff_requests"
+# A second head / second stamped revision, for the ambiguous-reading cases.
+_OTHER_BRANCH = "web_notification_prefs"
 
 _DSN = "postgresql+psycopg2://qontinui_user:s3cr3t_pw@postgres:5432/qontinui_db"
 
@@ -125,10 +127,42 @@ if [ "$1" = "current" ]; then
 fi
 """
 
+# A DB stamped at more than one revision at once. `alembic current` prints
+# one row per stamped revision, and the FIRST row here is the chain head, so
+# a first-row reading calls this "already at head".
+_CURRENT_BRANCHED = f"""
+if [ "$1" = "current" ]; then
+  echo "INFO  [alembic.runtime.migration] Context impl PostgresqlImpl." >&2
+  echo "{_IMAGE_HEAD} (head)"
+  echo "{_OTHER_BRANCH} (head)"
+  exit 0
+fi
+"""
+
 _HEADS_OK = f"""
 if [ "$1" = "heads" ]; then
   echo "{_IMAGE_HEAD} (head)"
   exit 0
+fi
+"""
+
+# The 2026-05-07 divergence the sibling healthcheck was built to catch, and to
+# which this script was blind. Its FIRST head is where `_CURRENT_AT_HEAD` says
+# the DB is stamped, so a first-row reading no-ops on a diverged chain.
+_HEADS_DIVERGED = f"""
+if [ "$1" = "heads" ]; then
+  echo "{_IMAGE_HEAD} (head)"
+  echo "{_OTHER_BRANCH} (head)"
+  exit 0
+fi
+"""
+
+# What `alembic upgrade head` actually says on a diverged chain — i.e. what
+# the no-op used to suppress.
+_UPGRADE_MULTIPLE_HEADS = """
+if [ "$1" = "upgrade" ]; then
+  echo "FAILED: Multiple head revisions are present for given argument 'head'"
+  exit 255
 fi
 """
 
@@ -312,6 +346,64 @@ class RevisionReportingTests(_ScriptCase):
         self.assertIn("[migrator] alembic current: <none>", res.output)
         self.assertNotIn("alembic current: FAILED", res.output)
         self.assertTrue(res.ran_upgrade, res.output)
+
+
+class AmbiguousReadingTests(_ScriptCase):
+    """A reading whose FIRST row matches, but which as a whole is ambiguous.
+
+    The "already at head" no-op is the one place a logging-only probe may
+    SUPPRESS the upgrade, so it may fire only on an unambiguous reading:
+    exactly one stamped revision AND exactly one chain head. Both shapes
+    below are arranged so that row 1 matches — which is what made them exit 0
+    having run no migration at all, silently, from the script that is the
+    ECS migrator task's only signal.
+    """
+
+    MULTI_HEAD = _shim(
+        _CURRENT_AT_HEAD, heads=_HEADS_DIVERGED, upgrade=_UPGRADE_MULTIPLE_HEADS
+    )
+    BRANCHED_DB = _shim(_CURRENT_BRANCHED)
+
+    def test_multi_head_is_named_not_reduced_to_its_first_head(self):
+        res = self.run_script(self.MULTI_HEAD)
+        self.assertIn("[migrator] alembic head:    2 heads (expected 1)", res.output)
+        self.assertIn("chain has diverged", res.output)
+        self.assertIn(f"[migrator]   head: {_IMAGE_HEAD}", res.output)
+        self.assertIn(f"[migrator]   head: {_OTHER_BRANCH}", res.output)
+        # The headline must not present one of the two as THE head.
+        self.assertNotIn(f"[migrator] alembic head:    {_IMAGE_HEAD}", res.output)
+
+    def test_multi_head_does_not_no_op_when_current_matches_a_head(self):
+        res = self.run_script(self.MULTI_HEAD)
+        self.assertNotIn("already at head", res.output)
+        self.assertTrue(res.ran_upgrade, res.output)
+
+    def test_multi_head_lets_alembic_report_the_real_error(self):
+        """The upgrade the no-op used to suppress is the thing that diagnoses this."""
+        res = self.run_script(self.MULTI_HEAD)
+        self.assertNotEqual(res.returncode, 0, res.output)
+        self.assertIn("Multiple head revisions are present", res.output)
+
+    def test_branched_db_is_named_not_reduced_to_its_first_revision(self):
+        res = self.run_script(self.BRANCHED_DB)
+        self.assertIn(
+            "[migrator] alembic current: 2 revisions stamped (expected 1)", res.output
+        )
+        self.assertIn("DB is branched", res.output)
+        self.assertIn(f"[migrator]   current: {_IMAGE_HEAD}", res.output)
+        self.assertIn(f"[migrator]   current: {_OTHER_BRANCH}", res.output)
+
+    def test_branched_db_does_not_no_op(self):
+        res = self.run_script(self.BRANCHED_DB)
+        self.assertNotIn("already at head", res.output)
+        self.assertTrue(res.ran_upgrade, res.output)
+
+    def test_a_single_head_reading_is_still_a_no_op(self):
+        """The guard must not cost the happy path its shortcut."""
+        res = self.run_script(_shim(_CURRENT_AT_HEAD))
+        self.assertIn("[migrator] DB already at head — no-op", res.output)
+        self.assertFalse(res.ran_upgrade, res.output)
+        self.assertEqual(res.returncode, 0, res.output)
 
 
 class DsnLoggingTests(_ScriptCase):
