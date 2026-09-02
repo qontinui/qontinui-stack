@@ -275,7 +275,9 @@ services:
   # at more than one revision (branched), multi-head divergence (the
   # 2026-05-07 failure mode), or current != head (post-migration
   # silent-failure fallout) — and UNDETERMINED when an `alembic`
-  # invocation itself FAILED, so nothing about the DB was established.
+  # invocation itself FAILED, or succeeded and named no head, so nothing
+  # about the DB was established. A chain with no head is a defect of the
+  # IMAGE, not a verdict about the DB, which is why it lands there.
   # Docker has no third state, so UNDETERMINED is also a non-zero exit:
   # an unhealthy sidecar does NOT on its own mean any particular one of
   # those conditions holds — read the message, which names which branch

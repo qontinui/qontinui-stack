@@ -179,6 +179,22 @@ exit 0
 """
 
 
+# `heads` SUCCEEDS and names no head — an empty or unreadable
+# `alembic/versions/` in this image. Nothing about the DB was established by
+# it, so it is the same UNDETERMINED class as `_SHIM_HEADS_BROKEN` one step
+# later, not a verdict about the DB.
+_SHIM_HEADS_EMPTY = """#!/bin/sh
+if [ "$1" = "current" ]; then
+  echo "oldrev01"
+  exit 0
+fi
+if [ "$1" = "heads" ]; then
+  exit 0
+fi
+exit 0
+"""
+
+
 class _Result:
     """A completed run of the script, with both streams and the exit status."""
 
@@ -399,6 +415,37 @@ class HeadsFailureTests(_ScriptCase):
         self.assertIn("missing_down_revision", res.output)
 
 
+class ZeroHeadTests(_ScriptCase):
+    """`alembic heads` succeeded and still named no head.
+
+    The sibling above pins that a FAILED `heads` must not become "0 heads".
+    This is the other half: a SUCCESSFUL `heads` that yields none. The chain
+    embedded in the image is empty or unreadable, so there is no head to
+    compare the DB against — which makes it an image defect, and leaves the
+    DB's stamp exactly as unestablished as a failed probe would.
+    """
+
+    def test_is_undetermined_not_an_unhealthy_verdict(self):
+        res = self.run_script(_SHIM_HEADS_EMPTY)
+        self.assertIn("UNDETERMINED", res.output)
+        self.assertIn("named no head", res.output)
+        self.assertIn("the chain in this image is empty or unreadable", res.output)
+        self.assertNotIn("UNHEALTHY", res.output)
+        self.assertNotEqual(res.returncode, 0)
+
+    def test_does_not_report_a_head_count_as_the_finding(self):
+        """The count is the symptom; naming it as the verdict is the defect."""
+        res = self.run_script(_SHIM_HEADS_EMPTY)
+        self.assertNotIn("has 0 heads", res.output)
+
+    def test_says_nothing_about_where_the_db_is_stamped(self):
+        """`current` read cleanly, but with no head there is nothing to say."""
+        res = self.run_script(_SHIM_HEADS_EMPTY)
+        self.assertNotIn("DB at oldrev01", res.output)
+        self.assertNotIn("DB never stamped", res.output)
+        self.assertNotIn("OK: at head", res.output)
+
+
 class FatalTests(_ScriptCase):
     def test_missing_database_url_is_exit_2(self):
         res = self.run_script(_SHIM_AT_HEAD, database_url=None)
@@ -450,6 +497,22 @@ class ShippedScriptTests(unittest.TestCase):
             if line.startswith("#")
         )
         self.assertIn("UNDETERMINED", header)
+
+    def test_header_does_not_promise_a_head_count_verdict_it_no_longer_gives(self):
+        """`count != 1` covered zero, which is now UNDETERMINED, not UNHEALTHY.
+
+        The header is the authoritative list — docker-compose.yml says so in
+        as many words — so it is the one place a stale enumeration is a
+        defect rather than a comment.
+        """
+        header = "\n".join(
+            line
+            for line in _SCRIPT.read_text(encoding="utf-8").splitlines()
+            if line.startswith("#")
+        )
+        self.assertNotIn("alembic heads count != 1", header)
+        self.assertIn("alembic heads count > 1", header)
+        self.assertIn("named no head", header)
 
 
 if __name__ == "__main__":  # pragma: no cover

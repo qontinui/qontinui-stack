@@ -26,11 +26,17 @@
 #   - UNDETERMINED: `alembic heads` failed, so the chain head is unknown.
 #     `heads` reads only the filesystem, so this means a broken chain
 #     (missing down_revision, import error), never a DB condition.
+#   - UNDETERMINED: `alembic heads` SUCCEEDED but named no head. The same
+#     cause one step later — the chain embedded in THIS IMAGE is empty or
+#     unreadable — so there is no head to compare the DB against and
+#     nothing about the DB's stamp was established. Reported as
+#     UNDETERMINED for exactly the reason the branch above is: an image
+#     defect must not be dressed as a verdict about the DB.
 #   - UNHEALTHY: alembic current is empty (DB never stamped). This may
 #     ONLY be claimed when `alembic current` SUCCEEDED and printed no
 #     revision token — an empty result from a FAILED command is UNKNOWN,
 #     not evidence that the DB is unstamped.
-#   - UNHEALTHY: alembic heads count != 1 (multi-head divergence — the
+#   - UNHEALTHY: alembic heads count > 1 (multi-head divergence — the
 #     same condition that broke the migrator on 2026-05-07).
 #   - UNHEALTHY: `alembic current` printed more than one revision (the DB
 #     is branched — stamped at several revisions at once). Reading only
@@ -197,11 +203,23 @@ if [ -n "$heads_lines" ]; then
   heads_count=$(printf '%s\n' "$heads_lines" | wc -l | tr -d ' ')
 fi
 
+# A ZERO-head reading is an image defect, not a verdict about the DB.
+# `heads` succeeded, so the chain was readable — and it still named no
+# head, which leaves nothing to compare `cur` against. That establishes
+# nothing about the DB's stamp, so it reports UNDETERMINED for the same
+# reason the `heads` FAILURE branch above does. Saying "the chain has 0
+# heads (expected 1)" under UNHEALTHY was the same shape of dishonesty as
+# calling a failed `current` an unstamped DB: a verdict asserted from a
+# reading that never established it.
+if [ "$heads_count" -eq 0 ]; then
+  printf '%s\n' '[alembic-status] UNDETERMINED: `alembic heads` named no head; the chain in this image is empty or unreadable' >&2
+  exit 1
+fi
+
+# Past the zero case, `-ne 1` can only be `> 1`, so the rows always print.
 if [ "$heads_count" -ne 1 ]; then
   echo "[alembic-status] UNHEALTHY: alembic chain has ${heads_count} heads (expected 1)" >&2
-  if [ "$heads_count" -gt 1 ]; then
-    printf '%s\n' "$heads_lines" | awk '{print "  head: " $0}' >&2
-  fi
+  printf '%s\n' "$heads_lines" | awk '{print "  head: " $0}' >&2
   exit 1
 fi
 

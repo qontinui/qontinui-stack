@@ -173,6 +173,25 @@ if [ "$1" = "heads" ]; then
 fi
 """
 
+# `heads` SUCCEEDS and names no head — an empty or unreadable
+# `alembic/versions/` in this image. `<none>` is a legitimate reading for
+# `current` (an unstamped DB) but never for `heads`, so the two must not
+# share a log token.
+_HEADS_EMPTY = """
+if [ "$1" = "heads" ]; then
+  exit 0
+fi
+"""
+
+# What `alembic upgrade head` says when the chain names no head — i.e. the
+# real diagnosis the migrator falls through to.
+_UPGRADE_NO_HEAD = """
+if [ "$1" = "upgrade" ]; then
+  echo "FAILED: Can't determine head revision"
+  exit 255
+fi
+"""
+
 
 def _shim(current: str, heads: str = _HEADS_OK, upgrade: str = _UPGRADE_OK) -> str:
     return _PREAMBLE + current + heads + upgrade
@@ -404,6 +423,47 @@ class AmbiguousReadingTests(_ScriptCase):
         self.assertIn("[migrator] DB already at head — no-op", res.output)
         self.assertFalse(res.ran_upgrade, res.output)
         self.assertEqual(res.returncode, 0, res.output)
+
+
+class ZeroHeadTests(_ScriptCase):
+    """`alembic heads` succeeded and still named no head.
+
+    The count-based guard makes a multi-row reading visible; zero is the
+    other end of the same axis, and the two probes do not mean the same
+    thing by it. An unstamped DB is a real state `current` reports as
+    ``<none>``; a chain with no head is an empty or unreadable
+    ``alembic/versions/`` in the image. Logging both as ``<none>`` left an
+    operator reading CloudWatch unable to tell them apart.
+    """
+
+    NO_HEAD = _shim(_CURRENT_BEHIND, heads=_HEADS_EMPTY, upgrade=_UPGRADE_NO_HEAD)
+
+    def test_zero_heads_is_named_rather_than_logged_as_none(self):
+        res = self.run_script(self.NO_HEAD)
+        self.assertIn("[migrator] alembic head:    none named (expected 1)", res.output)
+        self.assertIn("this image's chain is empty or unreadable", res.output)
+        self.assertNotIn("[migrator] alembic head:    <none>", res.output)
+
+    def test_the_current_probe_keeps_its_own_reading(self):
+        """Naming the heads case must not disturb the other probe's line."""
+        res = self.run_script(self.NO_HEAD)
+        self.assertIn("[migrator] alembic current: oldrev01", res.output)
+
+    def test_zero_heads_does_not_no_op(self):
+        res = self.run_script(self.NO_HEAD)
+        self.assertNotIn("already at head", res.output)
+        self.assertTrue(res.ran_upgrade, res.output)
+
+    def test_zero_heads_lets_alembic_report_the_real_error(self):
+        res = self.run_script(self.NO_HEAD)
+        self.assertNotEqual(res.returncode, 0, res.output)
+        self.assertIn("Can't determine head revision", res.output)
+
+    def test_an_unstamped_db_still_reads_as_none(self):
+        """``<none>`` stays the reading for the state that actually earns it."""
+        res = self.run_script(_shim(_CURRENT_TRULY_EMPTY))
+        self.assertIn("[migrator] alembic current: <none>", res.output)
+        self.assertNotIn("empty or unreadable", res.output)
 
 
 class DsnLoggingTests(_ScriptCase):

@@ -208,9 +208,27 @@ The `migrator` service is a one-shot container that runs `alembic upgrade head`
 against the canonical PG and exits. On every `docker compose up`, it:
 
 1. Waits for `postgres` to be healthy.
-2. Compares `alembic current` to `alembic heads`.
-3. Either logs `DB already at head — no-op` and exits 0, or runs `alembic
-   upgrade head` and exits with alembic's exit code.
+2. Reads `alembic current` and `alembic heads`, and logs what each one said.
+3. Skips the upgrade **only** on an unambiguous reading — exactly one stamped
+   revision, exactly one chain head, and the two equal. Then: `DB already at
+   head — no-op`, exit 0.
+4. Otherwise runs `alembic upgrade head` and exits with alembic's exit code.
+
+Step 3 is the only place a probe may suppress the upgrade, so it takes no
+shortcut on a reading that is ambiguous as a whole. A failed probe, a branched
+DB (stamped at several revisions at once), a diverged chain (several heads),
+and a chain that names no head are each named in the log and each fall through
+to step 4, where alembic produces the real diagnosis. In ECS the migrator task
+is the only signal there is, so an exit 0 that ran nothing would report a
+deploy as migrated when it is not.
+
+The `alembic-status` sidecar runs the same image's `/alembic_at_head.sh` as a
+docker healthcheck, so `docker inspect` answers "is the canonical DB at chain
+head?" — a stronger signal than `pg_isready`, which stays green against a stale
+schema. Both scripts' headers carry the authoritative list of the conditions
+they distinguish, and of which ones are verdicts about the DB rather than about
+the image; the summaries elsewhere (here, and the `alembic-status` comment in
+`docker-compose.yml`) are convenience and go stale.
 
 The image is built from `./migrator/Dockerfile`. Build context is one level up
 (`..`) so it can `COPY` from `qontinui-web/backend/` (alembic chain + model

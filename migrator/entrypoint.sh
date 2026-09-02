@@ -25,6 +25,13 @@
 #   - a BRANCHED DB stamped at several revisions, of which the first
 #     matches the head.
 #
+# A count of ZERO is named too, and separately, because the two probes
+# do not mean the same thing by it. `<none>` is a legitimate reading for
+# `current` — a DB nobody has stamped yet — but never for `heads`: a
+# chain that names no head is an empty or unreadable `alembic/versions/`
+# in THIS IMAGE. Logging both as `<none>` made an image defect read
+# exactly like a healthy reading of a fresh DB.
+#
 # In ECS the migrator task is the only signal there is, so a silent
 # exit 0 there reports a deploy as migrated when it is not.
 #
@@ -146,8 +153,12 @@ if [ "$heads_status" -ne 0 ]; then
 elif [ "$heads_count" -gt 1 ]; then
   echo "[migrator] alembic head:    ${heads_count} heads (expected 1) — chain has diverged"
   printf '%s\n' "$heads_revs" | sed 's/^/[migrator]   head: /'
+elif [ "$heads_count" -eq 0 ]; then
+  echo "[migrator] alembic head:    none named (expected 1) — this image's chain is empty or unreadable"
 else
-  echo "[migrator] alembic head:    ${head_rev:-<none>}"
+  # Past the branches above, heads_count is 1, so head_rev is set: no
+  # `<none>` default is reachable here.
+  echo "[migrator] alembic head:    ${head_rev}"
 fi
 
 if [ -n "$current_rev" ] && [ "$current_rev" = "$head_rev" ]; then
