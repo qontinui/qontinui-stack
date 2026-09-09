@@ -305,11 +305,28 @@ resource "aws_iam_role_policy" "task_cognito_linking" {
 # read-only SQL against the VPC-internal RDS. coord's image is curl-only.
 #
 # This closes a real workaround hazard: with exec dead, the fallback is
-# `aws ecs run-task --overrides command=[...]`, which is safe on web (no
-# image ENTRYPOINT) but is NOT a general substitute — the same trick against
-# coord cannot override its `/app/qontinui-coord` ENTRYPOINT and boots a
-# lease-holding server (four orphaned tasks caused the 2026-06-30 leaderless
-# outage). Restoring exec on web removes the temptation to generalize it.
+# `aws ecs run-task --overrides command=[...]`, which does land on web but is
+# NOT a general substitute. The REASON matters more than the verdict here,
+# because the reason is what a reader carries to the next container, and the
+# reason this comment used to give was wrong: it said web was safe because it
+# has "no image ENTRYPOINT". It has one — `["/usr/bin/tini", "--"]`
+# (qontinui-web `backend/Dockerfile`, checked 2026-09-09), and so do the other
+# two, so "does the image declare an ENTRYPOINT" answers UNSAFE for the one
+# image that is safe and is the wrong test.
+#
+# The real rule: `containerOverrides` has no `entryPoint` field at all, so your
+# command is handed to the EFFECTIVE entrypoint as argv, and what matters is
+# whether that entrypoint EXECS its argv. `tini --` is a pass-through, so on
+# web the command runs. `tini -s -- /app/qontinui-coord` already names its
+# payload, so against coord the same trick only passes arguments to the coord
+# binary and boots a lease-holding server (four orphaned tasks caused the
+# 2026-06-30 leaderless outage). `tini -- /entrypoint.sh` reaches a wrapper
+# that ignores argv and `exec alembic upgrade head`, so against the migrator it
+# APPLIES MIGRATIONS — it advanced prod's alembic head on 2026-07-23.
+#
+# Door-by-door detail, dated per claim:
+# qontinui-claude-config `knowledge-base/qontinui-specific/production-data-access.md` §3.
+# Restoring exec on web removes the temptation to generalize any of this.
 data "aws_iam_policy_document" "task_ecs_exec" {
   statement {
     sid = "EcsExecSsmMessages"
