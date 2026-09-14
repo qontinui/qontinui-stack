@@ -697,6 +697,25 @@ services:
       # as <issuer>/.well-known/jwks.json.
       COORD_OIDC_ISSUER: ${COORD_OIDC_ISSUER:-https://cognito-idp.us-east-1.amazonaws.com/us-east-1_rgTB9dbZ1}
       COORD_OIDC_AUDIENCE: ${COORD_OIDC_AUDIENCE:-q6ns1a8bokf2np1mj8v8arl31,67f2a1a0cmgileob23lniud5t7,7sirquecq6svomsoe34pblfp24,tb0epbojige1900ipu6q80j6b}
+      # The read-only half of the audience list above. A token whose aud /
+      # client_id is in this set gets a non-interactive OperatorContext and
+      # every mutating route answers 403 (auth_sso.rs
+      # noninteractive_audiences, auth::deny_non_interactive_write). Setting
+      # COORD_OIDC_AUDIENCE without it silently promotes password-mintable
+      # clients — tb0epbojige1900ipu6q80j6b is the USER_PASSWORD_AUTH CI
+      # client web's spec-CI / E2E use — to full WRITE authority, which is
+      # the `active_negation` drift class coord's own
+      # cognito_describe_observer names. Mirrors production's classification
+      # (qontinui-coord deploy/taskdef.json) restricted to the ids accepted
+      # above: prod's 6k0mt7h1gk4raam66bpkcnlo9f (coord-verify client) is not
+      # in this audience, and declaring it here would only record a
+      # benign_add row. NOT closed, inherited from production as-is: the
+      # runner client 67f2a1a0cmgileob23lniud5t7 also allows
+      # USER_PASSWORD_AUTH but is absent from prod's set — prod never
+      # classified it, since it joined the audience later for a read
+      # (qontinui-coord 31028596, /admin/coord/me). Left as prod has it;
+      # classifying it is a prod decision.
+      COORD_OIDC_NONINTERACTIVE_AUDIENCES: ${COORD_OIDC_NONINTERACTIVE_AUDIENCES:-tb0epbojige1900ipu6q80j6b,7sirquecq6svomsoe34pblfp24}
       # New operators (by Cognito sub) auto-join this tenant on first
       # successful local-coord login — this is local-dev-only state,
       # independent of any production tenant membership. Matches the
