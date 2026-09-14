@@ -685,6 +685,34 @@ services:
       # proj_deployment_config_gaps_2026-05-rollout.
       NATS_URL: nats://${NATS_CLIENT_USER:-qontinui_client}:${NATS_CLIENT_PASSWORD:-qontinui_dev_nats}@nats-1:4222
       COORD_BIND_ADDR: 0.0.0.0:9870
+      # Cognito OIDC verification — was entirely unset here (coord-side gap,
+      # found 2026-08-24 diagnosing a pair-cli 400 tenant_id_required loop:
+      # web stopped sending tenant_id in the body and relies on coord
+      # deriving it from the forwarded operator bearer, but with
+      # COORD_OIDC_ISSUER unset coord can never verify that bearer and
+      # always falls through to tenant_id_required). Mirrors qontinui-web
+      # backend's COGNITO_USER_POOL_ID/COGNITO_ALLOWED_AUDIENCES defaults
+      # (app/core/config.py) so the same production Cognito tokens verify
+      # on both sides. COORD_OIDC_JWKS_URL is left unset — coord derives it
+      # as <issuer>/.well-known/jwks.json.
+      COORD_OIDC_ISSUER: ${COORD_OIDC_ISSUER:-https://cognito-idp.us-east-1.amazonaws.com/us-east-1_rgTB9dbZ1}
+      COORD_OIDC_AUDIENCE: ${COORD_OIDC_AUDIENCE:-q6ns1a8bokf2np1mj8v8arl31,67f2a1a0cmgileob23lniud5t7,7sirquecq6svomsoe34pblfp24,tb0epbojige1900ipu6q80j6b}
+      # New operators (by Cognito sub) auto-join this tenant on first
+      # successful local-coord login — this is local-dev-only state,
+      # independent of any production tenant membership. Matches the
+      # convention Start-LocalCoord already uses for the VerifyWeb coord.
+      COORD_SSO_DEFAULT_TENANT: ${COORD_SSO_DEFAULT_TENANT:-default}
+      # JWT signing key persistence — found 2026-08-24 alongside the OIDC gap
+      # above: coord's default key path is under $HOME
+      # (~/.qontinui/coord-jwt-ed25519.pkcs8, jwt.rs::key_path), which is
+      # ephemeral container filesystem here (no volume mounted at $HOME), so
+      # every container recreate minted a FRESH signing keypair and silently
+      # invalidated every previously-issued device JWT — the runner's WS auth
+      # then failed against the web backend's cached (now-stale) JWKS,
+      # producing an endless "Reconnecting…" loop that looked unrelated to
+      # pairing. Point it at the already-persistent coord-mirrors volume
+      # instead of minting a new volume for one small file.
+      COORD_JWT_KEY_PATH: ${COORD_JWT_KEY_PATH:-/var/lib/qontinui-coord/mirrors/.coord-jwt-ed25519.pkcs8}
       GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
       # Strategy Phase 1 service-account JWT bridge — coord mints/verifies
       # JWTs for qontinui-web's StrategyClient. Unset = 503 on
