@@ -719,6 +719,18 @@ services:
       # qontinui-coord 31028596). Classifying either is a prod decision:
       # change the taskdef, then mirror it here.
       COORD_OIDC_NONINTERACTIVE_AUDIENCES: ${COORD_OIDC_NONINTERACTIVE_AUDIENCES:-6k0mt7h1gk4raam66bpkcnlo9f,tb0epbojige1900ipu6q80j6b,7sirquecq6svomsoe34pblfp24}
+      # The DECLARED interactive-on-purpose half: password-mintable clients
+      # that stay interactive by recorded decision. OBSERVER-ONLY — coord's
+      # auth observer reports them under machine_mintable_declared_interactive
+      # instead of raising the critical auth-client-aud-wiring alert; token
+      # authority is still decided by the non-interactive set alone
+      # (auth_sso.rs interactive_mintable_audiences). Each entry is
+      # <client_id>:<FLOW>[+<FLOW>] and exempts the client only while its live
+      # password-mintable flows stay within the declared ones — a flow added
+      # later negates again. headless-ops is declared here per f1ae10a2 (admin
+      # flow only); the runner client stays undeclared (and so still alerts)
+      # until it is classified. Mirrors the taskdef verbatim.
+      COORD_OIDC_INTERACTIVE_MINTABLE_AUDIENCES: ${COORD_OIDC_INTERACTIVE_MINTABLE_AUDIENCES:-6j1gc0r988qu1g6qaou0pb4isb:ALLOW_ADMIN_USER_PASSWORD_AUTH}
       # New operators (by Cognito sub) auto-join this tenant on first
       # successful local-coord login — this is local-dev-only state,
       # independent of any production tenant membership. Matches the
