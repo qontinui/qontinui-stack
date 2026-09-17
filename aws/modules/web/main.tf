@@ -289,9 +289,12 @@ data "aws_iam_policy_document" "task_cognito_linking" {
   # AdminCreateUser with MessageAction=RESEND emails the invitation. The
   # backend refuses it to non-superusers, because the pool's PreSignUp
   # allowlist (the invite-only gate) exempts PreSignUp_AdminCreateUser.
-  # A grant that fails after a fresh create is undone with AdminDeleteUser,
-  # which the linking statement above already carries. A SEPARATE statement
-  # so the account-creation surface is independently auditable.
+  # Nothing is deleted on a failed grant — a created-but-ungranted account is
+  # inert, and deleting it could remove one a concurrent request just
+  # invited — so this flow needs no delete permission of its own; the
+  # linking statement's AdminDeleteUser above is for federated-takeover
+  # cleanup, unrelated to this one. A SEPARATE statement so the
+  # account-creation surface is independently auditable.
   statement {
     sid = "CognitoInviteByEmail"
     actions = [
