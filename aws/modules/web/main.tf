@@ -282,6 +282,23 @@ data "aws_iam_policy_document" "task_cognito_linking" {
     ]
     resources = [var.cognito_user_pool_arn]
   }
+
+  # Invite-by-email grant. `POST /operations/coord/tenant-members` lets a
+  # platform superuser add somebody with no account: AdminCreateUser with
+  # MessageAction=SUPPRESS creates it, the coord grant is made, then
+  # AdminCreateUser with MessageAction=RESEND emails the invitation. The
+  # backend refuses it to non-superusers, because the pool's PreSignUp
+  # allowlist (the invite-only gate) exempts PreSignUp_AdminCreateUser.
+  # A grant that fails after a fresh create is undone with AdminDeleteUser,
+  # which the linking statement above already carries. A SEPARATE statement
+  # so the account-creation surface is independently auditable.
+  statement {
+    sid = "CognitoInviteByEmail"
+    actions = [
+      "cognito-idp:AdminCreateUser",
+    ]
+    resources = [var.cognito_user_pool_arn]
+  }
 }
 
 resource "aws_iam_role_policy" "task_cognito_linking" {
