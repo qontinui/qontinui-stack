@@ -713,11 +713,18 @@ services:
       # client web's spec-CI / E2E use — to full WRITE authority. Two
       # password-mintable clients stay interactive in prod and so here:
       # headless-ops by recorded decision (qontinui-coord f1ae10a2 — admin
-      # flow only, IAM-gated), and the runner client
-      # 67f2a1a0cmgileob23lniud5t7, which allows public USER_PASSWORD_AUTH and
-      # was never classified (it joined the audience later, for a read —
-      # qontinui-coord 31028596). Classifying either is a prod decision:
-      # change the taskdef, then mirror it here.
+      # flow only, IAM-gated; now expressed below via
+      # COORD_OIDC_INTERACTIVE_MINTABLE_AUDIENCES rather than left
+      # unclassified), and the runner client 67f2a1a0cmgileob23lniud5t7,
+      # which allows public USER_PASSWORD_AUTH and is still unclassified here
+      # (it joined the audience later, for a read — qontinui-coord 31028596).
+      # Answered by policy (qontinui-coord question 9c987ab8, Answer 1: keep
+      # interactive) — add it to COORD_OIDC_INTERACTIVE_MINTABLE_AUDIENCES
+      # below as `,67f2a1a0cmgileob23lniud5t7:ALLOW_USER_PASSWORD_AUTH` once
+      # the flow-scoped carve-out parser lands (qontinui-coord PR #2194;
+      # entries declared before the parser ships are silently ignored, so
+      # sequencing after it is required, not just tidy). Same change to
+      # deploy/taskdef.json first, then mirror it here.
       COORD_OIDC_NONINTERACTIVE_AUDIENCES: ${COORD_OIDC_NONINTERACTIVE_AUDIENCES:-6k0mt7h1gk4raam66bpkcnlo9f,tb0epbojige1900ipu6q80j6b,7sirquecq6svomsoe34pblfp24}
       # The DECLARED interactive-on-purpose half: password-mintable clients
       # that stay interactive by recorded decision. OBSERVER-ONLY — coord's
@@ -729,7 +736,9 @@ services:
       # password-mintable flows stay within the declared ones — a flow added
       # later negates again. headless-ops is declared here per f1ae10a2 (admin
       # flow only); the runner client stays undeclared (and so still alerts)
-      # until it is classified. Mirrors the taskdef verbatim.
+      # until qontinui-coord PR #2194 lands and this is updated per the
+      # decided answer to question 9c987ab8 (see COORD_OIDC_AUDIENCE comment
+      # above). Mirrors the taskdef verbatim.
       COORD_OIDC_INTERACTIVE_MINTABLE_AUDIENCES: ${COORD_OIDC_INTERACTIVE_MINTABLE_AUDIENCES:-6j1gc0r988qu1g6qaou0pb4isb:ALLOW_ADMIN_USER_PASSWORD_AUTH}
       # New operators (by Cognito sub) auto-join this tenant on first
       # successful local-coord login — this is local-dev-only state,
