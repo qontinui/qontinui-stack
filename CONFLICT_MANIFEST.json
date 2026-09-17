@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "base_sha": "8b573ee4466078f4f5c9f9ad7b51c8e8aaeb9506",
+  "ours_sha": "356dbc1bc7f06c4a095f30f9c4d7ea17c0dd35f2",
+  "theirs_sha": "a9faec8f93d70233866a901eea9f7b0cb9713aff",
+  "entries": [
+    {
+      "path": "docker-compose.yml",
+      "base_oid": "d3841dc5955ba89fbc9bc2f26c6747130beb8e3a",
+      "ours_oid": "3aecd59e00a0fa491d2d355812c411da4d477fb4",
+      "theirs_oid": "67cd4a971e8c015296ff30ac0ec28e09a0156cd9",
+      "base_path": "docker-compose.yml.base",
+      "ours_path": "docker-compose.yml.ours",
+      "theirs_path": "docker-compose.yml.theirs",
+      "hunks": [
+        "<<<<<<< HEAD\n      # flow only, IAM-gated; now expressed below via\n      # COORD_OIDC_INTERACTIVE_MINTABLE_AUDIENCES rather than left\n      # unclassified), and the runner client 67f2a1a0cmgileob23lniud5t7,\n      # which allows public USER_PASSWORD_AUTH and is still unclassified here\n      # (it joined the audience later, for a read — qontinui-coord 31028596).\n      # Answered by policy (qontinui-coord question 9c987ab8, Answer 1: keep\n      # interactive) — add it to COORD_OIDC_INTERACTIVE_MINTABLE_AUDIENCES\n      # below as `,67f2a1a0cmgileob23lniud5t7:ALLOW_USER_PASSWORD_AUTH` once\n      # the flow-scoped carve-out parser lands (qontinui-coord PR #2194;\n      # entries declared before the parser ships are silently ignored, so\n      # sequencing after it is required, not just tidy). Same change to\n      # deploy/taskdef.json first, then mirror it here.\n=======\n      # flow only, IAM-gated), and the runner client\n      # 67f2a1a0cmgileob23lniud5t7, which allows public USER_PASSWORD_AUTH —\n      # it joined the audience later, for a read (qontinui-coord 31028596),\n      # and stayed interactive by recorded decision (question 9c987ab8\n      # Answer 1). Reclassifying either is a prod decision: change the\n      # taskdef, then mirror it here.\n>>>>>>> 356dbc1 (feat(stack): mirror the runner-client interactive-mintable declaration)\n",
+        "<<<<<<< HEAD\n      # flow only); the runner client stays undeclared (and so still alerts)\n      # until qontinui-coord PR #2194 lands and this is updated per the\n      # decided answer to question 9c987ab8 (see COORD_OIDC_AUDIENCE comment\n      # above). Mirrors the taskdef verbatim.\n      COORD_OIDC_INTERACTIVE_MINTABLE_AUDIENCES: ${COORD_OIDC_INTERACTIVE_MINTABLE_AUDIENCES:-6j1gc0r988qu1g6qaou0pb4isb:ALLOW_ADMIN_USER_PASSWORD_AUTH}\n=======\n      # flow only); the runner client is declared per question 9c987ab8\n      # Answer 1 (keep interactive), public password flow only. Mirrors the\n      # taskdef verbatim.\n      COORD_OIDC_INTERACTIVE_MINTABLE_AUDIENCES: ${COORD_OIDC_INTERACTIVE_MINTABLE_AUDIENCES:-6j1gc0r988qu1g6qaou0pb4isb:ALLOW_ADMIN_USER_PASSWORD_AUTH,67f2a1a0cmgileob23lniud5t7:ALLOW_USER_PASSWORD_AUTH}\n>>>>>>> 356dbc1 (feat(stack): mirror the runner-client interactive-mintable declaration)\n"
+      ]
+    }
+  ]
+}
