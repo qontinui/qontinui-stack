@@ -95,6 +95,26 @@ variable "cognito_user_pool_arn" {
   description = "ARN of the (manually-managed, NOT-in-Terraform) Cognito user pool the web task administers for cross-IdP account linking. The web task role is granted admin user-management cognito-idp actions scoped to ONLY this pool ARN. Pool us-east-1_rgTB9dbZ1 lives in us-east-1/047719635665 and is referenced by ARN, never imported."
 }
 
+variable "ses_sender_identity_arn" {
+  type        = string
+  description = "ARN of the (manually-managed, NOT-in-Terraform) SES identity the web task sends transactional mail from. The task role is granted ses:SendEmail scoped to ONLY this identity. The domain identity staging.qontinui.io lives in us-east-1/047719635665 with DKIM verified; it is referenced by ARN, never imported."
+
+  validation {
+    # The identity's region, var.region and the container's AWS_REGION are three
+    # independent values that agree today only because each defaults to
+    # us-east-1. Nothing downstream notices a divergence: the boto3 client is
+    # built for AWS_REGION, the grant is scoped to an ARN in another, and the
+    # first symptom is an AccessDenied on a live send. Pin it at plan time.
+    condition     = can(regex("^arn:aws:ses:${var.region}:[0-9]{12}:identity/", var.ses_sender_identity_arn))
+    error_message = "ses_sender_identity_arn must be an SES identity ARN in var.region — the container's AWS_REGION is set from var.region, and a client in one region cannot use an identity granted in another."
+  }
+}
+
+variable "ses_from_email" {
+  type        = string
+  description = "Source address for transactional mail (the backend's SMTP_FROM_EMAIL). It MUST be an address under the domain of var.ses_sender_identity_arn: the grant is resource-scoped to that identity, so anything else is AccessDenied by IAM. The backend's own default (noreply@qontinui.com) is not a verified identity in this account, which is why leaving this unset is not an option."
+}
+
 # Email address of the bootstrap superuser. qontinui-web's
 # backend/app/db/init_db.py seeds the FIRST superuser at app startup — but only
 # when FIRST_SUPERUSER_EMAIL is set; unset, the seed is inert and a deployed
@@ -231,10 +251,15 @@ resource "aws_iam_role_policy" "task_exec_secrets" {
   policy = data.aws_iam_policy_document.task_exec_secrets.json
 }
 
-# Task role: web has no S3/SES/SQS needs at staging (cloud-control's Stripe
-# + SES paths are off until billing/email is wired). Carries ONLY the
-# cross-IdP account-linking grant below; extend when storage/email backends
-# move to AWS-native.
+# Task role. Three inline grants hang off it, each its own policy so each
+# surface is independently auditable: Cognito user/group administration
+# (task_cognito_linking), the ECS Exec SSM channel (task_ecs_exec), and
+# outbound transactional email (task_ses_send). No S3 or SQS grant -- storage
+# is local-filesystem-in-container at this environment and there is no queue;
+# extend when either moves to AWS-native. This comment used to say the role
+# carried ONLY the Cognito grant and that the SES path was off until email was
+# wired. Email got wired and the comment went stale for months, so if it ever
+# disagrees with the policies below again, the policies are the answer.
 resource "aws_iam_role" "task" {
   name               = "qontinui-${var.environment}-web-task"
   assume_role_policy = data.aws_iam_policy_document.ecs_assume.json
@@ -308,6 +333,42 @@ resource "aws_iam_role_policy" "task_cognito_linking" {
   name   = "qontinui-${var.environment}-web-cognito-linking"
   role   = aws_iam_role.task.id
   policy = data.aws_iam_policy_document.task_cognito_linking.json
+}
+
+# Transactional email (SES). What actually sends through
+# EmailTransportService: org invitations and project-share notices
+# (app/services/collaboration/sharing_service.py), notification mail
+# (app/services/notifications/email.py), device-verification mail
+# (app/api/v1/endpoints/auth/helpers.py, via the worker queue), beta feedback,
+# and the tenant-member notices from /operations/coord/tenant-members. NOT
+# password resets: Cognito is the sole authenticator and sends those itself
+# from the pool's own EmailConfiguration, never through this role.
+#
+# ONE action, because the backend makes exactly one SES call --
+# `ses_client.send_email(Source=..., Destination=..., Message=...)`, the v1
+# formatted SendEmail. The MIME builder in that same module feeds `aiosmtplib`
+# on the SMTP branch and never reaches SES, so ses:SendRawEmail would be a
+# permission for a code path that does not exist. Add it in the same change
+# that adds the caller, not before.
+#
+# Resource-scoped to the single verified identity, so a Source outside that
+# domain is AccessDenied by IAM before SES sees the request. Kept as its own
+# role policy, separate from the Cognito one, so the outbound-mail surface is
+# independently auditable.
+data "aws_iam_policy_document" "task_ses_send" {
+  statement {
+    sid = "SesSendTransactionalEmail"
+    actions = [
+      "ses:SendEmail",
+    ]
+    resources = [var.ses_sender_identity_arn]
+  }
+}
+
+resource "aws_iam_role_policy" "task_ses_send" {
+  name   = "qontinui-${var.environment}-web-ses-send"
+  role   = aws_iam_role.task.id
+  policy = data.aws_iam_policy_document.task_ses_send.json
 }
 
 # ECS Exec (SSM Session Manager) — mirrors modules/coord's task_ecs_exec.
@@ -407,7 +468,18 @@ resource "aws_ecs_task_definition" "web" {
         { name = "BACKEND_CORS_ORIGIN_REGEX", value = var.backend_cors_origin_regex },
         { name = "REDIS_ENABLED", value = "true" },
         { name = "RATE_LIMIT_ENABLED", value = "true" },
-        { name = "USE_SES_API", value = "false" },
+        # Transactional email goes through the SES API rather than SMTP. The
+        # grant is aws_iam_role_policy.task_ses_send above.
+        { name = "USE_SES_API", value = "true" },
+        # Spelled out rather than left to the backend's own us-east-1 default.
+        # boto3 reads this for every client in the container, not just SES, and
+        # the variable validation above pins the identity ARN to the same
+        # region — the two halves of one assertion.
+        { name = "AWS_REGION", value = var.region },
+        # Source address. Must sit under the verified SES identity: the
+        # backend's default (noreply@qontinui.com) is not verified in this
+        # account, so every send would come back MessageRejected.
+        { name = "SMTP_FROM_EMAIL", value = var.ses_from_email },
         # Storage: local-filesystem-in-container for staging. Persists for the
         # container's lifetime; resets on task replacement. S3 is the future
         # direction; not blocking for two-account Strategy smoke.
@@ -514,7 +586,7 @@ resource "aws_ecs_service" "web" {
 
   # TF/CI seam. Terraform owns the canonical task-def DEFINITION
   # (aws_ecs_task_definition.web above: cpu/memory/env/secrets/health/IAM/log)
-  # and all provisioning. CI (qontinui-web/.github/workflows/staging-web-deploy.yml)
+  # and all provisioning. CI (qontinui-web/.github/workflows/deploy-web.yml)
   # owns DEPLOYMENT: it `describe-task-definition`s THIS family's latest revision
   # (inheriting the canonical definition here), swaps in the freshly-built
   # SHA-pinned image, registers a new revision, and points the service at it.

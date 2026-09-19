@@ -97,7 +97,7 @@ variable "web_image_uri" {
   description = <<-EOT
     ECR URI of the qontinui-web-backend image, used to render
     module.web's aws_ecs_task_definition.web. Ongoing deploys do NOT come from
-    here: CI (qontinui-web/.github/workflows/staging-web-deploy.yml) describes
+    here: CI (qontinui-web/.github/workflows/deploy-web.yml) describes
     this family's latest revision, swaps in the SHA-pinned image it just built,
     and registers a new one — see the TF/CI seam comment in modules/web/main.tf.
 
@@ -154,6 +154,33 @@ variable "cognito_user_pool_arn" {
   EOT
   type        = string
   default     = "arn:aws:cognito-idp:us-east-1:047719635665:userpool/us-east-1_rgTB9dbZ1"
+}
+
+# ─── Transactional email (SES) ───────────────────────────────────────────
+
+variable "ses_sender_identity_arn" {
+  description = <<-EOT
+    ARN of the SES identity the web task sends transactional mail from. Like the
+    Cognito pool above, this identity is MANUALLY managed and intentionally NOT
+    in Terraform (never imported) — it is referenced by ARN only. The web ECS
+    task role's ses:SendEmail grant scopes to this ARN and nothing else, so a
+    Source outside the identity is AccessDenied by IAM before SES sees it.
+    staging.qontinui.io is domain-verified with DKIM in us-east-1/047719635665,
+    and the account has SES production access (no sandbox recipient list).
+  EOT
+  type        = string
+  default     = "arn:aws:ses:us-east-1:047719635665:identity/staging.qontinui.io"
+}
+
+variable "ses_from_email" {
+  description = <<-EOT
+    Source address for transactional mail — reaches the backend as
+    SMTP_FROM_EMAIL. MUST be under the domain of ses_sender_identity_arn. This
+    is the same address the Cognito invitation template already sends from, so
+    an invited user sees one sender across the invite and every later notice.
+  EOT
+  type        = string
+  default     = "no-reply@staging.qontinui.io"
 }
 
 # signup_allowlist is no longer a variable. It moved to SSM

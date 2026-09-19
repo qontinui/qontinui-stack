@@ -272,6 +272,11 @@ module "web" {
   # to ONLY this ARN inside the web module.
   cognito_user_pool_arn = var.cognito_user_pool_arn
 
+  # Transactional email: the web task sends through the SES API, scoped to this
+  # one manually-managed identity, from an address under its domain.
+  ses_sender_identity_arn = var.ses_sender_identity_arn
+  ses_from_email          = var.ses_from_email
+
   # Bootstrap superuser seeded by web's init_db at startup. This is the
   # non-HTTP first-admin path — the deployed environment's only way to reach a
   # superuser once the unauthenticated bootstrap routes are deleted.
