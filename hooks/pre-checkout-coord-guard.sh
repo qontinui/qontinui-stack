@@ -68,7 +68,18 @@
 #   one-off interactive use). Logged so the bypass is auditable.
 #
 # Endpoint usage
-#   GET <COORD_URL>/coord/claims/by-resource?kind=worktree&key=<urlenc>
+#   GET  <COORD_URL>/coord/claims/by-resource?kind=worktree&key=<urlenc>
+#        the claim check (the only thing that can produce a verdict).
+#   POST <COORD_URL>/coord/trees/branch-events
+#        branch-provenance OBSERVATION, added by plan
+#        `2026-08-28-shared-checkout-branch-provenance-and-reclaim-signal`
+#        (Phase 3). Bearer-less and device-scoped, mirroring
+#        `POST /coord/trees/upsert` - this hook must work with no runner up, so
+#        there is no JWT to mint. Fired only for a branch CREATE/SWITCH in a
+#        primary/shared checkout (never inside `agent-worktrees/`, which already
+#        reports via `POST /agents/allocate`), only when the guarded command is
+#        supplied via `--command` / $GIT_GUARD_COMMAND, in the BACKGROUND with
+#        both fds detached, and it NEVER changes this script's exit code.
 #
 # Robustness - every error path FAILS OPEN (warn + exit 0):
 #   missing curl/git target, coord unreachable, HTTP 4xx/5xx, bad JSON,
@@ -76,6 +87,8 @@
 #
 # Exit codes
 #   0  - allow (held by us / fail-open / skip / not-a-git-tree / warn-only)
+#        The branch-events POST has NO exit code of its own - it is telemetry,
+#        and every one of its failure modes lands in this same arm.
 #   1  - block (enforce mode AND a real conflict: no claim, peer, or foreign)
 #   2  - usage error (git not on PATH)
 # ----------------------------------------------------------------------------
@@ -93,8 +106,12 @@ on_unexpected_exit() {
 }
 trap on_unexpected_exit EXIT
 
-# ---- arg parse: --cwd <dir> ------------------------------------------------
+# ---- arg parse: --cwd <dir> / --command <cmd> ------------------------------
 arg_cwd=""
+# The git command line being guarded. OBSERVATION-ONLY input: it feeds the
+# branch-provenance POST below and nothing else - no claim decision, no exit
+# code, reads it. Absent -> that POST is simply not made.
+arg_command=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --cwd)
@@ -103,6 +120,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --cwd=*)
       arg_cwd="${1#--cwd=}"
+      shift
+      ;;
+    --command)
+      arg_command="${2:-}"
+      shift 2 || shift
+      ;;
+    --command=*)
+      arg_command="${1#--command=}"
       shift
       ;;
     *)
@@ -217,6 +242,12 @@ normalize_resource_key() {
   p="${p,,}"        # lowercase (matches the runner's .to_lowercase())
   printf '%s' "$p"
 }
+# Keep the pre-normalized basename: `coord.primary_trees.repo` stores the
+# directory name verbatim (qontinui-runner fleet.rs:1882
+# `repo_path.file_name()`), and the branch-provenance POST below joins to that
+# table by `(repo, branch)`. normalize_resource_key() lowercases for the CLAIM
+# lookup key only.
+tree_repo_name="${canonical_path##*/}"
 canonical_path="$(normalize_resource_key "$canonical_path" 2>/dev/null || printf '%s' "$canonical_path")"
 
 # ---- resolve caller identity (machine_id + session_id) --------------------
@@ -275,6 +306,207 @@ coord_url="${coord_url%/ws}"
 coord_url="${coord_url/#wss:/https:}"
 coord_url="${coord_url/#ws:/http:}"
 coord_url="${coord_url%/}"
+
+# ---- branch-provenance observation (plan 2026-08-28, Phase 3) --------------
+# ONE fail-open POST beside the claim GET above. It records the FACT that a
+# branch was created/switched to in a primary/shared checkout, so coord can
+# later join it to `repo_branches`/`pr_events` and answer "whose branch is this
+# and did its PR ever conclude" - the archaeology (`git reflog` + `gh pr view`)
+# that plan's provenance section describes doing by hand.
+#
+#   POST <coord>/coord/trees/branch-events
+#   { "device_id", "repo", "branch", "agent_session_id"?, "created_via" }
+#
+# The route is BEARER-LESS and device-scoped on purpose, mirroring
+# `POST /coord/trees/upsert` (the runner's tree publisher, fleet.rs:3070, which
+# coord serves with no bearer - see routes.rs:2512 and its tenant_scope note).
+# This hook has to work with no runner up, so there is no JWT to mint. Send no
+# Authorization header.
+#
+# THIS IS OBSERVATION, NEVER A GATE. It adds no refuse path and no exit code.
+# Every failure - no command to classify, an allocated worktree, a coord 404,
+# an unreachable coord - lands in the same fail-open shape the GET arms use:
+# a breadcrumb and nothing else. The session never sees an error from it.
+#
+# `repo` is the working-tree directory BASENAME, matching what the runner's
+# publisher stores in `coord.primary_trees.repo`
+# (fleet.rs:1882 `repo_path.file_name()`), so the two tables join.
+
+# The command being guarded. The guard does not run git and is not handed the
+# argv, so without this it cannot know (a) whether the op is branch-mutating at
+# all and (b) which branch is being switched TO - `git rev-parse HEAD` runs
+# BEFORE the checkout and would report the branch being left. Sources:
+#   1. `--command <cmd>` / `--command=<cmd>`
+#   2. $GIT_GUARD_COMMAND
+# Absent -> NO EVENT. Per the plan's own risk note that reads as UNKNOWN, never
+# as "nobody checked anything out"; the guard's legacy inline callers (the
+# `hooks/README.md` shell functions) pass no command and are unchanged.
+guard_command="$arg_command"
+if [[ -z "$guard_command" ]]; then
+  guard_command="${GIT_GUARD_COMMAND:-}"
+fi
+
+# Split a shell command into segments on UNQUOTED `&& || ; | &`, so a verb
+# inside a quoted argument (`git commit -m "git checkout -b x"`) cannot be
+# mistaken for the command itself. Same char-walk shape as urlencode() below.
+split_command_segments() {
+  # NOT one `local ... len=${#s}` line: bash expands every word of the `local`
+  # builtin BEFORE running it, so `${#s}` would read the (unset) GLOBAL `s` and
+  # abort under `set -u`.
+  local s="$1" out="" q="" c i len
+  len=${#s}
+  for (( i = 0; i < len; i++ )); do
+    c="${s:$i:1}"
+    if [[ -n "$q" ]]; then
+      out+="$c"
+      [[ "$c" == "$q" ]] && q=""
+      continue
+    fi
+    case "$c" in
+      \'|\") q="$c"; out+="$c" ;;
+      '&'|'|'|';'|$'\n') out+=$'\n' ;;
+      *) out+="$c" ;;
+    esac
+  done
+  printf '%s\n' "$out"
+}
+
+dequote() {
+  local t="$1"
+  t="${t%\"}"; t="${t#\"}"
+  t="${t%\'}"; t="${t#\'}"
+  printf '%s' "$t"
+}
+
+# Is $1 plausibly a BRANCH name being created/switched to (vs a commit-ish,
+# a pathspec, or a flag)? Conservative: when in doubt, emit nothing.
+looks_like_branch() {
+  local b="$1"
+  [[ -n "$b" ]] || return 1
+  [[ "$b" == -* ]] && return 1
+  case "$b" in
+    .|..|-|HEAD|FETCH_HEAD|ORIG_HEAD|MERGE_HEAD) return 1 ;;
+  esac
+  # `~` `^` `:` never appear in a refname; they mark a revision expression.
+  [[ "$b" == *[~^:]* ]] && return 1
+  # A raw object id (`git checkout 9763836e`) detaches HEAD - not a branch.
+  [[ "$b" =~ ^[0-9a-fA-F]{7,40}$ ]] && return 1
+  return 0
+}
+
+# Emit the branch a `git checkout`/`git switch` segment creates or switches to,
+# or nothing. Deliberately silent for every op class the shim calls
+# `tree_disturb` (`checkout .`, `checkout -- <path>`, `pull`, `rebase`,
+# `stash pop|apply`) and for `reset --hard`: none of those create or switch a
+# branch, so none of them is a provenance event.
+branch_target_from_command() {
+  local seg tok verb branch
+  local -a toks
+  while IFS= read -r seg; do
+    # shellcheck disable=SC2206  # deliberate word-split of a shell segment
+    toks=( $seg )
+    (( ${#toks[@]} )) || continue
+    local i=0
+    # Leading `VAR=value` assignments (`GIT_GUARD_CWD=x git switch y`).
+    while (( i < ${#toks[@]} )) && [[ "${toks[$i]}" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; do
+      i=$(( i + 1 ))
+    done
+    [[ "${toks[$i]:-}" == "git" ]] || continue
+    i=$(( i + 1 ))
+    # git's own global options, incl. the value-taking ones the shim's
+    # classifier also skips (`-C <dir>`, `-c <k=v>`, `--git-dir`, ...).
+    while (( i < ${#toks[@]} )) && [[ "${toks[$i]}" == -* ]]; do
+      case "${toks[$i]}" in
+        -C|-c|--git-dir|--work-tree|--namespace|--exec-path) i=$(( i + 2 )) ;;
+        *) i=$(( i + 1 )) ;;
+      esac
+    done
+    verb="${toks[$i]:-}"
+    [[ "$verb" == "checkout" || "$verb" == "switch" ]] || continue
+    i=$(( i + 1 ))
+    branch=""
+    while (( i < ${#toks[@]} )); do
+      tok="$(dequote "${toks[$i]}")"
+      case "$tok" in
+        # A pathspec separator makes this a working-tree restore, not a
+        # branch move. Same call the shim's classifier makes.
+        --) branch=""; break ;;
+        --detach|--orphan=*|--patch|-p) branch=""; break ;;
+        # The create forms: the branch is the NEXT token.
+        -b|-B|-c|-C|--orphan|--create|--force-create)
+          branch="$(dequote "${toks[$(( i + 1 ))]:-}")"
+          break
+          ;;
+        # Value-taking options that are not the branch.
+        --conflict|--pathspec-from-file|--start-point|-t|--track)
+          i=$(( i + 2 ))
+          continue
+          ;;
+        -*) i=$(( i + 1 )); continue ;;
+        *) branch="$tok"; break ;;
+      esac
+    done
+    if looks_like_branch "$branch"; then
+      printf '%s' "$branch"
+      return 0
+    fi
+  done < <(split_command_segments "$1")
+  return 1
+}
+
+# Minimal JSON string escaping. Refname rules forbid most of what would need
+# escaping, but the path/repo halves are filesystem-derived.
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '%s' "$s"
+}
+
+# Fires in the BACKGROUND with both fds detached, so the POST costs the session
+# no wall-clock time and cannot hold the caller's stdout pipe open (the Claude
+# Code shim reads this guard through a command substitution). The child writes
+# its own breadcrumb, so the outcome is still recorded.
+post_branch_event() {
+  local url="$1" body="$2" repo="$3" branch="$4" code=""
+  trap - EXIT
+  code="$(curl -sS -m 3 -o /dev/null -w '%{http_code}' \
+      -X POST -H 'Content-Type: application/json' \
+      --data-binary "$body" "$url" 2>/dev/null)" || code=""
+  log_breadcrumb "EVENT reason=branch-event-posted key=$canonical_path repo=$repo branch=$branch http=${code:-unreachable}"
+}
+
+if [[ -n "$guard_command" ]]; then
+  branch_target="$(branch_target_from_command "$guard_command" || true)"
+  if [[ -z "$branch_target" ]]; then
+    # Not a branch create/switch (tree_disturb, `reset --hard`, a pathspec
+    # restore, a detaching checkout). No event, no network call.
+    log_breadcrumb "EVENT reason=branch-event-skipped-not-branch-mut key=$canonical_path"
+  elif [[ "$canonical_path" == */agent-worktrees/* || "$canonical_path" == */.agent-worktrees/* ]]; then
+    # A coord-ALLOCATED worktree already reports its branch through
+    # `POST /agents/allocate` (`coord.agent_worktrees.branch`). Emitting here
+    # too would double-count the same checkout in two tables - a correctness
+    # bug, not just noise. This table is for the path that has nothing (plan
+    # D5). `canonical_path` is already lowercased by normalize_resource_key.
+    log_breadcrumb "EVENT reason=branch-event-skipped-allocated-worktree key=$canonical_path branch=$branch_target"
+  else
+    # Un-lowercased basename: `primary_trees.repo` stores exactly this
+    # (fleet.rs:1882), and normalize_resource_key() lowercases only the
+    # claim-lookup key.
+    event_repo="${tree_repo_name:-${canonical_path##*/}}"
+    event_body="{\"device_id\":\"$(json_escape "$machine_id")\""
+    event_body+=",\"repo\":\"$(json_escape "$event_repo")\""
+    event_body+=",\"branch\":\"$(json_escape "$branch_target")\""
+    if [[ -n "$session_id" ]]; then
+      event_body+=",\"agent_session_id\":\"$(json_escape "$session_id")\""
+    fi
+    event_body+=",\"created_via\":\"checkout_guard_observed\"}"
+    {
+      post_branch_event "$coord_url/coord/trees/branch-events" \
+        "$event_body" "$event_repo" "$branch_target" &
+    } </dev/null >/dev/null 2>&1
+  fi
+fi
 
 # ---- urlencode the path ----------------------------------------------------
 urlencode() {
