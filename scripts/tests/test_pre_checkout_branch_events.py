@@ -187,6 +187,12 @@ def _breadcrumbs(env) -> str:
         ("cd /somewhere && git switch -c feat/three", "feat/three"),
         ("git -C /somewhere checkout -b feat/four", "feat/four"),
         ("git fetch origin && git checkout -b feat/five origin/main", "feat/five"),
+        # Redirections are not operands. The shim forwards the Bash tool's
+        # command verbatim, and `>/dev/null 2>&1` is a form agents write
+        # constantly - counting it as a second operand silenced a real switch.
+        ("git checkout main >/dev/null", "main"),
+        ("git checkout main 2>&1", "main"),
+        ("git switch feat/x >/dev/null 2>&1", "feat/x"),
     ],
 )
 def test_branch_create_in_primary_tree_emits_exactly_one_event(env, command, branch):
@@ -271,6 +277,9 @@ def test_allocated_worktree_emits_no_event(env):
         # The same restore without the `--` separator: two operands mean a
         # pathspec, not a branch move.
         "git checkout main src/foo.c",
+        # The paths live in a file rather than inline; still a restore.
+        "git checkout --pathspec-from-file=list.txt main",
+        "git checkout --pathspec-from-file list.txt main",
     ],
 )
 def test_non_branch_creating_ops_emit_no_event(env, command):

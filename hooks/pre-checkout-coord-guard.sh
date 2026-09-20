@@ -444,8 +444,15 @@ branch_target_from_command() {
       tok="$(dequote "${toks[$i]}")"
       case "$tok" in
         # A pathspec separator makes this a working-tree restore, not a
-        # branch move. Same call the shim's classifier makes.
+        # branch move. The guard is deliberately STRICTER than the shim here:
+        # the shim's regex only matches `checkout` followed IMMEDIATELY by
+        # `--`/`.`, so it classifies `git checkout main -- a` as branch_mut and
+        # runs this guard unconditionally. That is why the restore reached this
+        # classifier at all, on a clean tree as well as a dirty one.
         --) has_pathspec=1; break ;;
+        # `--pathspec-from-file` names the paths in a file instead of inline.
+        # Still a restore, and still not a branch move.
+        --pathspec-from-file=*|--pathspec-file-nul) has_pathspec=1; break ;;
         --detach|--orphan=*|--patch|-p) suppress=1; break ;;
         # The create forms: the branch is the NEXT token.
         -b|-B|-c|-C|--orphan|--create|--force-create)
@@ -453,11 +460,32 @@ branch_target_from_command() {
           break
           ;;
         # Value-taking options that are not the branch.
-        --conflict|--pathspec-from-file|--start-point|-t|--track)
+        --pathspec-from-file)
+          has_pathspec=1
+          break
+          ;;
+        # Value-taking options that are not the branch. `-t`/`--track` are
+        # boolean in git and their operand IS a branch create - but the local
+        # branch git creates is the SHORT name (`x` from `origin/x`), which this
+        # parser cannot derive without knowing the remote names. Consuming the
+        # operand keeps it silent; emitting `origin/x` would write a branch that
+        # no `(repo, branch)` join can resolve. A missing row is UNKNOWN, a
+        # wrong row is corruption, so silence is the correct trade here.
+        --conflict|--start-point|-t|--track)
           i=$(( i + 2 ))
           continue
           ;;
         -*) i=$(( i + 1 )); continue ;;
+        # Shell redirections are NOT operands. `toks=( $seg )` word-splits raw
+        # command text, so `>/dev/null` arrives as a plain token - and the `&`
+        # split in split_command_segments leaves `2>` behind from `2>&1`.
+        # Counting either as a second operand silences a real
+        # `git checkout <branch> >/dev/null 2>&1`, which is a form agents write
+        # constantly and which the shim forwards verbatim.
+        [0-9]*'>'*|'>'*|'<'*)
+          i=$(( i + 1 ))
+          continue
+          ;;
         *)
           positionals=$(( positionals + 1 ))
           # NOT `[[ -z .. ]] && ..`: under `set -e` that list returns non-zero

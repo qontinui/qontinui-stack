@@ -157,7 +157,9 @@ Four things about it are load-bearing:
   shared checkout as parked on a finished branch when it is sitting on `main`
   doing nothing of the kind. The classifier therefore decides only after
   scanning the whole command: exactly one operand and no pathspec, or an
-  explicit `-b`/`-B`/`-c`/`-C`/`--orphan` create form.
+  explicit `-b`/`-B`/`-c`/`-C`/`--orphan`/`--create`/`--force-create` create
+  form. Shell redirections (`>/dev/null`, `2>&1`) are not operands and do not
+  suppress an otherwise-valid switch.
 
 It runs in the background with both file descriptors detached, so it costs the
 caller no wall-clock time and cannot hold a caller's stdout pipe open. Its
