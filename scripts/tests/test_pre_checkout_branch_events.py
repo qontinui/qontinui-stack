@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -35,6 +36,14 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GUARD = REPO_ROOT / "hooks" / "pre-checkout-coord-guard.sh"
+
+# Resolve the interpreter rather than spawning bare `"bash"`. On Windows,
+# CreateProcess searches System32 BEFORE $PATH, so a bare `"bash"` resolves to
+# the WSL launcher (`C:\Windows\System32ash.exe`) and every test here dies
+# with `Bash/Service/E_UNEXPECTED` before the guard runs a line. `shutil.which`
+# honours $PATH and finds the real shell. Same idiom the sibling suites already
+# use (`test_alembic_at_head.py`, `test_migrator_entrypoint.py`).
+_BASH = shutil.which("bash") or "bash"
 
 DEVICE_ID = "11111111-2222-3333-4444-555555555555"
 SESSION_ID = "sess-abc-123"
@@ -125,7 +134,7 @@ def _run(env, cwd: Path, command: str | None, **extra) -> subprocess.CompletedPr
         e["GIT_GUARD_COMMAND"] = command
     e.update(extra)
     return subprocess.run(
-        ["bash", str(GUARD)], env=e, capture_output=True, text=True, timeout=60
+        [_BASH, str(GUARD)], env=e, capture_output=True, text=True, timeout=60
     )
 
 
@@ -249,6 +258,19 @@ def test_allocated_worktree_emits_no_event(env):
         # A raw object id detaches HEAD; it names no branch.
         "git checkout 9763836e",
         "git switch --detach",
+        # Restoring paths FROM a branch is not switching TO it: HEAD never
+        # moves, so it is not a provenance event. The restore source is
+        # usually the default branch, so recording it manufactured a `main`
+        # row that Phase 4's `(repo, branch)` join then resolved against a
+        # concluded PR - a false "parked on a finished branch" advisory in
+        # Phase 6's `/preflight`.
+        "git checkout main -- a",
+        "git checkout main -- src/foo.c",
+        "git checkout origin/main -- a",
+        "git switch main -- a",
+        # The same restore without the `--` separator: two operands mean a
+        # pathspec, not a branch move.
+        "git checkout main src/foo.c",
     ],
 )
 def test_non_branch_creating_ops_emit_no_event(env, command):
@@ -278,7 +300,7 @@ def test_command_can_be_passed_as_an_argument(env):
     e = dict(env["base_env"])
     e["GIT_GUARD_CWD"] = str(repo)
     proc = subprocess.run(
-        ["bash", str(GUARD), "--command", "git checkout -b feat/argform"],
+        [_BASH, str(GUARD), "--command", "git checkout -b feat/argform"],
         env=e,
         capture_output=True,
         text=True,
@@ -311,7 +333,7 @@ def test_session_id_is_omitted_when_unknown(env):
     e["GIT_GUARD_CWD"] = str(repo)
     e["GIT_GUARD_COMMAND"] = "git checkout -b feat/nosession"
     proc = subprocess.run(
-        ["bash", str(GUARD)], env=e, capture_output=True, text=True, timeout=60
+        [_BASH, str(GUARD)], env=e, capture_output=True, text=True, timeout=60
     )
     assert proc.returncode == 0, proc.stderr
 

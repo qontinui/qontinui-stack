@@ -148,6 +148,16 @@ Four things about it are load-bearing:
 - **It fires only for a branch create/switch.** `git checkout .`,
   `git checkout -- <path>`, `pull`, `rebase`, `stash pop|apply` and
   `reset --hard` produce nothing: none of them creates or switches a branch.
+  Neither does a **restore of paths FROM a branch** — `git checkout main --
+  src/foo.c`, or the same without the `--` separator. Those name a branch as
+  the *source* to read a file out of; HEAD never moves, so they are not
+  provenance. Because the source is usually the default branch, recording them
+  would manufacture a `main` row that Phase 4's `(repo, branch)` join resolves
+  against a long-concluded PR, and Phase 6's `/preflight` would then report a
+  shared checkout as parked on a finished branch when it is sitting on `main`
+  doing nothing of the kind. The classifier therefore decides only after
+  scanning the whole command: exactly one operand and no pathspec, or an
+  explicit `-b`/`-B`/`-c`/`-C`/`--orphan` create form.
 
 It runs in the background with both file descriptors detached, so it costs the
 caller no wall-clock time and cannot hold a caller's stdout pipe open. Its

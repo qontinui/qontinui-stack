@@ -401,6 +401,7 @@ looks_like_branch() {
 # branch, so none of them is a provenance event.
 branch_target_from_command() {
   local seg tok verb branch
+  local create_branch first_positional positionals has_pathspec suppress
   local -a toks
   while IFS= read -r seg; do
     # shellcheck disable=SC2206  # deliberate word-split of a shell segment
@@ -425,16 +426,30 @@ branch_target_from_command() {
     [[ "$verb" == "checkout" || "$verb" == "switch" ]] || continue
     i=$(( i + 1 ))
     branch=""
+    # Scan the WHOLE post-verb segment before deciding, rather than returning
+    # on the first positional token. `git checkout <branch> -- <path>` and
+    # `git checkout <branch> <path>` are working-tree RESTORES: HEAD never
+    # moves, so neither is a provenance event. Stopping at the first positional
+    # reported the restore source as a checked-out branch - and because that
+    # source is usually `main`, it manufactured a default-branch row in
+    # `primary_tree_branch_events` that Phase 4's `(repo, branch)` join then
+    # resolved against a concluded PR. Deciding after the scan is what makes
+    # the `--` arm below actually reachable.
+    create_branch=""
+    first_positional=""
+    positionals=0
+    has_pathspec=0
+    suppress=0
     while (( i < ${#toks[@]} )); do
       tok="$(dequote "${toks[$i]}")"
       case "$tok" in
         # A pathspec separator makes this a working-tree restore, not a
         # branch move. Same call the shim's classifier makes.
-        --) branch=""; break ;;
-        --detach|--orphan=*|--patch|-p) branch=""; break ;;
+        --) has_pathspec=1; break ;;
+        --detach|--orphan=*|--patch|-p) suppress=1; break ;;
         # The create forms: the branch is the NEXT token.
         -b|-B|-c|-C|--orphan|--create|--force-create)
-          branch="$(dequote "${toks[$(( i + 1 ))]:-}")"
+          create_branch="$(dequote "${toks[$(( i + 1 ))]:-}")"
           break
           ;;
         # Value-taking options that are not the branch.
@@ -443,9 +458,30 @@ branch_target_from_command() {
           continue
           ;;
         -*) i=$(( i + 1 )); continue ;;
-        *) branch="$tok"; break ;;
+        *)
+          positionals=$(( positionals + 1 ))
+          # NOT `[[ -z .. ]] && ..`: under `set -e` that list returns non-zero
+          # once a positional is already recorded, and this function is only
+          # incidentally called where `-e` is suspended (`|| true`).
+          if [[ -z "$first_positional" ]]; then
+            first_positional="$tok"
+          fi
+          i=$(( i + 1 ))
+          continue
+          ;;
       esac
     done
+    if [[ -n "$create_branch" ]]; then
+      # An explicit create/force-create names the branch outright.
+      branch="$create_branch"
+    elif (( suppress == 0 && has_pathspec == 0 && positionals == 1 )); then
+      # `git checkout <branch>` / `git switch <branch>`: exactly one operand
+      # and no pathspec. Two or more operands is a restore
+      # (`git checkout main src/foo.c`), so it stays silent.
+      branch="$first_positional"
+    else
+      branch=""
+    fi
     if looks_like_branch "$branch"; then
       printf '%s' "$branch"
       return 0
