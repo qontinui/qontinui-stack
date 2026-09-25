@@ -344,6 +344,8 @@ module "observability" {
   coord_cluster_name   = module.coord.cluster_name
   coord_service_name   = module.coord.service_name
   coord_log_group_name = module.coord.log_group_name
+
+  postgres_instance_identifier = module.postgres.identifier
 }
 
 # ─── Operator-staged, out-of-region ─────────────────────────────────────

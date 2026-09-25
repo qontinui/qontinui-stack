@@ -152,6 +152,13 @@ output "port" {
   value = aws_db_instance.main.port
 }
 
+# The DB instance identifier (e.g. qontinui-staging): the DBInstanceIdentifier
+# dimension of AWS/RDS CloudWatch metrics and the source id of an RDS event
+# subscription. Consumed by the observability module's storage alarm.
+output "identifier" {
+  value = aws_db_instance.main.identifier
+}
+
 output "db_name" {
   value = var.db_name
 }

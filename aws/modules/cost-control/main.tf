@@ -46,10 +46,12 @@ resource "aws_sns_topic_subscription" "budget_email" {
   # confirmation link AWS emails them. Surface this to the operator.
 }
 
-# Account id for scoping the CloudWatch publish grant below.
+# Account id, region and partition for scoping the publish grants below.
 data "aws_caller_identity" "current" {}
+data "aws_region" "current" {}
+data "aws_partition" "current" {}
 
-# This topic carries TWO publishers, so the policy needs TWO statements.
+# This topic carries THREE publishers, so the policy needs THREE statements.
 # Setting an explicit aws_sns_topic_policy REPLACES SNS's default policy
 # (which would otherwise allow same-account principals to publish), so every
 # publisher must be granted EXPLICITLY here or its publish is silently denied.
@@ -63,6 +65,18 @@ data "aws_caller_identity" "current" {}
 #      the Action history — it had been broken since the alarms were created.)
 #      Scoped to this account's CloudWatch via aws:SourceAccount (least-priv;
 #      a foreign account's CloudWatch can't publish here).
+#   3. RDS events  — the observability module's aws_db_event_subscription
+#      (events.rds.amazonaws.com). SNS's default policy would have let RDS
+#      publish, but that default is exactly what this policy replaces, so
+#      without this statement RDS event delivery is silently denied. For RDS,
+#      aws:SourceArn is the SOURCE RESOURCE's ARN (the DB instance,
+#      `…:rds:<region>:<account>:db:<id>`), NOT the event subscription's
+#      `…:es:<name>` — the RDS User Guide, "Granting permissions to publish
+#      notifications to an Amazon SNS topic". An `es:*` condition would never
+#      match, so every event would be denied. Scoped to this account's DB
+#      instances in this region: aws:SourceAccount (confused-deputy guard) plus
+#      ArnLike on `db:*`. It is `db:*` rather than one instance id so that
+#      adding a source_id to the subscription does not silently lose delivery.
 data "aws_iam_policy_document" "budget_sns" {
   statement {
     sid       = "AllowBudgetsPublish"
@@ -88,6 +102,27 @@ data "aws_iam_policy_document" "budget_sns" {
       test     = "StringEquals"
       variable = "aws:SourceAccount"
       values   = [data.aws_caller_identity.current.account_id]
+    }
+  }
+
+  statement {
+    sid       = "AllowRdsEventsPublish"
+    actions   = ["SNS:Publish"]
+    effect    = "Allow"
+    resources = [aws_sns_topic.budget.arn]
+    principals {
+      type        = "Service"
+      identifiers = ["events.rds.amazonaws.com"]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [data.aws_caller_identity.current.account_id]
+    }
+    condition {
+      test     = "ArnLike"
+      variable = "aws:SourceArn"
+      values   = ["arn:${data.aws_partition.current.partition}:rds:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:db:*"]
     }
   }
 }
@@ -124,7 +159,12 @@ resource "aws_budgets_budget" "monthly" {
 }
 
 output "budget_name" { value = aws_budgets_budget.monthly.name }
-output "sns_topic_arn" { value = aws_sns_topic.budget.arn }
+# Read through the topic POLICY rather than the topic. The value is identical
+# (the policy's `arn` is the topic ARN), but the reference orders every
+# consumer — the observability alarms and its RDS event subscription — after
+# the publish grants above exist, so a first apply cannot wire a publisher to a
+# topic that still denies it.
+output "sns_topic_arn" { value = aws_sns_topic_policy.budget.arn }
 # `sensitive = true` is REQUIRED, not decorative: a root module re-exporting an
 # unmarked child output that carries a sensitive value is a plan-time error
 # ("Output refers to sensitive values"). Nothing consumes this output today, so

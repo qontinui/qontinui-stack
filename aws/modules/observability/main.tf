@@ -11,6 +11,11 @@
 # created 2026-05-20) that had ZERO subscribers and therefore notified nobody.
 # Bringing them into IaC + onto the subscribed topic is what makes them live.
 # (Plan 2026-05-30-qontinui-stack-terraform-state-reconciliation follow-up.)
+#
+# Also coord's Postgres (RDS) storage: a FreeStorageSpace alarm plus an RDS
+# event subscription, both on the same topic. A storage-full RDS takes coord
+# down, and until these existed nothing watched it (plan
+# 2026-09-24-coord-rds-storage-has-fifteen-gb-headroom-and-no-autoscaling).
 
 variable "environment" { type = string }
 variable "alb_arn_suffix" { type = string }
@@ -27,6 +32,10 @@ variable "coord_service_name" {
 variable "coord_log_group_name" {
   type        = string
   description = "coord CloudWatch log group (plan-ingest metric filter source). From module.coord.log_group_name."
+}
+variable "postgres_instance_identifier" {
+  type        = string
+  description = "coord's RDS DB instance identifier (AWS/RDS DBInstanceIdentifier alarm dimension, and the RDS event subscription's source id). From module.postgres.identifier."
 }
 
 # coord down: no healthy targets behind the ALB.
@@ -328,6 +337,73 @@ resource "aws_cloudwatch_metric_alarm" "coord_worker_panic" {
   ok_actions    = [var.sns_topic_arn]
 }
 
+# coord's RDS running out of disk. AWS/RDS FreeStorageSpace is always-on (no
+# Enhanced Monitoring needed), in BYTES, so the threshold is 5e9 (5 GB).
+#
+# Why 5 GB and not 10: storage autoscaling (the postgres module's
+# max_allocated_storage) grows the disk once free space is <=10% of allocated
+# storage for >=5 min — 10 GiB at today's 100 GiB — so free space dipping to
+# ~10 GB is the ROUTINE autoscale trigger, and a 10 GB alarm would page on every
+# normal growth step. Below 5 GB for 3 x 5 min means autoscaling did NOT rescue
+# it: the ceiling was reached, or growth outran the wait before the next storage
+# modification (6 h, or until storage optimization finishes, whichever is
+# longer). An RDS that runs out of storage enters the `storage-full` status and
+# becomes unavailable, taking coord down. The gap widens as allocation grows
+# (10% of 150 GiB is 15 GiB), which only makes the page rarer.
+#
+# treat_missing_data = "missing": an RDS that stops reporting at all is a
+# down-database case, and paging on missing data here would be noise. Other
+# alarms cover it: coord-no-healthy-hosts indirectly (coord's /livez does not
+# probe Postgres, but coord's pg_watchdog exits the process after
+# COORD_PG_DEAD_EXIT_AFTER_SECS, default 300 s, of a dead pool, and a
+# replacement task cannot pass its boot-time schema check, so the target group
+# stays empty; with that env var set to 0 this path is off), coord-5xx once
+# PG-backed routes take traffic, and the event subscription's `failure`
+# category below.
+resource "aws_cloudwatch_metric_alarm" "rds_free_storage_low" {
+  alarm_name          = "qontinui-${var.environment}-rds-free-storage-low"
+  alarm_description   = "coord RDS FreeStorageSpace < 5 GB (Minimum) for 15 min: storage autoscaling did not rescue it. Autoscaling grows the disk once free space is <=10% of allocated storage, so a dip near that is routine; below 5 GB means MaxAllocatedStorage was reached or growth outran the wait before the next storage modification (6 h or until storage optimization finishes). An RDS out of storage enters storage-full and becomes unavailable, taking coord down. Check describe-db-instances AllocatedStorage/MaxAllocatedStorage and the coord table-retention sweep."
+  namespace           = "AWS/RDS"
+  metric_name         = "FreeStorageSpace"
+  statistic           = "Minimum"
+  period              = 300
+  evaluation_periods  = 3
+  threshold           = 5000000000
+  comparison_operator = "LessThanThreshold"
+  treat_missing_data  = "missing"
+
+  dimensions = {
+    DBInstanceIdentifier = var.postgres_instance_identifier
+  }
+
+  alarm_actions = [var.sns_topic_arn]
+  ok_actions    = [var.sns_topic_arn]
+}
+
+# RDS's own event stream for the instance, to the same topic. Before this
+# existed there were ZERO event subscriptions in us-east-1, so RDS's
+# "Storage size 100 GiB is approaching the maximum storage threshold" event —
+# emitted every 2 h from 2026-09-12 to 2026-09-24 — reached no one.
+#
+# Category choice, measured 2026-09-25 with `aws rds describe-events` on this
+# instance (not assumed from the category names):
+#   - "notification": the 2-hourly "Storage size 100 GiB is approaching the
+#     maximum storage threshold" message carries THIS category, not
+#     "low storage". Without it, the signal that sat unread for 12 days would
+#     still be unread.
+#   - "failure": "Storage autoscaling has triggered a pending scale storage
+#     task that will reach or exceed the maximum storage threshold" carries it.
+#   - "low storage": RDS's own low-storage category.
+# The topic's policy must grant events.rds.amazonaws.com (cost-control module,
+# statement AllowRdsEventsPublish) or delivery is silently denied.
+resource "aws_db_event_subscription" "postgres" {
+  name             = "qontinui-${var.environment}-rds-events"
+  sns_topic        = var.sns_topic_arn
+  source_type      = "db-instance"
+  source_ids       = [var.postgres_instance_identifier]
+  event_categories = ["low storage", "failure", "notification"]
+}
+
 output "alarm_names" {
   value = [
     aws_cloudwatch_metric_alarm.coord_unhealthy.alarm_name,
@@ -340,5 +416,6 @@ output "alarm_names" {
     aws_cloudwatch_metric_alarm.coord_plan_ingest_inert.alarm_name,
     aws_cloudwatch_metric_alarm.coord_pr_hydration_down.alarm_name,
     aws_cloudwatch_metric_alarm.coord_worker_panic.alarm_name,
+    aws_cloudwatch_metric_alarm.rds_free_storage_low.alarm_name,
   ]
 }
