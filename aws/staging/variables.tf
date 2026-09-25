@@ -236,9 +236,23 @@ variable "postgres_allocated_storage_gb" {
 }
 
 variable "postgres_max_allocated_storage_gb" {
-  description = "Storage auto-grow ceiling."
+  description = <<-EOT
+    Storage auto-grow ceiling (RDS MaxAllocatedStorage).
+
+    Raised 100 -> 200 on the live instance qontinui-staging by AWS CLI at
+    2026-09-24T19:54:10Z (CloudTrail ModifyDBInstance). Storage autoscaling had
+    grown the disk to the 100 GiB ceiling on 2026-09-12, and by 2026-09-24 only
+    about 15 GB was free, falling ~1.5-2 GB/day.
+
+    This default matches live, so an apply does not lower the ceiling. Lowering
+    it back to 100, where allocated storage already sits, would at best fail
+    the apply and at worst re-arm the storage-full trap. A gitignored operator
+    *.tfvars can still override this default, so check that file before
+    applying. Neither tracked tfvars file sets it. Plan:
+    2026-09-24-coord-rds-storage-has-fifteen-gb-headroom-and-no-autoscaling.
+  EOT
   type        = number
-  default     = 100
+  default     = 200
 }
 
 variable "postgres_username" {
