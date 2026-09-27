@@ -1,15 +1,17 @@
-"""Pins `branch_target_from_command` in `hooks/pre-checkout-coord-guard.sh`.
+r"""Pins `branch_target_from_command` in `hooks/pre-checkout-coord-guard.sh`.
 
 Plan `2026-09-27-command-segmenter-linear-time-and-shell-quote-model`, Phase 4.
 
 The function used to run `tok="$(dequote ...)"` for every word after
 `git checkout` / `git switch`, which forked a subshell per token. That cost
 about 185 ms per token on a loaded Windows box, and `dequote`'s unconditional
-`${t%\\"}`-style expansions were quadratic in the length of one long word. So a
+`${t%\"}`-style expansions were quadratic in the length of one long word. So a
 checkout followed by a few hundred words, or by one very long word, ran past
 the guard's 15 s PreToolUse timeout, and a timed-out hook fails OPEN. The
-rewrite is fork-free and linear, and its output (the printed branch and the
-return status) must not change on any input.
+rewrite is fork-free and linear. The one exception is a token containing a
+newline, which only a glob can produce; it keeps the old `$(...)` on purpose.
+Its output (the printed branch and the return status) must not change on any
+input.
 
 What each test pins:
 
@@ -21,12 +23,15 @@ What each test pins:
   with a newline or `\r\n` in them, which is the one kind of token that still
   takes the old `$(...)` path.
 * `test_table_expectations`: the branch pinned for each table case with a known
-  answer, so both copies cannot drift together unnoticed.
+  answer, so both copies cannot drift together unnoticed. The glob rows with a
+  `\r\n` in the filename have a different pinned answer on Git Bash. Only there
+  can they tell an exact `$(...)` from an emulation of it, so the Windows half
+  of the equivalence claim rests on local Git Bash runs.
 * `test_branch_target_is_linear`: a checkout followed by about 200 KB of words
-  classifies inside a 5 s ceiling, and doubling the input costs less than 3x,
-  taking the second-fastest of 5 interleaved runs. A quadratic walk gives about 4x. The
-  per-token fork breaks the ceiling on its own. The output of each timed
-  fixture is checked too.
+  (100 KB for the all-quoted fixture) classifies inside a 5 s ceiling, and
+  doubling the input costs less than 3x, taking the second-fastest of 5
+  interleaved runs. A quadratic walk gives about 4x. The per-token fork breaks
+  the ceiling on its own. The output of each timed fixture is checked too.
 
 Inputs reach bash through files, never argv or the environment.
 """
@@ -38,6 +43,7 @@ import random
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -159,11 +165,12 @@ mapfile -d '' -t inputs < "$1"
 cd "$2"
 # The files the table's globs expand to. They are made from bash rather than
 # Python, because Git Bash can store a `\r`, a `\n` or a `"` in a filename (it
-# maps them into private-use code points) where Windows Python cannot. A name
-# the platform refuses is skipped: both copies see the same directory.
+# maps them into private-use code points) where Windows Python cannot. A failed
+# create stops the driver: without its file, a glob row would reach both
+# copies as an unmatched literal and agree vacuously.
 for name in main feat-glob-hit "'qfile'" '"dqfile"' $'nl-branch\n' \
     $'crf\r\n' $'\r\n' $'mid\nline' $'crmid\r\nx'; do
-  { : > "$name"; } 2>/dev/null || true
+  : > "$name"
 done
 for input in "${inputs[@]}"; do
   rc=0
@@ -264,6 +271,15 @@ def _glob_dir(tmp_path: Path) -> Path:
 NONE = ""  # no branch: nothing printed, status 1
 ANY = None  # not pinned: the differential alone decides
 
+# Git Bash's `$(...)` also drops the `\r` before each trailing newline, and the
+# old function ran every token through one. The glob rows below therefore have
+# a different answer there.
+_MSYS_BASH = sys.platform in ("win32", "cygwin", "msys")
+
+
+def _plat(posix: str, msys: str) -> str:
+    return msys if _MSYS_BASH else posix
+
 # (command, expected branch). The expectation is the old function's answer,
 # written down so that the two copies cannot drift together. ANY marks an
 # answer that depends on the platform or the locale, or is not worth spelling.
@@ -346,18 +362,20 @@ TABLE: list[tuple[bytes, str | None]] = [
     (b"git checkout feat-g*", "feat-glob-hit"),
     (b"git checkout -b ?qf*", "qfile"),
     (b"git checkout [m]ain src", NONE),
-    # Platform-dependent answers: pinned only by the differential. A filename
-    # ending in a newline, or in `\r\n`, reaches the function only through a
-    # glob. The old `$(dequote ...)` stripped trailing newlines, and on Git
-    # Bash the `\r` before them as well. `??` matches only the name `\r\n`.
-    (b"git checkout nl-bra*", ANY),
-    (b"git checkout -b nl-bra*", ANY),
-    (b"git checkout crf*", ANY),
-    (b"git checkout -b crf*", ANY),
-    (b"git checkout ??", ANY),
-    (b"git checkout mid*", ANY),
-    (b"git checkout crm*", ANY),
-    (b"git checkout -b ?dq*", ANY),
+    # A filename containing a newline reaches the function only through a
+    # glob, and it is the one kind of token that still takes the old `$(...)`
+    # path. That stripped trailing newlines, and on Git Bash the `\r` before
+    # each one as well. `??` matches only the name `\r\n`. On Linux these rows
+    # cannot tell an exact `$(...)` from an emulation that strips only `\n`;
+    # on Git Bash they can.
+    (b"git checkout nl-bra*", "nl-branch"),
+    (b"git checkout -b nl-bra*", "nl-branch"),
+    (b"git checkout crf*", _plat("crf\r", "crf")),
+    (b"git checkout -b crf*", _plat("crf\r", "crf")),
+    (b"git checkout ??", _plat("\r", NONE)),
+    (b"git checkout mid*", "mid\nline"),
+    (b"git checkout crm*", "crmid\r\nx"),
+    (b"git checkout -b ?dq*", "dqfile"),
     # Invalid UTF-8, including an encoded lone surrogate, which Git Bash's
     # pattern expansions re-encode in a UTF-8 locale when they remove a quote.
     (b"git checkout feat/\xff", ANY),
@@ -438,7 +456,9 @@ def _split(raw: bytes, width: int) -> list[list[bytes]]:
 @pytest.mark.parametrize("locale", LOCALES)
 def test_matches_the_legacy_function(tmp_path, locale):
     inputs = [cmd for cmd, _ in TABLE] + _long_inputs() + _random_inputs()
-    raw = _run(tmp_path, DIFFERENTIAL_DRIVER, inputs, locale, _glob_dir(tmp_path))
+    globs = _glob_dir(tmp_path)
+    raw = _run(tmp_path, DIFFERENTIAL_DRIVER, inputs, locale, globs)
+    assert len(list(globs.iterdir())) == 9, sorted(globs.iterdir())
     rows = _split(raw, 4)
     assert len(rows) == len(inputs)
     found = 0
@@ -458,6 +478,7 @@ def test_table_expectations(tmp_path, locale):
     cmds = [cmd for cmd, _ in PINNED]
     raw = _run(tmp_path, DIFFERENTIAL_DRIVER, cmds, locale, _glob_dir(tmp_path))
     rows = _split(raw, 4)
+    assert len(rows) == len(PINNED)
     for (cmd, want), (legacy, legacy_rc, current, current_rc) in zip(PINNED, rows):
         expected = (b"", b"1") if want == NONE else (want.encode(), b"0")
         assert (current, current_rc) == expected, f"{cmd!r}: {current!r} rc={current_rc!r}"

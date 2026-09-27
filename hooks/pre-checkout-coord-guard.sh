@@ -459,8 +459,8 @@ split_command_segments() {
   printf '%s\n' "$out"
 }
 
-# Strip one surrounding `"` and then one surrounding `'` from $2, and store the
-# result in the variable named by $1.
+# Strip a trailing then a leading `"`, then a trailing then a leading `'`, from
+# $2, each one independently, and store the result in the variable named by $1.
 #
 # It stores through `printf -v` because the old `tok="$(dequote ...)"` forked a
 # subshell for every token after `git checkout`. That cost about 185 ms per token
@@ -475,7 +475,9 @@ split_command_segments() {
 # from wide characters only when a pattern matched, so the result keeps the same
 # bytes as before, including how a multibyte locale re-encodes it.
 #
-# NOT for a token with a newline in it; see `dequote_print`.
+# It does not reproduce what the old `$(...)` call site did to trailing
+# newlines. A token containing a newline goes through `dequote_print`, inside a
+# `$(...)`, instead.
 dequote_into() {
   local t="$2"
   if [[ "$t" == *\" ]]; then t="${t%\"}"; fi
