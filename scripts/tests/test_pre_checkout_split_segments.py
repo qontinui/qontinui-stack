@@ -27,17 +27,23 @@ What each test pins:
   comparison cannot reach cheaply.
 * `test_segmenting_is_linear`: a 200 KB command segments inside a generous
   budget, and 400 KB costs less than 3x 200 KB, taking the minimum of
-  interleaved runs. A quadratic walk gives about 4x. It also checks that the
-  timed output is correct, so a fast wrong answer cannot pass.
+  interleaved runs. A quadratic walk gives about 4x. The function's output on
+  the same fixtures is checked against the model too, so a fast wrong answer
+  cannot pass.
 * `test_callers_locale_is_restored`: the rewrite runs under `local LC_ALL=C`,
-  and the caller's locale must be back when it returns.
+  and the caller's locale must be back when it returns, whether it came from
+  `LC_ALL` or from `LANG`.
+* `test_walk_runs_in_the_c_locale`: that `local LC_ALL=C` line is present.
 
-Invalid UTF-8 is in the table and the random alphabet on purpose. On Git Bash a
-4-byte character counts as two characters, and a truncated sequence counts
-differently depending on the byte after it. A rewrite that did arithmetic on
-character counts therefore invented a closing quote there. Ubuntu's glibc counts
-consistently, so only a Windows run can catch that class. The inputs are still
-kept, so that a Windows run does catch it.
+Invalid UTF-8 is in the table and the random alphabet on purpose. In a UTF-8
+locale on Git Bash, a 4-byte character counts as two characters, and a
+truncated sequence counts differently depending on the byte after it. Pattern
+expansions there also rewrite some invalid bytes, for example an encoded lone
+surrogate. A first draft that did arithmetic on character counts invented a
+closing quote. Dropping `local LC_ALL=C` rewrites surrogate bytes. Ubuntu's
+glibc does neither, so only a Windows run catches these inputs failing. That is
+why `test_walk_runs_in_the_c_locale` also pins the line itself, which CI checks
+on every platform.
 
 Everything is fed to bash through files, never argv or the environment, so the
 sizes are not capped by the OS argument limits.
@@ -177,7 +183,8 @@ def _model(data: bytes) -> bytes:
 
 
 def _run(tmp_path: Path, driver: str, inputs: list[bytes], locale: str,
-         *extra: str, timeout: int = 600) -> bytes:
+         *extra: str, timeout: int = 600, locale_var: str = "LC_ALL") -> bytes:
+    """Run `driver` with `locale` in `locale_var`, every other locale var unset."""
     for data in inputs:
         assert b"\0" not in data, "a bash string cannot hold NUL"
     script = tmp_path / "driver.sh"
@@ -186,7 +193,8 @@ def _run(tmp_path: Path, driver: str, inputs: list[bytes], locale: str,
     script.write_bytes((_current_function() + LEGACY_FUNCTION + driver).encode())
     feed = tmp_path / "inputs.bin"
     feed.write_bytes(b"".join(data + b"\0" for data in inputs))
-    env = {**os.environ, "LC_ALL": locale}
+    env = {k: v for k, v in os.environ.items() if k != "LANG" and not k.startswith("LC_")}
+    env[locale_var] = locale
     proc = subprocess.run(
         [_BASH, str(script), str(feed), *extra],
         env=env,
@@ -255,6 +263,11 @@ TABLE: list[bytes] = [
     b"\xf0\x9f\x9a'\xf0\x9a\x80",
     b"\xf0\x9f\x9a'\xf0\x9a\x80;x' ; y",
     b"a\"\xf0\x9f\x9a\"|\xf0\x9f;'\xf0'&z",
+    # An encoded lone surrogate. On Git Bash a pattern expansion run in a
+    # UTF-8 locale rewrites it to other bytes, which is why the rewrite runs
+    # its walk under `local LC_ALL=C`.
+    b'a\xed\xa0\x80"',
+    b"x" * 510 + b'\xed\xa0\x80"' + b";y",
 ]
 
 
@@ -296,7 +309,10 @@ def _random_inputs() -> list[bytes]:
     wide_alphabet = ascii_alphabet + [c.encode() for c in ["é", "日", "🚀"]]
     # Truncated sequences, a lone lead byte, a lone continuation byte, and a
     # byte that is never valid UTF-8.
-    invalid_alphabet = wide_alphabet + [b"\xf0\x9f\x9a", b"\xe6\x97", b"\xc3", b"\x80", b"\xff"]
+    # An encoded lone surrogate too.
+    invalid_alphabet = wide_alphabet + [
+        b"\xf0\x9f\x9a", b"\xe6\x97", b"\xc3", b"\x80", b"\xff", b"\xed\xa0\x80",
+    ]
     out: list[bytes] = []
     for alphabet, count in ((ascii_alphabet, 300), (wide_alphabet, 60), (invalid_alphabet, 60)):
         for _ in range(count):
@@ -392,7 +408,9 @@ PERF_CASES = [
     "name,make,size,budget", PERF_CASES, ids=[c[0] for c in PERF_CASES]
 )
 def test_segmenting_is_linear(tmp_path, name, make, size, budget):
-    rounds = 3
+    # Five interleaved rounds. The sparse fixture takes about 13 ms on Linux,
+    # so one burst of runner load must not decide the ratio.
+    rounds = 5
     fixtures = [make(size).encode(), make(2 * size).encode()]
     outdir = tmp_path / "out"
     outdir.mkdir()
@@ -430,7 +448,23 @@ printf '%s %s\n' "$before" "$after"
 """
 
 
-def test_callers_locale_is_restored(tmp_path):
-    """`local LC_ALL=C` must not leak: `é` is one character before and after."""
-    raw = _run(tmp_path, LOCALE_DRIVER, [], "C.UTF-8")
+@pytest.mark.parametrize("locale_var", ["LC_ALL", "LANG"])
+def test_callers_locale_is_restored(tmp_path, locale_var):
+    """`local LC_ALL=C` must not leak: `é` is one character before and after.
+
+    The `LANG` case is the usual production shape. There `LC_ALL` starts out
+    unset, and returning from the function has to UNSET it again.
+    """
+    raw = _run(tmp_path, LOCALE_DRIVER, [], "C.UTF-8", locale_var=locale_var)
     assert raw == b"1 1\n", raw
+
+
+def test_walk_runs_in_the_c_locale():
+    """Pin the `local LC_ALL=C` line itself.
+
+    Without it the walk is still correct under glibc, so the Linux CI job could
+    never see it go. On Git Bash the equivalence test fails without it, on the
+    encoded-surrogate inputs.
+    """
+    body = _current_function()
+    assert "\n  local LC_ALL=C\n" in body, body[:400]

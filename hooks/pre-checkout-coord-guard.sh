@@ -374,19 +374,26 @@ fi
 #   * Output is collected per window and per block before it is joined onto
 #     `out`, because `+=` copies the whole existing value.
 # What remains is a constant per QUOTE character, about 20 us on that box. Two
-# terms are still superlinear, and both run at memory speed: one `strlen` of the
-# whole command per 64 KiB, and one copy of `out` per 8 KiB block. Neither
-# matters at any size a hook is handed.
+# terms are still superlinear, and both run at memory speed: one pass over the
+# whole command (a length and a copy) per 64 KiB, and one copy of `out` per 8 KiB
+# block. Neither matters at any size a hook is handed.
 #
-# The walk runs in the C locale, so every length and offset counts BYTES. That
-# keeps the output identical to the old walk wherever the charset is UTF-8 or
-# single-byte. Every character acted on is ASCII, and in UTF-8 an ASCII byte is
-# never part of a multibyte character. Counting characters instead is not safe.
-# On Git Bash, a 4-byte UTF-8 character counts as two, and a truncated sequence
-# counts differently depending on the byte after it, so slices measured apart do
-# not add up. The one known difference from the old walk is in a double-byte
-# locale such as Shift-JIS, where a trail byte can be `|`. The old walk kept such
-# a character whole; this one splits on the `|`. The fleet runs no such locale.
+# The walk runs in the C locale, so every length, offset and pattern match works
+# on BYTES. That keeps the output identical to the old walk wherever the charset
+# is UTF-8 or single-byte. Every character acted on is ASCII, and in UTF-8 an
+# ASCII byte is never part of a multibyte character. In a UTF-8 locale on Git
+# Bash neither half is safe:
+#   * A 4-byte character counts as two, and a truncated sequence counts
+#     differently depending on the byte after it. Slices measured apart then do
+#     not add up.
+#   * A pattern expansion such as `${win%%...}` round-trips the text through wide
+#     characters, and that rewrites some invalid bytes, for example an encoded
+#     lone surrogate.
+# The one known difference from the old walk is a double-byte locale such as
+# Shift-JIS, where a trail byte can be `|`. The old walk kept such a character
+# whole; this one splits on the `|`. The fleet runs no such locale. When the
+# caller's locale is not installed, bash repeats its "cannot change locale"
+# warning on stderr as the function returns. The output does not change.
 # `scripts/tests/test_pre_checkout_split_segments.py` pins the output
 # byte-for-byte against the old character walk, and pins linearity.
 split_command_segments() {
