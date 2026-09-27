@@ -213,6 +213,31 @@ def test_branch_create_in_primary_tree_emits_exactly_one_event(env, command, bra
     }
 
 
+def test_long_command_still_reaches_the_segment_after_its_body(env):
+    """A long quoted body neither hides the real switch nor leaks a decoy.
+
+    Plan `2026-09-27-command-segmenter-linear-time-and-shell-quote-model`,
+    Phase 4, made `split_command_segments` linear. This is the end-to-end half:
+    the whole guard, on a command whose body carries separators, apostrophes
+    and a quoted `git checkout -b decoy` in every repetition. The quote state
+    has to hold across every window and block boundary for the only event to be
+    the switch AFTER the body.
+
+    30,000 characters, so `GIT_GUARD_COMMAND` fits Windows' 32,767-character
+    limit on one environment variable and the test runs on every box. The
+    timing is pinned in `test_pre_checkout_split_segments.py`, not here.
+    """
+    repo = _make_repo(env["tmp_path"] / "qontinui-stack")
+    unit = "git checkout -b decoy; it's a | b & c "
+    body = (unit * (30_000 // len(unit) + 1))[:30_000]
+    command = f'git commit -m "{body}" && git checkout -b feat/after-long-body'
+    proc = _run(env, repo, command)
+    assert proc.returncode == 0, proc.stderr
+
+    posts = _posts(env, expect=1)
+    assert [p["body"]["branch"] for p in posts] == ["feat/after-long-body"]
+
+
 def test_no_authorization_header_is_sent(env):
     """The route is bearer-less and device-scoped, mirroring /coord/trees/upsert.
 

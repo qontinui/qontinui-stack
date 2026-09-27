@@ -348,25 +348,89 @@ fi
 
 # Split a shell command into segments on UNQUOTED `&& || ; | &`, so a verb
 # inside a quoted argument (`git commit -m "git checkout -b x"`) cannot be
-# mistaken for the command itself. Same char-walk shape as urlencode() below.
+# mistaken for the command itself.
+#
+# The quote model is the simple one this function has always had. A `'` or `"`
+# outside a quote opens a quote that only the SAME character closes. There is
+# no backslash escape, no `$(...)`/`${...}` nesting, and no comment or heredoc
+# awareness. Outside a quote, each of `& | ;` and newline becomes a newline.
+# Every other character, the quotes included, is copied through unchanged.
+#
+# The cost is LINEAR in the command's length (plan
+# `2026-09-27-command-segmenter-linear-time-and-shell-quote-model`, Phase 4).
+# The previous body walked one character at a time with `${s:i:1}`. In bash
+# every substring expansion re-measures the WHOLE value, so that walk was
+# quadratic: 0.49 / 1.59 / 6.78 s at 10 / 20 / 40 KB on a Windows Git Bash box.
+# This guard runs synchronously on the Claude Code PreToolUse path under a 15 s
+# hook timeout, so a long checkout-class command timed the hook out, and a
+# timed-out hook fails open. The walk now works like this:
+#   * The input is cut into 64 KiB superblocks, 8 KiB blocks sliced from the
+#     superblock, and 512-character windows sliced from the block. No per-step
+#     expansion touches more than one window, and the whole string is sliced
+#     only once per 64 KiB.
+#   * Inside a window, `${win%%...}` jumps straight to the next character that
+#     can change state: a quote character outside a quote, or the closing
+#     character inside one. The run before it is appended whole, and an
+#     unquoted run has its separators rewritten in one `${run//...}`.
+#   * Output is collected per window and per block before it is joined onto
+#     `out`, because `+=` copies the whole existing value.
+# What remains is a constant per QUOTE character, about 20 us on that box.
+# Offsets are CHARACTER counts in every locale, so the slices tile multibyte
+# input exactly. `scripts/tests/test_pre_checkout_split_segments.py` pins the
+# output byte-for-byte against the old character walk, and pins linearity.
 split_command_segments() {
   # NOT one `local ... len=${#s}` line: bash expands every word of the `local`
   # builtin BEFORE running it, so `${#s}` would read the (unset) GLOBAL `s` and
   # abort under `set -u`.
-  local s="$1" out="" q="" c i len
+  local s="$1" out="" q="" sup="" blk="" win="" run="" bout="" wout=""
+  # The patterns live in variables and expand UNQUOTED inside `${...}`, where
+  # they stay patterns. That spares the parser a bracket of quote characters.
+  local nl=$'\n' quote_suffix="[\"']*" sep='[&|;]'
+  local len slen blen wl rl a b w
   len=${#s}
-  for (( i = 0; i < len; i++ )); do
-    c="${s:$i:1}"
-    if [[ -n "$q" ]]; then
-      out+="$c"
-      [[ "$c" == "$q" ]] && q=""
-      continue
-    fi
-    case "$c" in
-      \'|\") q="$c"; out+="$c" ;;
-      '&'|'|'|';'|$'\n') out+=$'\n' ;;
-      *) out+="$c" ;;
-    esac
+  for (( a = 0; a < len; a += 65536 )); do
+    sup=${s:a:65536}
+    slen=${#sup}
+    for (( b = 0; b < slen; b += 8192 )); do
+      blk=${sup:b:8192}
+      blen=${#blk}
+      bout=""
+      for (( w = 0; w < blen; w += 512 )); do
+        win=${blk:w:512}
+        wl=${#win}
+        wout=""
+        while (( wl > 0 )); do
+          if [[ -n "$q" ]]; then
+            # Inside a quote: only the same quote character closes it.
+            run=${win%%"$q"*}
+            rl=${#run}
+            if (( rl == wl )); then
+              # Still open at the window's end; `q` carries into the next one.
+              wout+=$run
+              break
+            fi
+            wout+=$run$q
+            q=""
+          else
+            # Outside a quote: copy up to the next quote character, with every
+            # separator in between turned into a newline.
+            run=${win%%$quote_suffix}
+            rl=${#run}
+            if (( rl == wl )); then
+              wout+=${run//$sep/$nl}
+              break
+            fi
+            q=${win:rl:1}
+            wout+=${run//$sep/$nl}$q
+          fi
+          # Step past the run and the quote character that ended it.
+          win=${win:rl+1}
+          wl=$(( wl - rl - 1 ))
+        done
+        bout+=$wout
+      done
+      out+=$bout
+    done
   done
   printf '%s\n' "$out"
 }
