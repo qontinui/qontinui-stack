@@ -26,7 +26,7 @@ What each test pins:
   inputs cross the 64 KiB superblock boundary, the one boundary the legacy
   comparison cannot reach cheaply.
 * `test_segmenting_is_linear`: a 200 KB command segments inside a generous
-  budget, and 400 KB costs less than 3x 200 KB, taking the minimum of
+  budget, and 400 KB costs less than 3x 200 KB, taking the median of
   interleaved runs. A quadratic walk gives about 4x. The function's output on
   the same fixtures is checked against the model too, so a fast wrong answer
   cannot pass.
@@ -58,6 +58,7 @@ import os
 import random
 import re
 import shutil
+import statistics
 import subprocess
 from pathlib import Path
 
@@ -415,8 +416,10 @@ PERF_CASES = [
     "name,make,size,budget", PERF_CASES, ids=[c[0] for c in PERF_CASES]
 )
 def test_segmenting_is_linear(tmp_path, name, make, size, budget):
-    # Five interleaved rounds. The sparse fixture takes about 13 ms on Linux,
-    # so one burst of runner load must not decide the ratio.
+    # The MEDIAN of interleaved rounds, not the minimum: `EPOCHREALTIME` is wall
+    # time, and a clock step (measured on WSL: one sample came out at -0.81 s)
+    # drags a minimum down as surely as runner load pushes a sample up. A
+    # median of 5 absorbs two outliers in either direction.
     rounds = 5
     fixtures = [make(size).encode(), make(2 * size).encode()]
     outdir = tmp_path / "out"
@@ -433,11 +436,11 @@ def test_segmenting_is_linear(tmp_path, name, make, size, budget):
         timings[int(idx)].append(int(usec))
     assert all(len(v) == rounds for v in timings.values()), timings
 
-    small = min(timings[0]) / 1e6
-    large = min(timings[1]) / 1e6
+    small = statistics.median(timings[0]) / 1e6
+    large = statistics.median(timings[1]) / 1e6
     summary = (
         f"{name}: {size} B in {small:.3f}s, {2 * size} B in {large:.3f}s "
-        f"(min of {rounds}; all runs usec {timings})"
+        f"(median of {rounds}; all runs usec {timings})"
     )
     assert small < budget, f"over the {budget}s budget. {summary}"
     # max() keeps a sub-millisecond small run from inflating the ratio.
