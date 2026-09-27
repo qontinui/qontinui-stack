@@ -356,7 +356,7 @@ fi
 # awareness. Outside a quote, each of `& | ;` and newline becomes a newline.
 # Every other character, the quotes included, is copied through unchanged.
 #
-# The cost is LINEAR in the command's length (plan
+# The cost is linear in the command's length (plan
 # `2026-09-27-command-segmenter-linear-time-and-shell-quote-model`, Phase 4).
 # The previous body walked one character at a time with `${s:i:1}`. In bash
 # every substring expansion re-measures the WHOLE value, so that walk was
@@ -365,20 +365,34 @@ fi
 # hook timeout, so a long checkout-class command timed the hook out, and a
 # timed-out hook fails open. The walk now works like this:
 #   * The input is cut into 64 KiB superblocks, 8 KiB blocks sliced from the
-#     superblock, and 512-character windows sliced from the block. No per-step
-#     expansion touches more than one window, and the whole string is sliced
-#     only once per 64 KiB.
-#   * Inside a window, `${win%%...}` jumps straight to the next character that
-#     can change state: a quote character outside a quote, or the closing
+#     superblock, and 512-byte windows sliced from the block. No per-step
+#     expansion touches more than one window.
+#   * Inside a window, `${win%%...}` jumps straight to the next byte that can
+#     change state: a quote character outside a quote, or the closing
 #     character inside one. The run before it is appended whole, and an
 #     unquoted run has its separators rewritten in one `${run//...}`.
 #   * Output is collected per window and per block before it is joined onto
 #     `out`, because `+=` copies the whole existing value.
-# What remains is a constant per QUOTE character, about 20 us on that box.
-# Offsets are CHARACTER counts in every locale, so the slices tile multibyte
-# input exactly. `scripts/tests/test_pre_checkout_split_segments.py` pins the
-# output byte-for-byte against the old character walk, and pins linearity.
+# What remains is a constant per QUOTE character, about 20 us on that box. Two
+# terms are still superlinear, and both run at memory speed: one `strlen` of the
+# whole command per 64 KiB, and one copy of `out` per 8 KiB block. Neither
+# matters at any size a hook is handed.
+#
+# The walk runs in the C locale, so every length and offset counts BYTES. That
+# keeps the output identical to the old walk wherever the charset is UTF-8 or
+# single-byte. Every character acted on is ASCII, and in UTF-8 an ASCII byte is
+# never part of a multibyte character. Counting characters instead is not safe.
+# On Git Bash, a 4-byte UTF-8 character counts as two, and a truncated sequence
+# counts differently depending on the byte after it, so slices measured apart do
+# not add up. The one known difference from the old walk is in a double-byte
+# locale such as Shift-JIS, where a trail byte can be `|`. The old walk kept such
+# a character whole; this one splits on the `|`. The fleet runs no such locale.
+# `scripts/tests/test_pre_checkout_split_segments.py` pins the output
+# byte-for-byte against the old character walk, and pins linearity.
 split_command_segments() {
+  # Byte semantics for this function only; bash restores the caller's locale
+  # when the function returns. Declared before anything is measured.
+  local LC_ALL=C
   # NOT one `local ... len=${#s}` line: bash expands every word of the `local`
   # builtin BEFORE running it, so `${#s}` would read the (unset) GLOBAL `s` and
   # abort under `set -u`.
@@ -423,9 +437,11 @@ split_command_segments() {
             q=${win:rl:1}
             wout+=${run//$sep/$nl}$q
           fi
-          # Step past the run and the quote character that ended it.
+          # Step past the run and the quote character that ended it. The length
+          # is re-measured rather than derived, so the `rl == wl` test above
+          # always compares two measurements of the same kind.
           win=${win:rl+1}
-          wl=$(( wl - rl - 1 ))
+          wl=${#win}
         done
         bout+=$wout
       done

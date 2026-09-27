@@ -29,6 +29,15 @@ What each test pins:
   budget, and 400 KB costs less than 3x 200 KB, taking the minimum of
   interleaved runs. A quadratic walk gives about 4x. It also checks that the
   timed output is correct, so a fast wrong answer cannot pass.
+* `test_callers_locale_is_restored`: the rewrite runs under `local LC_ALL=C`,
+  and the caller's locale must be back when it returns.
+
+Invalid UTF-8 is in the table and the random alphabet on purpose. On Git Bash a
+4-byte character counts as two characters, and a truncated sequence counts
+differently depending on the byte after it. A rewrite that did arithmetic on
+character counts therefore invented a closing quote there. Ubuntu's glibc counts
+consistently, so only a Windows run can catch that class. The inputs are still
+kept, so that a Windows run does catch it.
 
 Everything is fed to bash through files, never argv or the environment, so the
 sizes are not capped by the OS argument limits.
@@ -240,22 +249,36 @@ TABLE: list[bytes] = [
     # bytes, and a truncated sequence at the very end.
     b"x\xc3'a;b'\xff;\xfe|y\xe6\x97",
     b"\x80\x81;'\xc3';\xf0\x9f\x9a",
+    # Truncated 4-byte sequences beside quotes. On Git Bash these count
+    # differently depending on the next byte, and a first draft of the rewrite
+    # that did arithmetic on character counts invented a closing quote here.
+    b"\xf0\x9f\x9a'\xf0\x9a\x80",
+    b"\xf0\x9f\x9a'\xf0\x9a\x80;x' ; y",
+    b"a\"\xf0\x9f\x9a\"|\xf0\x9f;'\xf0'&z",
 ]
 
 
 def _boundary_inputs() -> list[bytes]:
-    """A quote or a separator on each side of the 512 / 8192 boundaries.
+    """A quote, a separator or a split character at the 512 / 8192 boundaries.
 
-    The rewrite slices the command into 512-character windows inside 8 KiB
-    blocks, so each boundary is where a carried-over quote state could go
-    wrong. The offsets are in CHARACTERS, so the multibyte variants put the
-    boundary at a different byte than the ASCII ones.
+    The rewrite slices the command into 512-byte windows inside 8 KiB blocks,
+    so each boundary is where a carried-over quote state could go wrong, and
+    where a multibyte character is cut in two between windows.
     """
     out: list[bytes] = []
     for pad in (510, 511, 512, 513, 1023, 1024, 8191, 8192, 8193):
         out.append((" " * pad + "'x;y'" + ";z").encode())
-        out.append(("é" * pad + '"a|b"' + "&c").encode())
         out.append(("x" * pad + ";" + "'q'").encode())
+    # Two-byte characters, so the quote lands at bytes 510 / 512 / 514 and
+    # 8190 / 8192 / 8194. The one-byte lead shifts every `é` onto an odd
+    # offset, so one of them straddles each boundary.
+    for n in (255, 256, 257, 4095, 4096, 4097):
+        out.append(("é" * n + '"a|b"' + "&c").encode())
+        out.append(("x" + "é" * n + "'a;b'" + "|c").encode())
+    # A 4-byte character straddling the first window boundary, and a
+    # truncated one ending exactly on it before a quote.
+    out.append(("x" * 510 + "🚀" + "'a;b'" + ";c").encode())
+    out.append(b"x" * 509 + b"\xf0\x9f\x9a" + b"'a;b'" + b";c")
     # A quote that opens in one window and closes several windows later.
     out.append(("'" + "a;" * 400 + "'" + ";b").encode())
     # A quote that spans the 8 KiB block boundary, then a separator after it.
@@ -269,15 +292,16 @@ def _random_inputs() -> list[bytes]:
     """Seeded random strings. The quote characters are dense, so the quote
     state flips often and runs cross windows in both states."""
     rng = random.Random(20260927)
-    ascii_alphabet = ["a", "b", "'", '"', "&", "|", ";", " ", "\n", "x"]
-    wide_alphabet = ascii_alphabet + ["é", "日", "🚀"]
+    ascii_alphabet = [c.encode() for c in ["a", "b", "'", '"', "&", "|", ";", " ", "\n", "x"]]
+    wide_alphabet = ascii_alphabet + [c.encode() for c in ["é", "日", "🚀"]]
+    # Truncated sequences, a lone lead byte, a lone continuation byte, and a
+    # byte that is never valid UTF-8.
+    invalid_alphabet = wide_alphabet + [b"\xf0\x9f\x9a", b"\xe6\x97", b"\xc3", b"\x80", b"\xff"]
     out: list[bytes] = []
-    for _ in range(300):
-        n = rng.randrange(0, 1300)
-        out.append("".join(rng.choice(ascii_alphabet) for _ in range(n)).encode())
-    for _ in range(60):
-        n = rng.randrange(0, 1300)
-        out.append("".join(rng.choice(wide_alphabet) for _ in range(n)).encode())
+    for alphabet, count in ((ascii_alphabet, 300), (wide_alphabet, 60), (invalid_alphabet, 60)):
+        for _ in range(count):
+            n = rng.randrange(0, 1300)
+            out.append(b"".join(rng.choice(alphabet) for _ in range(n)))
     return out
 
 
@@ -394,3 +418,19 @@ def test_segmenting_is_linear(tmp_path, name, make, size, budget):
     # max() keeps a sub-millisecond small run from inflating the ratio.
     ratio = large / max(small, 0.001)
     assert ratio < 3.0, f"not linear, ratio {ratio:.2f} (quadratic is ~4). {summary}"
+
+
+LOCALE_DRIVER = r"""
+set -euo pipefail
+x=$'\xc3\xa9'
+before=${#x}
+split_command_segments "a;b 'c|d'" > /dev/null
+after=${#x}
+printf '%s %s\n' "$before" "$after"
+"""
+
+
+def test_callers_locale_is_restored(tmp_path):
+    """`local LC_ALL=C` must not leak: `é` is one character before and after."""
+    raw = _run(tmp_path, LOCALE_DRIVER, [], "C.UTF-8")
+    assert raw == b"1 1\n", raw
