@@ -465,24 +465,36 @@ split_command_segments() {
 # It stores through `printf -v` because the old `tok="$(dequote ...)"` forked a
 # subshell for every token after `git checkout`. That cost about 185 ms per token
 # on a loaded Windows box, so a checkout followed by a few hundred words ran past
-# the hook's 15 s timeout and the guard failed open. The command substitution
-# also dropped trailing newlines. A token can end in one only when a glob
-# expanded to such a filename, and the loop at the end keeps that result.
+# the hook's 15 s timeout and the guard failed open.
 #
 # Each `${t%...}` / `${t#...}` runs only when it will remove a character. On no
 # match, bash tries every position and re-measures the rest of the string at
 # each one. That is quadratic in the token's length: one 200 KB word took 18.6 s
 # on Git Bash. The `[[ ]]` tests are linear. When an expansion does run it
-# removes exactly what the unconditional one did, so the result is unchanged,
-# down to how bash re-encodes the text in a multibyte locale.
+# removes exactly what the unconditional one did. Bash converts the text back
+# from wide characters only when a pattern matched, so the result keeps the same
+# bytes as before, including how a multibyte locale re-encodes it.
+#
+# NOT for a token with a newline in it; see `dequote_print`.
 dequote_into() {
   local t="$2"
   if [[ "$t" == *\" ]]; then t="${t%\"}"; fi
   if [[ "$t" == \"* ]]; then t="${t#\"}"; fi
   if [[ "$t" == *\' ]]; then t="${t%\'}"; fi
   if [[ "$t" == \'* ]]; then t="${t#\'}"; fi
-  while [[ "$t" == *$'\n' ]]; do t="${t%$'\n'}"; done
   printf -v "$1" '%s' "$t"
+}
+
+# Print $1 dequoted, for use inside `$(...)`. This keeps the old forking path,
+# on purpose, for the one kind of token it cannot be taken off. The command
+# substitution also rewrote the result: it dropped trailing newlines, and on
+# Git Bash it drops a `\r` before each of them too. The only way a token gets a
+# newline is a glob matching a filename that contains one, so this path is
+# rare. Going through the same `$(...)` keeps it exact on every platform.
+dequote_print() {
+  local d
+  dequote_into d "$1"
+  printf '%s' "$d"
 }
 
 # Is $1 plausibly a BRANCH name being created/switched to (vs a commit-ish,
@@ -550,9 +562,10 @@ branch_target_from_command() {
     while (( i < ${#toks[@]} )); do
       tok="${toks[$i]}"
       # Only a token with a quote or a newline in it can change, so only that
-      # kind pays for the function call.
+      # kind pays for a function call. Only a newline costs a fork.
       case "$tok" in
-        *[\"\']*|*$'\n'*) dequote_into tok "$tok" ;;
+        *$'\n'*) tok="$(dequote_print "$tok")" ;;
+        *[\"\']*) dequote_into tok "$tok" ;;
       esac
       case "$tok" in
         # A pathspec separator makes this a working-tree restore, not a
@@ -568,7 +581,11 @@ branch_target_from_command() {
         --detach|--orphan=*|--patch|-p) suppress=1; break ;;
         # The create forms: the branch is the NEXT token.
         -b|-B|-c|-C|--orphan|--create|--force-create)
-          dequote_into create_branch "${toks[$(( i + 1 ))]:-}"
+          create_branch="${toks[$(( i + 1 ))]:-}"
+          case "$create_branch" in
+            *$'\n'*) create_branch="$(dequote_print "$create_branch")" ;;
+            *) dequote_into create_branch "$create_branch" ;;
+          esac
           break
           ;;
         # Value-taking options that are not the branch.

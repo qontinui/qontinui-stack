@@ -17,13 +17,14 @@ What each test pins:
   function give the same output and status, in the C and C.UTF-8 locales. The
   inputs are a table of every case arm, globs, quotes, invalid UTF-8 and long
   commands, plus a few hundred seeded random commands. The comparison runs in a
-  directory whose files the table's globs expand to. On Linux that includes a
-  filename ending in a newline, which the old `$(...)` stripped.
+  directory whose files the table's globs expand to. Those include filenames
+  with a newline or `\r\n` in them, which is the one kind of token that still
+  takes the old `$(...)` path.
 * `test_table_expectations`: the branch pinned for each table case with a known
   answer, so both copies cannot drift together unnoticed.
 * `test_branch_target_is_linear`: a checkout followed by about 200 KB of words
   classifies inside a 5 s ceiling, and doubling the input costs less than 3x,
-  taking the median of interleaved runs. A quadratic walk gives about 4x. The
+  taking the second-fastest of 5 interleaved runs. A quadratic walk gives about 4x. The
   per-token fork breaks the ceiling on its own. The output of each timed
   fixture is checked too.
 
@@ -36,7 +37,6 @@ import os
 import random
 import re
 import shutil
-import statistics
 import subprocess
 from pathlib import Path
 
@@ -54,6 +54,7 @@ _BASH = shutil.which("bash") or "bash"
 HOOK_FUNCTIONS = (
     "split_command_segments",
     "dequote_into",
+    "dequote_print",
     "looks_like_branch",
     "branch_target_from_command",
 )
@@ -156,6 +157,14 @@ DIFFERENTIAL_DRIVER = r"""
 set -euo pipefail
 mapfile -d '' -t inputs < "$1"
 cd "$2"
+# The files the table's globs expand to. They are made from bash rather than
+# Python, because Git Bash can store a `\r`, a `\n` or a `"` in a filename (it
+# maps them into private-use code points) where Windows Python cannot. A name
+# the platform refuses is skipped: both copies see the same directory.
+for name in main feat-glob-hit "'qfile'" '"dqfile"' $'nl-branch\n' \
+    $'crf\r\n' $'\r\n' $'mid\nline' $'crmid\r\nx'; do
+  { : > "$name"; } 2>/dev/null || true
+done
 for input in "${inputs[@]}"; do
   rc=0
   branch_target_from_command_legacy "$input" || rc=$?
@@ -243,20 +252,9 @@ def _run(tmp_path: Path, driver: str, inputs: list[bytes], locale: str,
 
 
 def _glob_dir(tmp_path: Path) -> Path:
-    """Files for the table's globs. The platform decides which names exist, and
-    both copies of the function run against the same directory."""
+    """An empty directory; DIFFERENTIAL_DRIVER fills it with the glob targets."""
     d = tmp_path / "globs"
     d.mkdir()
-    names = ["main", "feat-glob-hit", "'qfile'"]
-    # Not creatable on Windows: a newline or a `"` in a filename.
-    optional = ["nl-branch\n", '"dqfile"']
-    for name in names:
-        (d / name).write_bytes(b"")
-    for name in optional:
-        try:
-            (d / name).write_bytes(b"")
-        except OSError:
-            pass
     return d
 
 
@@ -348,10 +346,17 @@ TABLE: list[tuple[bytes, str | None]] = [
     (b"git checkout feat-g*", "feat-glob-hit"),
     (b"git checkout -b ?qf*", "qfile"),
     (b"git checkout [m]ain src", NONE),
-    # Platform-dependent answers: pinned only by the differential. On Linux,
-    # `nl-bra*` expands to a filename ending in a newline, which the old
-    # `$(dequote ...)` stripped; `?dq*` expands to `"dqfile"`.
+    # Platform-dependent answers: pinned only by the differential. A filename
+    # ending in a newline, or in `\r\n`, reaches the function only through a
+    # glob. The old `$(dequote ...)` stripped trailing newlines, and on Git
+    # Bash the `\r` before them as well. `??` matches only the name `\r\n`.
     (b"git checkout nl-bra*", ANY),
+    (b"git checkout -b nl-bra*", ANY),
+    (b"git checkout crf*", ANY),
+    (b"git checkout -b crf*", ANY),
+    (b"git checkout ??", ANY),
+    (b"git checkout mid*", ANY),
+    (b"git checkout crm*", ANY),
     (b"git checkout -b ?dq*", ANY),
     # Invalid UTF-8, including an encoded lone surrogate, which Git Bash's
     # pattern expansions re-encode in a UTF-8 locale when they remove a quote.
@@ -479,20 +484,35 @@ PERF_CASES = [
 CEILING_S = 5.0
 
 
+def _robust_time(usecs: list[int]) -> float:
+    """The second-fastest sample, in seconds.
+
+    `EPOCHREALTIME` is wall time. Runner load only makes a sample slower, which
+    a minimum ignores. A clock step can make one sample too FAST (on WSL one
+    came out at -0.81 s), and a minimum would trust it. The second-fastest of 5
+    absorbs one such step and up to three slow samples.
+    """
+    return sorted(usecs)[1] / 1e6
+
+
 @pytest.mark.parametrize(
     "name,make,size,want", PERF_CASES, ids=[c[0] for c in PERF_CASES]
 )
 def test_branch_target_is_linear(tmp_path, name, make, size, want):
-    # The MEDIAN of interleaved rounds, not the minimum: `EPOCHREALTIME` is wall
-    # time, and a clock step (measured on WSL: one sample came out at -0.81 s)
-    # drags a minimum down as surely as runner load pushes a sample up. A
-    # median of 5 absorbs two outliers in either direction.
     rounds = 5
     fixtures = [make(size).encode(), make(2 * size).encode()]
     workdir = tmp_path / "work"
     workdir.mkdir()
-    raw = _run(tmp_path, PERF_DRIVER, fixtures, "C.UTF-8", workdir,
-               str(rounds), str(int(CEILING_S * 1e6)))
+    # The driver aborts after the first run that goes over the ceiling, but
+    # only once that run returns. A regression to per-token forks can take
+    # minutes, so the whole driver is bounded as well: every run allowed its
+    # ceiling (twice that for the larger fixture), plus slack.
+    limit = int(CEILING_S * 3 * (rounds + 1)) + 60
+    try:
+        raw = _run(tmp_path, PERF_DRIVER, fixtures, "C.UTF-8", workdir,
+                   str(rounds), str(int(CEILING_S * 1e6)), timeout=limit)
+    except subprocess.TimeoutExpired:
+        pytest.fail(f"{name}: did not finish in {limit}s, far over the {CEILING_S}s ceiling")
 
     first: dict[int, tuple[int, str]] = {}
     runs: dict[int, list[int]] = {0: [], 1: []}
@@ -522,11 +542,11 @@ def test_branch_target_is_linear(tmp_path, name, make, size, want):
             expected = (want.encode(), "0")
         assert (got, rc) == expected, f"{name}: {got[:80]!r} rc={rc}"
 
-    small = statistics.median(runs[0]) / 1e6
-    large = statistics.median(runs[1]) / 1e6
+    small = _robust_time(runs[0])
+    large = _robust_time(runs[1])
     summary = (
         f"{name}: {len(fixtures[0])} B in {small:.3f}s, {len(fixtures[1])} B in "
-        f"{large:.3f}s (median of {rounds}; all runs usec {runs})"
+        f"{large:.3f}s (2nd-fastest of {rounds}; all runs usec {runs})"
     )
     assert small < CEILING_S, f"over the {CEILING_S}s ceiling. {summary}"
     ratio = large / max(small, 0.001)
