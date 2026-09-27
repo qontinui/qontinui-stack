@@ -33,9 +33,10 @@ What each test pins:
 * `test_callers_locale_is_restored`: the rewrite runs under `local LC_ALL=C`,
   and the caller's locale must be back when it returns, whether it came from
   `LC_ALL` or from `LANG`.
-* `test_walk_runs_in_the_c_locale` and its `_textually` twin: the walk really
-  counts bytes. The first checks that `é` measures 2 inside the function and 1
-  outside it. The second checks that the `local LC_ALL=C` line is present.
+* `test_walk_runs_in_the_c_locale` and its `_textually` twin. The first checks
+  that `é` measures 2 when the function prints and 1 outside it. The second
+  checks that `local LC_ALL=C` is the function's first statement, so the walk
+  runs in C as well.
 
 Invalid UTF-8 is in the table and the random alphabet on purpose. In a UTF-8
 locale on Git Bash, a 4-byte character counts as two characters, and a
@@ -206,9 +207,10 @@ def _run(tmp_path: Path, driver: str, inputs: list[bytes], locale: str,
     stderr = proc.stderr.decode("utf-8", "replace")
     # Skip only on the warning that names the locale this test asked for. Any
     # other "cannot change locale" would come from the function itself, and
-    # that is a failure.
+    # that is a failure. The function's own `local LC_ALL=C` never warns.
     if f"cannot change locale ({locale})" in stderr:
         pytest.skip(f"locale {locale} is not installed here: {stderr.strip()}")
+    assert "cannot change locale" not in stderr, stderr
     assert proc.returncode == 0, stderr
     return proc.stdout
 
@@ -504,7 +506,10 @@ def test_walk_runs_in_the_c_locale_textually():
 
 @pytest.mark.parametrize("locale_var", ["LC_ALL", "LANG"])
 def test_walk_runs_in_the_c_locale(tmp_path, locale_var):
-    """The walk really counts bytes: `é` is 2 inside it and 1 outside it."""
+    """`é` is 2 when the function prints and 1 outside it.
+
+    `_textually` pins that the walk before the print runs in C too.
+    """
     raw = _run(tmp_path, C_LOCALE_DRIVER, [], "C.UTF-8", locale_var=locale_var)
     if not raw.startswith(b"outer=1\n"):
         pytest.skip(f"C.UTF-8 is not in effect via {locale_var} here: {raw!r}")
