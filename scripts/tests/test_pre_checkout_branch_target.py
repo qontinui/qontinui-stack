@@ -23,10 +23,11 @@ What each test pins:
   with a newline or `\r\n` in them, which is the one kind of token that still
   takes the old `$(...)` path.
 * `test_table_expectations`: the branch pinned for each table case with a known
-  answer, so both copies cannot drift together unnoticed. The glob rows with a
-  `\r\n` in the filename have a different pinned answer on Git Bash. Only there
-  can they tell an exact `$(...)` from an emulation of it, so the Windows half
-  of the equivalence claim rests on local Git Bash runs.
+  answer, so both copies cannot drift together unnoticed. The glob rows whose
+  filename ends in `\r\n` (`crf*`, `-b crf*`, `??`) have a different pinned
+  answer on Git Bash. Only there can they tell an exact `$(...)` from an
+  emulation that strips only `\n`, so that half of the Windows equivalence
+  claim rests on local Git Bash runs.
 * `test_branch_target_is_linear`: a checkout followed by about 200 KB of words
   (100 KB for the all-quoted fixture) classifies inside a 5 s ceiling, and
   doubling the input costs less than 3x, taking the second-fastest of 5
@@ -43,7 +44,6 @@ import random
 import re
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -272,13 +272,18 @@ NONE = ""  # no branch: nothing printed, status 1
 ANY = None  # not pinned: the differential alone decides
 
 # Git Bash's `$(...)` also drops the `\r` before each trailing newline, and the
-# old function ran every token through one. The glob rows below therefore have
-# a different answer there.
-_MSYS_BASH = sys.platform in ("win32", "cygwin", "msys")
+# old function ran every token through one. Three of the glob rows below
+# therefore have a different answer there. This asks the bash under test, not
+# Python's platform, since the answer is a property of that bash.
+_CR_DROPPED = subprocess.run(
+    [_BASH, "-c", "x=$(printf 'a\\r\\n'); printf %s ${#x}"],
+    capture_output=True,
+).stdout == b"1"
 
 
-def _plat(posix: str, msys: str) -> str:
-    return msys if _MSYS_BASH else posix
+def _plat(posix: str, cr_dropped: str) -> str:
+    return cr_dropped if _CR_DROPPED else posix
+
 
 # (command, expected branch). The expectation is the old function's answer,
 # written down so that the two copies cannot drift together. ANY marks an
