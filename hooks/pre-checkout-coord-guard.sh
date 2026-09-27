@@ -392,8 +392,9 @@ fi
 # The one known difference from the old walk is a double-byte locale such as
 # Shift-JIS, where a trail byte can be `|`. The old walk kept such a character
 # whole; this one splits on the `|`. The fleet runs no such locale. When the
-# caller's locale is not installed, bash repeats its "cannot change locale"
-# warning on stderr as the function returns. The output does not change.
+# caller's `LC_ALL` names a locale that is not installed, bash repeats its
+# "cannot change locale" warning on stderr as the function returns. The output
+# does not change.
 # `scripts/tests/test_pre_checkout_split_segments.py` pins the output
 # byte-for-byte against the old character walk, and pins linearity.
 split_command_segments() {

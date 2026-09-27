@@ -33,7 +33,9 @@ What each test pins:
 * `test_callers_locale_is_restored`: the rewrite runs under `local LC_ALL=C`,
   and the caller's locale must be back when it returns, whether it came from
   `LC_ALL` or from `LANG`.
-* `test_walk_runs_in_the_c_locale`: that `local LC_ALL=C` line is present.
+* `test_walk_runs_in_the_c_locale` and its `_textually` twin: the walk really
+  counts bytes. The first checks that `é` measures 2 inside the function and 1
+  outside it. The second checks that the `local LC_ALL=C` line is present.
 
 Invalid UTF-8 is in the table and the random alphabet on purpose. In a UTF-8
 locale on Git Bash, a 4-byte character counts as two characters, and a
@@ -41,9 +43,9 @@ truncated sequence counts differently depending on the byte after it. Pattern
 expansions there also rewrite some invalid bytes, for example an encoded lone
 surrogate. A first draft that did arithmetic on character counts invented a
 closing quote. Dropping `local LC_ALL=C` rewrites surrogate bytes. Ubuntu's
-glibc does neither, so only a Windows run catches these inputs failing. That is
-why `test_walk_runs_in_the_c_locale` also pins the line itself, which CI checks
-on every platform.
+glibc does neither, so only a Windows run catches these inputs failing. The two
+C-locale tests exist so that CI, on every platform, would notice if the walk
+stopped counting bytes.
 
 Everything is fed to bash through files, never argv or the environment, so the
 sizes are not capped by the OS argument limits.
@@ -444,7 +446,7 @@ x=$'\xc3\xa9'
 before=${#x}
 split_command_segments "a;b 'c|d'" > /dev/null
 after=${#x}
-printf '%s %s\n' "$before" "$after"
+printf '%s %s %s\n' "$before" "$after" "${LC_ALL-<unset>}"
 """
 
 
@@ -453,13 +455,31 @@ def test_callers_locale_is_restored(tmp_path, locale_var):
     """`local LC_ALL=C` must not leak: `é` is one character before and after.
 
     The `LANG` case is the usual production shape. There `LC_ALL` starts out
-    unset, and returning from the function has to UNSET it again.
+    unset, and returning from the function has to leave it UNSET, not merely
+    empty.
     """
     raw = _run(tmp_path, LOCALE_DRIVER, [], "C.UTF-8", locale_var=locale_var)
-    assert raw == b"1 1\n", raw
+    if not raw.startswith(b"1 "):
+        # Measured BEFORE the call, so a skip here cannot hide a regression.
+        pytest.skip(f"C.UTF-8 is not in effect via {locale_var} here: {raw!r}")
+    expected_lc_all = b"C.UTF-8" if locale_var == "LC_ALL" else b"<unset>"
+    assert raw == b"1 1 " + expected_lc_all + b"\n", raw
 
 
-def test_walk_runs_in_the_c_locale():
+# `split_command_segments` ends with `printf`, so a shell function that
+# shadows the builtin runs INSIDE its dynamic scope and can measure the locale
+# the walk actually ran in. fd 3 carries the reading past the `> /dev/null`.
+C_LOCALE_DRIVER = r"""
+set -euo pipefail
+exec 3>&1
+p=$'\xc3\xa9'
+builtin printf 'outer=%s\n' "${#p}"
+printf() { local q=$'\xc3\xa9'; builtin printf 'inner=%s\n' "${#q}" >&3; builtin printf "$@"; }
+split_command_segments "a;b" > /dev/null
+"""
+
+
+def test_walk_runs_in_the_c_locale_textually():
     """Pin the `local LC_ALL=C` line itself.
 
     Without it the walk is still correct under glibc, so the Linux CI job could
@@ -468,3 +488,12 @@ def test_walk_runs_in_the_c_locale():
     """
     body = _current_function()
     assert "\n  local LC_ALL=C\n" in body, body[:400]
+
+
+@pytest.mark.parametrize("locale_var", ["LC_ALL", "LANG"])
+def test_walk_runs_in_the_c_locale(tmp_path, locale_var):
+    """The walk really counts bytes: `é` is 2 inside it and 1 outside it."""
+    raw = _run(tmp_path, C_LOCALE_DRIVER, [], "C.UTF-8", locale_var=locale_var)
+    if not raw.startswith(b"outer=1\n"):
+        pytest.skip(f"C.UTF-8 is not in effect via {locale_var} here: {raw!r}")
+    assert raw == b"outer=1\ninner=2\n", raw
