@@ -44,8 +44,8 @@ expansions there also rewrite some invalid bytes, for example an encoded lone
 surrogate. A first draft that did arithmetic on character counts invented a
 closing quote. Dropping `local LC_ALL=C` rewrites surrogate bytes. Ubuntu's
 glibc does neither, so only a Windows run catches these inputs failing. The two
-C-locale tests exist so that CI, on every platform, would notice if the walk
-stopped counting bytes.
+C-locale tests exist so that CI, on every platform, would notice if the
+`local LC_ALL=C` line were removed or moved below the walk.
 
 Everything is fed to bash through files, never argv or the environment, so the
 sizes are not capped by the OS argument limits.
@@ -204,7 +204,10 @@ def _run(tmp_path: Path, driver: str, inputs: list[bytes], locale: str,
         timeout=timeout,
     )
     stderr = proc.stderr.decode("utf-8", "replace")
-    if "cannot change locale" in stderr:
+    # Skip only on the warning that names the locale this test asked for. Any
+    # other "cannot change locale" would come from the function itself, and
+    # that is a failure.
+    if f"cannot change locale ({locale})" in stderr:
         pytest.skip(f"locale {locale} is not installed here: {stderr.strip()}")
     assert proc.returncode == 0, stderr
     return proc.stdout
@@ -467,8 +470,9 @@ def test_callers_locale_is_restored(tmp_path, locale_var):
 
 
 # `split_command_segments` ends with `printf`, so a shell function that
-# shadows the builtin runs INSIDE its dynamic scope and can measure the locale
-# the walk actually ran in. fd 3 carries the reading past the `> /dev/null`.
+# shadows the builtin runs INSIDE its dynamic scope and measures the locale in
+# effect when the function prints. The `_textually` test pins that the locale
+# is set before the walk too. fd 3 carries the reading past the `> /dev/null`.
 C_LOCALE_DRIVER = r"""
 set -euo pipefail
 exec 3>&1
@@ -480,14 +484,22 @@ split_command_segments "a;b" > /dev/null
 
 
 def test_walk_runs_in_the_c_locale_textually():
-    """Pin the `local LC_ALL=C` line itself.
+    """Pin the `local LC_ALL=C` line AND its position: it must be the function's
+    first statement.
 
-    Without it the walk is still correct under glibc, so the Linux CI job could
-    never see it go. On Git Bash the equivalence test fails without it, on the
-    encoded-surrogate inputs.
+    The behavioural test below measures the locale only when the function
+    prints, so a line moved down to just before that `printf` would pass it
+    while the walk itself ran in the caller's locale. Under glibc the output
+    would still be right, so only this check would catch that on Linux CI.
+    This check also still runs where C.UTF-8 is missing and the behavioural
+    tests skip.
     """
     body = _current_function()
-    assert "\n  local LC_ALL=C\n" in body, body[:400]
+    code = [
+        line for line in body.splitlines()[1:]
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    assert code[0] == "  local LC_ALL=C", code[:3]
 
 
 @pytest.mark.parametrize("locale_var", ["LC_ALL", "LANG"])
