@@ -275,10 +275,15 @@ ANY = None  # not pinned: the differential alone decides
 # old function ran every token through one. Three of the glob rows below
 # therefore have a different answer there. This asks the bash under test, not
 # Python's platform, since the answer is a property of that bash.
-_CR_DROPPED = subprocess.run(
+_CR_PROBE = subprocess.run(
     [_BASH, "-c", "x=$(printf 'a\\r\\n'); printf %s ${#x}"],
     capture_output=True,
-).stdout == b"1"
+    timeout=60,
+).stdout
+# Anything but a length of 1 or 2 means the probe itself broke. Stop here with
+# that, rather than as three confusing row mismatches later.
+assert _CR_PROBE in (b"1", b"2"), f"bash $(...) CR probe printed {_CR_PROBE!r}"
+_CR_DROPPED = _CR_PROBE == b"1"
 
 
 def _plat(posix: str, cr_dropped: str) -> str:
