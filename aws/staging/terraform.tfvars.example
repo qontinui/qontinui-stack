@@ -39,3 +39,7 @@ coord_image_uri = "<aws-account-id>.dkr.ecr.us-east-1.amazonaws.com/qontinui-coo
 # postgres_multi_az       = false
 # redis_node_type         = "cache.t4g.micro"
 # coord_desired_count     = 1
+
+# The tenant that owns this AWS account's bill — the only tenant the web
+# backend's AWS Cost Explorer task-role arm serves. Required, no default.
+spend_aws_task_role_tenant_id = "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a"
