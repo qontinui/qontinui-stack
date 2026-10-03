@@ -481,7 +481,8 @@ resource "aws_iam_role_policy" "task_spend_secrets" {
 
 # Provider-reported spend: AWS Cost Explorer (same plan, Phase 8). The
 # aws_cost_explorer connector reads THIS account's daily cost, grouped by
-# service, with ce:GetCostAndUsage — and with that action only.
+# service, with ce:GetCostAndUsage — and, for other tenants' own accounts,
+# assumes their qontinui-spend-* role (second statement).
 #
 # `resources = ["*"]` is the one unavoidable wildcard here: Cost Explorer
 # defines no resource types, so IAM accepts GetCostAndUsage only against "*".
@@ -491,8 +492,8 @@ resource "aws_iam_role_policy" "task_spend_secrets" {
 # Tenant pin: the backend serves this task-role arm ONLY to the tenant named by
 # SPEND_AWS_TASK_ROLE_TENANT_ID (the task definition's environment, below).
 # Any other tenant's aws_cost_explorer vendor is refused on this arm and must
-# link its own cross-account role ARN + ExternalId (an sts:AssumeRole that its
-# OWN account's trust policy grants) — policy aws-account-is-per-tenant.
+# link its own cross-account role (the AssumeTenantSpendReadRoles statement,
+# granted by ITS OWN account's trust policy) — policy aws-account-is-per-tenant.
 #
 # Each request is billed at $0.01; the backend pulls at most twice a day.
 data "aws_iam_policy_document" "task_cost_explorer" {
@@ -502,6 +503,22 @@ data "aws_iam_policy_document" "task_cost_explorer" {
       "ce:GetCostAndUsage",
     ]
     resources = ["*"]
+  }
+
+  # The cross-account arm: a tenant other than the pinned one links a role in
+  # ITS OWN account, and the backend assumes it to read that account's Cost
+  # Explorer. Scoped by NAME to roles called qontinui-spend-* (the backend
+  # refuses any other role ARN), with an ExternalId qontinui issues per tenant
+  # (a confused-deputy guard the tenant's trust policy must require). The
+  # backend also refuses a role in THIS account — the hosting bill is the
+  # pinned tenant's alone. Assuming a role still needs that account's own
+  # trust policy to name this task role.
+  statement {
+    sid = "AssumeTenantSpendReadRoles"
+    actions = [
+      "sts:AssumeRole",
+    ]
+    resources = ["arn:aws:iam::*:role/qontinui-spend-*"]
   }
 }
 
