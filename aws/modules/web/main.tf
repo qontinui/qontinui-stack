@@ -427,6 +427,48 @@ resource "aws_iam_role_policy" "task_ecs_exec" {
   policy = data.aws_iam_policy_document.task_ecs_exec.json
 }
 
+# Provider-reported spend: the per-tenant credential vault (plan
+# 2026-10-03-provider-reported-spend-collection-alerts-and-mobile Phase 7).
+# The "Link account" form on /overview/financials validates a connector
+# credential with one live provider call and then stores it here, one secret
+# per tenant and connector, named
+#   qontinui/<environment>/web/spend/<tenant_id>/<connector>
+# (backend/app/spend/credentials.py). The backend never returns, logs or puts
+# a value in a database row; it reports only linked / not_linked / error.
+#
+# Named actions only, and the resource is restricted to that one path prefix,
+# so this grant can read or write NO other secret of this account — not the
+# database_url, coord_admin_secret or secret_key above. DeleteSecret is how
+# "Unlink" works (ForceDeleteWithoutRecovery, so a re-link can CreateSecret the
+# same name at once). No TagResource, no ListSecrets, no RestoreSecret: the
+# backend uses none of them. The secrets are encrypted with the account's
+# AWS-managed aws/secretsmanager key, whose key policy already admits use
+# through Secrets Manager by any principal Secrets Manager authorises, so no
+# kms: grant is needed.
+data "aws_caller_identity" "current" {}
+
+data "aws_iam_policy_document" "task_spend_secrets" {
+  statement {
+    sid = "SpendConnectorCredentialVault"
+    actions = [
+      "secretsmanager:GetSecretValue",
+      "secretsmanager:CreateSecret",
+      "secretsmanager:PutSecretValue",
+      "secretsmanager:DescribeSecret",
+      "secretsmanager:DeleteSecret",
+    ]
+    resources = [
+      "arn:aws:secretsmanager:${var.region}:${data.aws_caller_identity.current.account_id}:secret:qontinui/${var.environment}/web/spend/*",
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "task_spend_secrets" {
+  name   = "qontinui-${var.environment}-web-spend-secrets"
+  role   = aws_iam_role.task.id
+  policy = data.aws_iam_policy_document.task_spend_secrets.json
+}
+
 # ─── Task definition ────────────────────────────────────────────────────
 
 resource "aws_ecs_task_definition" "web" {
