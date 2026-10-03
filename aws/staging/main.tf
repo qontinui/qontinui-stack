@@ -281,6 +281,10 @@ module "web" {
   # non-HTTP first-admin path — the deployed environment's only way to reach a
   # superuser once the unauthenticated bootstrap routes are deleted.
   first_superuser_email = var.first_superuser_email
+
+  # The tenant that owns this account's bill — the only tenant the AWS Cost
+  # Explorer task-role arm serves (policy aws-account-is-per-tenant).
+  spend_aws_task_role_tenant_id = var.spend_aws_task_role_tenant_id
 }
 
 # ─── Cross-IdP account linking — PreSignUp auto-link Lambda ──────────────
