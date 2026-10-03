@@ -115,15 +115,6 @@ variable "ses_from_email" {
   description = "Source address for transactional mail (the backend's SMTP_FROM_EMAIL). It MUST be an address under the domain of var.ses_sender_identity_arn: the grant is resource-scoped to that identity, so anything else is AccessDenied by IAM. The backend's own default (noreply@qontinui.com) is not a verified identity in this account, which is why leaving this unset is not an option."
 }
 
-# Email address of the bootstrap superuser. qontinui-web's
-# backend/app/db/init_db.py seeds the FIRST superuser at app startup — but only
-# when FIRST_SUPERUSER_EMAIL is set; unset, the seed is inert and a deployed
-# environment that reaches zero superusers has no way back in. It creates a
-# shell auth.users row with is_superuser=true; on that operator's first Cognito
-# login, app/services/cognito_provision.py stamps cognito_sub onto the row by
-# verified email so they inherit the grant. This is an ADDRESS, not a
-# credential — it authenticates nothing on its own — so it belongs in the
-# container's `environment` list, NOT in `secrets`.
 variable "spend_aws_task_role_tenant_id" {
   type        = string
   description = "The ONE qontinui tenant the AWS Cost Explorer task-role arm serves (SPEND_AWS_TASK_ROLE_TENANT_ID). This account's bill belongs to that tenant alone (policy aws-account-is-per-tenant). A tenant id, not a credential. Empty disables the arm."
@@ -134,6 +125,15 @@ variable "spend_aws_task_role_tenant_id" {
   }
 }
 
+# Email address of the bootstrap superuser. qontinui-web's
+# backend/app/db/init_db.py seeds the FIRST superuser at app startup — but only
+# when FIRST_SUPERUSER_EMAIL is set; unset, the seed is inert and a deployed
+# environment that reaches zero superusers has no way back in. It creates a
+# shell auth.users row with is_superuser=true; on that operator's first Cognito
+# login, app/services/cognito_provision.py stamps cognito_sub onto the row by
+# verified email so they inherit the grant. This is an ADDRESS, not a
+# credential — it authenticates nothing on its own — so it belongs in the
+# container's `environment` list, NOT in `secrets`.
 variable "first_superuser_email" {
   type        = string
   description = "Email address of the bootstrap superuser seeded by qontinui-web's init_db at startup. An address, not a credential — wired via plain environment, never Secrets Manager. Must be lowercase (see validation)."
@@ -519,6 +519,21 @@ data "aws_iam_policy_document" "task_cost_explorer" {
       "sts:AssumeRole",
     ]
     resources = ["arn:aws:iam::*:role/qontinui-spend-*"]
+
+    # Never a role in THIS account (the hosting bill is the pinned tenant's,
+    # read through the task role itself) — enforced here as well as in code.
+    condition {
+      test     = "StringNotEquals"
+      variable = "aws:ResourceAccount"
+      values   = [data.aws_caller_identity.current.account_id]
+    }
+
+    # Every assume carries an ExternalId (the one qontinui issues per tenant).
+    condition {
+      test     = "Null"
+      variable = "sts:ExternalId"
+      values   = ["false"]
+    }
   }
 }
 
