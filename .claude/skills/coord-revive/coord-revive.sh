@@ -1,0 +1,4274 @@
+#!/usr/bin/env bash
+# coord-revive.sh — typed transport triage + recovery for a dead coord-mcp door.
+#
+# WHEN TO RUN: any coord MCP tool call returned "Command failed with no output"
+# (the client-side mask for a dead cached transport), or the coord tools read as
+# unknown/masked. Findings 2026-07-26 §3: 8 of 8 prod-adjudicable "no output"
+# writes were silently LOST — treat the write as LOST, run this script, re-issue
+# the call over the door it reports, then VERIFY BY READ.
+#
+# Cascade (stop at the first LIVE door; self-bound — max 2 probes per door,
+# and the second probe fires ONLY on a retry-safe verdict (CREDENTIAL_REFRESHING or TIMEOUT); no loops.
+# coord has no auth-path rate limiting, so the bounding lives here):
+#   L1  own cwd's .mcp.json    — re-read the key: the file may hold a NEWER key
+#                                than the session's startup snapshot (the client
+#                                reads .mcp.json once at startup, never again)
+#   L2  sibling-key sweep      — <workspace-root>/.mcp.json plus every
+#                                <workspace-root>/*/.mcp.json (a sibling repo's
+#                                config often holds the live key/port)
+#   L3  acting-bearer fallback — coord-acting-bearer.sh ($COORD_AGENT_JWT) ->
+#                                direct coord MCP over HTTPS
+#   L4  device-JWT bearer      — the fleet's documented THREE-source device-JWT
+#                                cascade, in order: $COORD_DEVICE_JWT, then
+#                                ~/.qontinui/coord-device-jwt, then a mint from
+#                                a live runner's UI Bridge — used as a bearer
+#                                against the SAME public coord MCP door as L3.
+#                                Independent of every proxy key AND of
+#                                $COORD_AGENT_JWT, which is unset on this
+#                                fleet's sessions.
+#
+# The two STATIC sources are tried before the mint because they are the fleet's
+# canonical order (CLAUDE.md; scripts/render-memory-cache.ps1 implements the
+# same three). L4 previously implemented only the third: on a box with no runner
+# but a valid $COORD_DEVICE_JWT the cascade printed VERDICT: DEAD over a
+# credential sitting in the environment — the same false-DEAD class L4 was
+# created to close, reached by a different route. Static tokens are static while
+# device JWTs live ~4h, so a 401 from one is EXPECTED and must NOT end the
+# cascade: it falls through to the runner mint. Only the mint's 401 is terminal.
+#
+# jwt-cascade-selection: every source is PROBED against coord and a rejection
+# falls through to the next, so no local `exp` decode is needed and no static
+# token can shadow the source behind it. Declared for
+# scripts/lint-jwt-cascade-parity.py check E.
+#
+# Why L4 exists (2026-08-08): every one of the 14 probeable doors answered 401
+# (the one-slot workdir key had rotated under all of them) and L3 answered
+# NO_TOKEN, so the cascade printed VERDICT: DEAD — while coord was reachable the
+# whole time. A device JWT minted from the runner's UI Bridge drove
+# withdraw_gate, register_gate and add_citation to completion moments later.
+# L3's helper treats $COORD_AGENT_JWT as "the ONLY source", which is true of
+# THAT helper and false of the session: the runner holds a device JWT and hands
+# it over on request. A false DEAD is the worst output this script can produce
+# (SKILL.md sells the DEAD line as honest blocked-evidence), so the rung that
+# was actually load-bearing belongs in the cascade.
+#
+# Every failed probe gets a TYPED verdict instead of the client's mask:
+#   COORD_MCP_PROXY_UNAUTHORIZED — stale/evicted proxy key (HTTP 401): the
+#                                  one-slot workdir key rotated under you
+#   RUNNER_CREDENTIAL_<POSTURE>  — ALSO an HTTP 401, and NOT about your nonce.
+#                                  The runner answered the call ITSELF rather
+#                                  than forwarding it, because its OWN coord
+#                                  device-JWT posture is EXPIRED, ABSENT,
+#                                  UNREFRESHABLE or DARK (the 401 body carries
+#                                  {"code":"runner_credential_<posture>",
+#                                  "since","remedy"}). The key in your
+#                                  .mcp.json is FINE and a re-provision mints a
+#                                  fresh nonce for a credential that is still
+#                                  dead — so it is NOT offered on this verdict.
+#                                  L4 (device JWT) and L5 (the bootstrap
+#                                  credential) carry their own credentials and
+#                                  DO work. Arrives with Phase 3 of plan
+#                                  2026-09-12-runner-loads-with-an-expired-coord-credential-and-tells-nobody
+#   CREDENTIAL_REFRESHING        — proxy up, deliberately withholding while its
+#                                  device JWT refreshes (HTTP 503; the ONLY
+#                                  retry-safe verdict — earns the second probe)
+#   CONNECT_REFUSED              — dead port, no listener (runner gone or moved)
+#   TIMEOUT                      — no answer reached this box inside the budget.
+#                                  UNKNOWN, not dead; earns the second probe
+#   TIMEOUT_UPSTREAM             — the proxy ANSWERED (408/504) that ITS upstream
+#                                  hung. Shares the TIMEOUT* prefix, so it earns
+#                                  the same retry, and is an HTTP-plane answer
+#   PROXY_LIVE_UPSTREAM_DEAD     — HTTP 502 carrying one of the runner's typed
+#                                  upstream codes: the proxy is LIVE and the
+#                                  coord /mcp hop is not (the F2 class). Probed
+#                                  twice; a second one is final
+# and three verdicts that are NOT failures at all — the live-class set, see
+# is_live_verdict(): LIVE (the end-to-end tools/call answered isError:false),
+# LIVE_APP_ERROR (…answered isError:true — the TOOL complained, the transport is
+# proven) and PROXY_LIVE_E2E_UNVERIFIED (tools/list answered, the end-to-end
+# probe was not run). Two SKIPS that are statements of absence rather than
+# verdicts about a door — SKIPPED_BUDGET_EXCEEDED and
+# SKIPPED_SHARED_UPSTREAM_REFRESHING — and one verdict about a PORT rather than
+# a door: RUNNER_WEDGED (below).
+# plus HTTP_200_NOT_MCP (200 without a JSON-RPC result — treat as dead),
+# UNREACHABLE / HTTP_<code>, typed L3 causes (NO_TOKEN / MINT_FAILED /
+# HELPER_NOT_FOUND / HELPER_DEPS_MISSING) and typed L4 causes:
+#   NO_RUNNER                    — nothing answered at that origin
+#   RUNNER_TIMEOUT               — the port answered but never responded; often
+#                                  SATURATION, not a dead runner
+#   RUNNER_EVAL_FAILED           — it ANSWERED, but not with a well-formed
+#                                  evaluate result (non-2xx / route absent /
+#                                  success:false). NOT a sign-in problem
+#   RUNNER_EVAL_CSP_BLOCKED      — the WebView CSP forbids evaluating a string
+#                                  as JavaScript, so the eval mint cannot work
+#                                  on this BUILD for any expression. A BROKEN
+#                                  DOOR, not a credential state; never transient
+#   RUNNER_EVAL_STATIC_GUARD     — the frontend blocklist rejected the
+#                                  expression before evaluating it. About what
+#                                  was SENT, not about the runner
+#   RUNNER_TIER_TOO_LOW          — the runner is Tier 0/1, where the Qontinui
+#                                  account commands do not exist at all
+#   RUNNER_TIER_UNKNOWN          — the runner could not resolve its own tier
+#                                  (corrupt/unreadable settings.json)
+#   RUNNER_SIGNED_OUT            — it answered, and holds no JWT-shaped token
+#   ENV_UNSET / FILE_ABSENT      — that static credential source is simply not
+#                                  present (a statement of ABSENCE, not a fault)
+#   HOME_UNRESOLVED              — neither $HOME nor $USERPROFILE is set, so
+#                                  source 2 has no path to read (LOCAL fault)
+#   DEVICE_JWT_ENV_MALFORMED     — $COORD_DEVICE_JWT set but not JWT-shaped
+#   DEVICE_JWT_FILE_MALFORMED    — ~/.qontinui/coord-device-jwt likewise
+#   DEVICE_JWT_UNAUTHORIZED      — coord rejected the device JWT
+# and typed L6 causes, about the WEB host (api.qontinui.io — a different
+# program on a different host; see the L6 block):
+#   WEB_HOST_UNREACHABLE         — the ONE L6 verdict about the host itself
+#   WEB_HOST_NO_USER_JWT         — the host is UP; no user_id-bearing credential
+#                                  resolved, or the one sent lacks the claim.
+#                                  A CREDENTIAL fact, never a host verdict
+#   WEB_HOST_JWT_UNAUTHORIZED    — the host is UP and refused the bearer for
+#                                  another reason (expired is the normal one)
+#   WEB_HOST_HTTP_<code>         — served, answered something else
+#
+# THE TERMINAL LINE IS EMITTED FROM AN AXIS TABLE, not beside one. Every rung
+# is a row over host x prefix x credential, marked PROBED / SKIPPED / UNPROBED
+# / NOT APPLICABLE, followed by a machine-readable `axes: ... unprobed=` line.
+# DEAD is printable ONLY when every probeable row is PROBED; a run that skipped
+# an axis (the sweep budget, an env opt-out) prints VERDICT: UNKNOWN with that
+# axis named, never DEAD. The rows are DERIVED from the recorded outcomes, so
+# a rung that grows a sub-source (L4 in #785) is in the table with no edit.
+#
+# Why RUNNER_EVAL_FAILED and the two tier verdicts exist (2026-08-13): the
+# response reader returns the EMPTY STRING for every body it cannot parse, so an
+# evaluate fault ({"success":false,"error":"JS evaluation error: …"}), a
+# route-absent 404 (whose body is NON-empty, so the NO_RUNNER fast-path does not
+# fire either) and a genuinely signed-out runner all landed on
+# RUNNER_SIGNED_OUT — i.e. "sign the runner in", which is useless advice for two
+# of the three and actively misleading for the route-absent one. Worse,
+# get_access_token_for_websocket_impl calls require_tier_2() as its FIRST
+# statement, BEFORE any keychain read (qontinui-runner
+# src-tauri/src/commands/auth.rs), so a perfectly healthy Tier-1 runner was told
+# to sign in. The runner's own NO-DOWNGRADE (C4) comment documents exactly that
+# wrong-CTA mistake internally; this script was reproducing it one layer out.
+#
+# PARTIAL: a LIVE verdict can be QUALIFIED. `live_exit` takes an optional second
+# argument naming a limit on what the winning door can actually DO, and appends
+# a ` PARTIAL` marker plus PARTIAL: lines. Only the device-JWT doors use it —
+# L1/L2/L3 pass no second argument and print an unqualified LIVE, exactly as
+# before. A bare LIVE that overstates its own reach is the same defect the DEAD
+# verdicts here are written to avoid, one level down.
+#
+# LOCAL faults are named as such and never dressed up as a coord verdict —
+# AUTH_HEADER_STAGING_FAILED (the header file could not be written) and
+# AUTH_HEADER_UNREADABLE (curl could not open it). A diagnostic tool that
+# blames the remote for its own broken plumbing is worse than no tool.
+#
+# READ-ONLY GUARANTEE: this script only READS .mcp.json files — it never writes
+# any config, and in particular it never writes a .mcp.json.
+#
+# MINTING, and the exact bound on it. This script used to promise it would NEVER
+# call /coord-mcp/provision-session, because minting re-provisions the ONE-SLOT
+# workdir key and would evict a live peer's — the exact failure class this
+# script exists to recover from. That promise is now NARROWED rather than
+# dropped, and the narrowing is what makes it safe:
+#
+#   * L4 source 3 mints, and it is reachable ONLY after L1 (this workdir's own
+#     .mcp.json) and L2 (every sibling) have each been PROBED and found dead.
+#   * It mints for $PWD — the very workdir whose key L1 just measured dead. A
+#     peer sharing this workdir shares that dead key, so there is no live slot
+#     here left to evict. Sibling workdirs are untouched: the slot is per-cwd.
+#   * $COORD_REVIVE_NO_MINT=1 disables it outright, for an operator who wants
+#     the old absolute guarantee back.
+#
+# Measured against the runner source while reviewing this change, and stronger
+# than the bound argued above: an EPHEMERAL mint cannot evict ANY peer, in this
+# workdir or another. `provision_session_proxy_config` ->
+# `register_session_proxy_nonce` mints `NonceLifetime::Ephemeral`, and
+# `coord_mcp.rs` states outright "do NOT re-add cwd-scoped eviction, which caused
+# the sibling-DoS" — that eviction was deliberately REMOVED. Ephemeral bindings
+# are also never persisted, so they never push against the 256-entry
+# MAX_PERSISTED_DEVICE_NONCES cap either; each mint simply ADDS a binding that
+# dies on its own TTL (12h). The operator's revoke is global and instant:
+# deleting ~/.qontinui/allow-session-coord-identity, re-checked per request.
+# Do not "restore" an eviction here on the strength of the first paragraph's
+# wording — the hazard it names is historical, not live.
+#
+# It is narrowed because the alternative was worse. On a HEADLESS runner the
+# UI-Bridge mint below CANNOT answer at all (no WebView), so a box with a live
+# device credential and no sibling .mcp.json lying around had no door whatsoever
+# and this script printed DEAD — confidently wrong. Plan
+# 2026-08-24-headless-box-has-no-working-coord-credential-door.
+#
+# What the mint returns is a NONCE, never a bearer: a local capability token
+# paired to this runner's own bound port, worthless off-box, with the runner
+# injecting a freshly-read device JWT per forwarded request.
+#
+# L4's other outbound POSTs are the runner's UI-Bridge token GETTERS
+# (`get_coord_device_token`, then `get_access_token_for_websocket`), which
+# return a credential the runner already holds and mutate nothing; the second is
+# the same call render-memory-cache.ps1 makes on every session boot.
+#
+# L4 source 4 mints its bearer through TWO runner doors, in order:
+#   invoke  POST <origin>/ui-bridge/invoke/get_coord_device_token  {}, then
+#           POST <origin>/ui-bridge/invoke/get_access_token_for_websocket  {}
+#           an IN-PROCESS arm of the invoke proxy - no WebView hop, so it
+#           answers on a headless runner. Two names for ONE credential slot;
+#           the ungated one is tried first because the other calls
+#           require_tier_2() and would turn a Tier-1 runner's live token into a
+#           tier refusal. A build without the allowlist entry answers HTTP 400
+#           "not in UI Bridge allowlist" (or 404 for the whole route); ONLY that
+#           answer moves on to the next name, and only both of them failing that
+#           way opens the eval fallback.
+#   eval    POST <origin>/ui-bridge/control/page/evaluate - the WebView mint,
+#           CSP-refused on the builds measured refusing (58414a05-1788118917383,
+#           2026-09-02; an unrecorded build, 2026-08-31 - it ANSWERED on
+#           546e9e024-1788209530736, 2026-09-01, so per-build, never every
+#           build) and kept solely for a build that predates the invoke entry; never attempted when /health says the
+#           runner is headless.
+# Whichever answered is named on the door (`source=runner-invoke:<command>` /
+# `source=runner-eval`). Both names read the SAME `access_token` slot -
+# "one slot, two names, both shipped" (coord-gates-and-access.md) - so neither
+# spelling upgrades the token's authority, and on the measured builds what comes
+# back is the operator's own Cognito identity rather than a fleet service one
+# (see PARTIAL_RUNNER_MINT below). The eval door additionally CANNOT ANSWER AT
+# ALL on a CSP-enforcing build - see RUNNER_EVAL_CSP_BLOCKED - which is why the
+# eval-free invoke door above is the one that has to carry this rung.
+#
+# TWO VERBS, no cascade: `coord-revive.sh call <tool> '<json-args>'` and
+# `coord-revive.sh tools` EXECUTE over the door L1 would find - the caller's
+# OWN .mcp.json nonce, walked up from $PWD - and print the JSON-RPC result.
+# They never mint (see the block below the helper functions).
+#
+# WEDGE AND BUDGET, the two verdicts that are not about one door:
+#   RUNNER_WEDGED    ONE endpoint answered on BOTH planes inside one sweep — a
+#                    transport-level verdict interleaved with an HTTP-level one.
+#                    No key or config fault can produce that set; the runner's
+#                    HTTP surface is starved. The re-provision advice is
+#                    SUPPRESSED on this path: re-provisioning during a wedge
+#                    evicts a live peer's key to fix a key that was never broken.
+#   BUDGET_EXCEEDED  the $PROBE_TOTAL_BUDGET wall clock ran out mid-sweep. It
+#                    replaces DEAD rather than joining it, because DEAD asserts
+#                    every door was probed and this run skipped some. The skipped
+#                    doors are named in the same list.
+#
+# Output: probe log on stderr; the final "VERDICT: ..." on stdout.
+# Exit: 0 = LIVE door found; 1 = cascade exhausted; 127 = missing curl, or
+#       neither jq nor python available to read JSON (both LOCAL faults).
+#       For the two verbs: 0 = the tool answered (result on stdout);
+#       1 = the door did not carry the call (typed reason on stderr: no
+#       provisioned nonce, 401, dead port, timeout); 3 = the tool answered
+#       with a JSON-RPC error (its answer, printed on stderr); 4 = usage.
+
+set -u
+
+RPC_LIST='{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+
+# THE END-TO-END PROBE, and why a `tools/list` green is not one.
+#
+# `tools/list` is answered by the PROXY: it proves the local hop, the nonce and
+# the JSON-RPC framing, and it says nothing whatever about whether coord is
+# behind it. A door can list 50-odd tools and then 502 on every call — the F2
+# class this cascade kept reporting as a clean LIVE. So a `tools/list`-only
+# green is downgraded to PROXY_LIVE_E2E_UNVERIFIED, which is still a LIVE-CLASS
+# verdict (the transport IS proven, as far as it went) but never a bare LIVE.
+#
+# THE TOOL IS `coord_query_identity` AND THE CHOICE IS MEASURED, not obvious:
+#   * zero required arguments, so `{}` is a VALID call rather than a validation
+#     error. `coord_can` was the first candidate and is WRONG for exactly this
+#     reason — with `{}` it answers isError:true, which would make every healthy
+#     door report LIVE_APP_ERROR and teach readers to ignore that verdict.
+#   * a READ, and a cheap one (~0.34s measured), so a diagnostic never mutates.
+#   * present in the device tool set AND in the runner's proxy allowlist, so it
+#     is callable over every rung this script probes, not just the loopback ones.
+# Verified live 2026-09-05: HTTP 200, isError:false.
+#
+# $COORD_REVIVE_E2E=0 turns it off. That is a CHOICE and it is reported as one —
+# the verdict stays PROXY_LIVE_E2E_UNVERIFIED, never an unearned LIVE.
+RPC_E2E='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"coord_query_identity","arguments":{}}}'
+PROBE_E2E="${COORD_REVIVE_E2E:-1}"
+COORD_URL="${COORD_HTTP_URL:-https://coord.qontinui.io}"
+# THE SECOND REMOTE HOST. Until 2026-09-11 this file named exactly one remote
+# host, and that single token WAS the whole host axis (plan
+# 2026-09-06-coord-reachability-verdicts-omit-the-host-axis). api.qontinui.io
+# is a DIFFERENT PROGRAM - the qontinui-web backend: plan-library, memory,
+# /api/v1 - on a different host. A 401 on coord.qontinui.io says nothing about
+# it: measured 2026-09-06 the same device JWT answered 200/422 there while
+# every coord.qontinui.io rung was refused. L6 probes it, and the AXES table
+# at the end names it whether or not L6 ran.
+WEB_URL="${QONTINUI_WEB_HTTP_URL:-https://api.qontinui.io}"
+# FOUR budgets, not one (three per-call, one for the whole sweep — the fourth is
+# defined below MINT_TIMEOUT). Until 2026-08-31 a single PROBE_TIMEOUT=15 was spent
+# on two calls that are orders of magnitude apart: the cheap JSON-RPC
+# `tools/list` probe (loopback, answers in milliseconds) and the WebView-driven
+# device-JWT mint at L4 source 4 (`POST <origin>/ui-bridge/control/page/evaluate`,
+# which bounces through a Tauri WebView to reach the Rust process holding the
+# credential). 15s was the SHORTEST budget any door in the fleet gave that mint,
+# and when it tripped this script printed VERDICT: DEAD - a false "no credential
+# available" for a box whose credential was fine, which is exactly the
+# confidently-wrong output this script exists to replace.
+#
+# Every value is env-overridable, following the $COORD_HTTP_URL idiom above.
+
+# TCP connect ONLY. A loopback connect either happens at once or the port is
+# dead; 5s is already generous, and its only real job is to stop a black-holed
+# remote host from hanging the whole cascade before the transfer even starts.
+PROBE_CONNECT_TIMEOUT="${COORD_REVIVE_CONNECT_TIMEOUT:-5}"
+
+# The whole `tools/list` probe in probe_door(), start to finish. Cheap by
+# construction on the L1/L2 loopback rungs; it also carries the L3/L4 bearer
+# probes against ${COORD_URL}/mcp, which answer a tool catalog over ONE HTTPS
+# POST with no session handshake. 15s leaves headroom for a cold TLS handshake
+# on a loaded box while still failing fast enough that sweeping a dozen
+# candidate .mcp.json files stays cheap - and a trip here is reported AS a
+# timeout by classify(), never as a credential verdict.
+PROBE_TIMEOUT="${COORD_REVIVE_PROBE_TIMEOUT:-15}"
+DOOR_SCRIPT_NAME="coord-revive"
+
+# The L4 source-4 BEARER mints - the in-process invoke door and the WebView
+# eval fallback behind it - and nothing else. 60s, aligned with the most generous
+# budget the fleet already gives this exact call (`/gate` residual (b) spends
+# -TimeoutSec 60 on it) - deliberately aligned UPWARD rather than to the median
+# of the fleet's 15/20/20/60 spread, because this is the door that actually has
+# to succeed: below it there is nothing left but the honest-failure report. The
+# measurement that forces the size is quoted at the mint itself - /health on
+# this same runner has been sampled from 296ms to 10120ms on a loaded box, and
+# the mint is a strictly longer call than /health (it adds the WebView hop).
+MINT_TIMEOUT="${COORD_REVIVE_MINT_TIMEOUT:-60}"
+
+# FOUR budgets now, and this one bounds the SWEEP rather than a call. The three
+# above each bound ONE request, which bounds nothing in aggregate: the cascade
+# probes as many doors as the filesystem hands it, so the total is a product
+# nobody chose. 60s is the size a human waits for a diagnostic before assuming it
+# has hung - and it is deliberately SMALLER than the arithmetic worst case,
+# because reporting which doors went unprobed is strictly better than a complete
+# answer nobody stayed to read. A trip is reported as BUDGET_EXCEEDED naming the
+# doors probed and the doors skipped; it is never reported as DEAD, which would
+# be a verdict about doors this run never touched.
+#
+# The measurement that forces a bound at all: every canonical door on this fleet
+# now resolves to the SAME runner port, so a device-JWT refresh makes all ~12
+# answer CREDENTIAL_REFRESHING together, each paying 15 + 3 + 15 = 33s ~= 400s
+# for one correlated fact. The budget is the backstop; the SHARED-UPSTREAM
+# short-circuit below is the actual fix.
+PROBE_TOTAL_BUDGET="${COORD_REVIVE_TOTAL_BUDGET:-60}"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+
+# ============================ SHARED COORD-DOOR CLASSIFIER v1 ============================
+# BYTE-IDENTICAL COPY. Lives in BOTH .claude/skills/coord-revive/coord-revive.sh and
+# .claude/skills/pr-status/pr-status.sh, pinned equal by CI check #35
+# (scripts/lint-shared-door-classifier.py). Edit ONE and CI reds until you edit BOTH.
+#
+# WHY A COPY AND NOT A SOURCED LIBRARY
+# (plan 2026-07-31-extract-shared-coord-door-classify-helper):
+#   qontinui-runner bundles fleet command files into its BINARY via `include_str!`
+#   (src-tauri/src/fleet_commands.rs). `include_str!` embeds the text of ONE file at
+#   compile time, so a bundled copy has no sibling files and no filesystem to resolve
+#   them against — a `source` line in a bundled script is not fragile, it is
+#   STRUCTURALLY IMPOSSIBLE. The bundle already carries gate.md and policy.md, i.e. it
+#   is growing along exactly this coord-door axis. scripts/lib/ is good precedent for
+#   code that always has a filesystem; these two scripts are about to stop having one.
+#
+# CALLER CONTRACT — set these BEFORE this block:
+#   PROBE_TIMEOUT     seconds; interpolated into the TIMEOUT verdict string.
+#   DOOR_SCRIPT_NAME  this script's name, for LOCAL-fault preflight errors.
+#
+# VERDICT STRINGS ARE AN INTERFACE. coord-revive.sh's probe_door() branches on
+# `CREDENTIAL_REFRESHING*` as a PREFIX match to decide whether to retry (it appends a
+# "[curl: …]" suffix to every non-LIVE verdict, which is why the match is a prefix).
+# A one-character change silently removes that retry, with no error anywhere.
+#
+# THREE MORE PREFIXES ARE LOAD-BEARING, added by plan
+# 2026-08-06-coord-mcp-post-remediation-plan Phase 1:
+#   TIMEOUT*                     both carriers retry it once. `TIMEOUT_UPSTREAM` is
+#                                DELIBERATELY spelled to share that prefix, so a
+#                                proxy-reported upstream stall inherits the retry.
+#                                It is separately classified as an HTTP-PLANE answer
+#                                by coord-revive.sh's wedge detector, which reads
+#                                TIMEOUT_UPSTREAM* BEFORE TIMEOUT*; swap that order
+#                                and every 504 starts corroborating a runner wedge
+#                                that is not happening.
+#   LIVE_APP_ERROR*              TRANSPORT-LIVE. The door carried the call and the
+#                                TOOL complained. Any caller comparing `verdict` to
+#                                the literal "LIVE" drops it on the floor and reports
+#                                a dead door over a demonstrably live one.
+#   PROXY_LIVE_UPSTREAM_DEAD*    the proxy is LIVE and its coord hop is not. Both
+#                                carriers re-probe it once; a second one is final.
+#                                It is NOT a live-class verdict: no call can be
+#                                carried over it.
+# ========================================================================================
+: "${PROBE_TIMEOUT:?must be set before the shared coord-door classifier}"
+: "${DOOR_SCRIPT_NAME:?must be set before the shared coord-door classifier}"
+
+if ! command -v curl >/dev/null 2>&1; then
+  echo "$DOOR_SCRIPT_NAME: ERROR: curl is required (LOCAL fault, not a coord verdict)." >&2
+  exit 127
+fi
+
+# jq is NOT guaranteed to exist — it is ABSENT on the Windows operator box
+# (verified 2026-08-06 by the /policy + /gate fix, and again 2026-08-07 when THIS
+# script hard-exited 127 during a real dead-transport recovery). Requiring it
+# outright is worse here than anywhere else in the fleet: this script is the
+# documented recovery path for "Command failed with no output", so an agent hits
+# it precisely when coord is already unreachable — and got a bare
+# "jq is required" with no door probed and no typed verdict. The recovery tool
+# must not be the thing that fails.
+#
+# Pick a reader up front and fail LOUD naming it a LOCAL fault, so a missing
+# binary can never read as a coord verdict (same rule as AUTH_HEADER_* below).
+# Inherited from the /policy and /gate fix rather than diverging from it.
+# `command -v python` proves a NAME resolves, not that it WORKS. Windows ships
+# App Execution Alias stubs at %LOCALAPPDATA%/Microsoft/WindowsApps/python{,3}.exe
+# which resolve, print nothing and exit non-zero — and both names are the same
+# stub, so a python3 fallback cannot rescue it. Accepting one would make every
+# read_cfg return empty, every candidate be rejected as "no proxy-shaped
+# coord-mcp entry" (a message that blames the CONFIG), and the cascade print
+# VERDICT: DEAD over live doors. That is the missing-binary-reads-as-empty-field
+# bug this fix exists to kill, reintroduced one layer up. Smoke-test instead.
+# unstamped-floor-ok: a counterfactual about a missing JSON reader, not a measured floor 2026-09-11
+JSON_READER=""
+if command -v jq >/dev/null 2>&1; then
+  JSON_READER=jq
+else
+  for c in python python3; do
+    # Check the OUTPUT, not just the exit code. A python that prints at
+    # interpreter start (sitecustomize/usercustomize, a printing .pth, a conda
+    # or venv shim) exits 0 and would pass an exit-code-only probe -- then
+    # shifts read_cfg's positional two-line pair by one, emptying every value
+    # and printing DEAD over live doors. That is the same
+    # missing-binary-reads-as-empty class this selection exists to close,
+    # entering through stdout instead of the status. tr strips the CR a native
+    # Windows python appends.
+    if command -v "$c" >/dev/null 2>&1 \
+       && [ "$("$c" -c 'import json;print(1)' </dev/null 2>/dev/null | tr -d '\r\n')" = "1" ]; then
+      JSON_READER="$c"; break
+    fi
+  done
+fi
+if [ -z "$JSON_READER" ]; then
+  echo "$DOOR_SCRIPT_NAME: ERROR: neither jq nor a working python can read JSON — cannot probe any door (LOCAL fault, not a coord verdict)." >&2
+  exit 127
+fi
+
+# rpc_has_result — reads a JSON-RPC body on STDIN; 0 iff it carries a real
+# `result` and no `error`. A JSON-RPC surface answers HTTP 200 even for in-band
+# errors, so LIVE requires the result object itself, or the caller re-issues its
+# lost write into a broken door.
+rpc_has_result() {
+  if [ "$JSON_READER" = jq ]; then
+    jq -e '(.error == null) and (.result != null)' >/dev/null 2>&1  # envelope-ok: a two-key PRESENCE predicate (exit status only, no value leaves it); rpc_print_result is the typed reader
+  else
+    "$JSON_READER" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(1)
+sys.exit(0 if (d.get("error") is None and d.get("result") is not None) else 1)' >/dev/null 2>&1  # envelope-ok: same presence predicate, python arm
+  fi
+}
+
+# rpc_error_code — reads a JSON body on STDIN; prints the typed ERROR CODE the
+# envelope carries (`.error.code`, else a top-level `.code`), or nothing.
+#
+# READ THE CODE, NEVER THE MESSAGE. The runner's proxy error text is due to grow
+# a source chain, so a classifier keyed on message text would stop matching on
+# the day it does — a live 502 silently re-reading as an unclassified `HTTP_502`,
+# i.e. the undifferentiated mask this whole block exists to replace, restored by
+# a wording change nobody would think to check. The code token is the contract;
+# the message is prose.
+#
+# Anything that is not a STRING comes back empty, so a numeric JSON-RPC `code`
+# (the -32601 family) cannot collide with the proxy's symbolic ones.
+rpc_error_code() {
+  if [ "$JSON_READER" = jq ]; then
+    jq -r 'if type == "object" then (((.error? | objects | .code?) // .code?) // "") else "" end
+           | if type == "string" then . else "" end' 2>/dev/null  # envelope-ok: reads ONLY the typed code token, never the message text, and a non-string is "" rather than a value
+  else
+    "$JSON_READER" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print(); sys.exit(0)
+e=d.get("error") if isinstance(d,dict) else None
+c=e.get("code") if isinstance(e,dict) else None
+if not isinstance(c,str):
+    c=d.get("code") if isinstance(d,dict) else None
+print(c if isinstance(c,str) else "")' 2>/dev/null  # envelope-ok: same typed code token, python arm
+  fi
+}
+
+# rpc_is_app_error — reads a JSON-RPC body on STDIN; 0 iff `.result` is a
+# WELL-FORMED MCP TOOL ENVELOPE reporting a TOOL-level error: an object carrying
+# `content` whose `isError` is true.
+#
+# READ THIS BEFORE TOUCHING IT — THE TRAP IS THE WHOLE POINT. `isError` is a
+# property of the TOOL's answer, never of the transport: the door carried the
+# call, coord ran the tool, and the tool complained. The obvious edit — folding
+# an `isError` test into `rpc_has_result` above so a "failed" response stops
+# counting as a result — turns that into a DEAD verdict over a door that just
+# demonstrated it works end to end. That is the worst output this family of
+# scripts can produce (coord-revive's SKILL.md sells its DEAD line as honest
+# blocked-evidence), so the caller maps this to LIVE_APP_ERROR, which is a
+# LIVE-CLASS verdict, and NEVER to a dead one.
+#
+# `content` is required alongside `isError` on purpose: without it, any tool
+# whose own DATA happens to carry a field named `isError` would be read as an
+# envelope. Requiring both keeps the predicate about the MCP envelope shape.
+rpc_is_app_error() {
+  if [ "$JSON_READER" = jq ]; then
+    jq -e '((.result | objects | (has("content") and (.isError == true))) // false)' >/dev/null 2>&1  # envelope-ok: a two-key PRESENCE predicate over the tool envelope (exit status only, no value leaves it)
+  else
+    "$JSON_READER" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(1)
+r=d.get("result") if isinstance(d,dict) else None  # envelope-ok: a PRESENCE test, not a read - the value never leaves this function, only the exit status does
+sys.exit(0 if (isinstance(r,dict) and "content" in r and r.get("isError") is True) else 1)' >/dev/null 2>&1  # envelope-ok: same presence predicate, python arm
+  fi
+}
+
+# rpc_result_rows — reads a JSON-RPC body on STDIN; prints the ROW COUNT the
+# `result` carries under the FIRST PRESENT key of a closed list, or `-1` when
+# no listed key is present. Not a verdict by itself (plan
+# 2026-09-03-capability-floor-claims-carry-their-probe, D3): a 2xx whose list
+# is empty under a key the caller GUESSED is indistinguishable from an empty
+# corpus at the call site, and it fails toward a false negative about a
+# capability — occurrence 10 read `.records`/`.results` off a body whose key
+# was `.hits` and reported 0 hits four times, including for a bare `DOSSIER`.
+# So the rule is: zero rows under every known key is UNKNOWN(envelope) until a
+# control read against a known-present record confirms the key.
+#
+# An MCP tool result arrives boxed — `result.content[0].text` holding the
+# tool's JSON as a string — so that box is opened first when it is present; a
+# bare `result` object (tools/list's `tools`) is read directly. The closed
+# list, in order: hits, records, results, items, findings, documents,
+# work_units, gates, tools, alerts (the agent alert queue's rows key, plan
+# 2026-09-18-notifications-are-agent-actions-and-alerts-are-agent-work). Anything
+# that is not an array under the matched key is `-1`, never a count.
+rpc_result_rows() {
+  if [ "$JSON_READER" = jq ]; then
+    jq -r '
+      def rows: . as $r
+        | (["hits","records","results","items","findings","documents","work_units","gates","tools","alerts"]
+           | map(select(. as $k | $r | has($k)))) as $present
+        | if ($present | length) == 0 then -1
+          else ($r[$present[0]] | if type == "array" then length else -1 end) end;
+      (.result? // null) as $res
+      | if ($res | type) != "object" then -1
+        elif (($res.content? | type) == "array") and (($res.content[0]?.text? | type) == "string")
+          then (($res.content[0].text | try fromjson catch null) as $inner
+                | if ($inner | type) == "object" then ($inner | rows) else -1 end)
+        else ($res | rows) end' 2>/dev/null  # envelope-ok: a COUNT under the first present key of a closed list, -1 when none is present; no row value leaves it
+  else
+    "$JSON_READER" -c 'import json,sys
+KEYS=("hits","records","results","items","findings","documents","work_units","gates","tools","alerts")
+def rows(r):
+    for k in KEYS:
+        if k in r:
+            v=r[k]
+            return len(v) if isinstance(v,list) else -1
+    return -1
+try: d=json.load(sys.stdin)
+except Exception: print(-1); sys.exit(0)
+res=d.get("result") if isinstance(d,dict) else None  # envelope-ok: the PRESENCE/shape walk that picks a list to count; the count is the only value that leaves
+if not isinstance(res,dict): print(-1); sys.exit(0)
+c=res.get("content")
+if isinstance(c,list) and c and isinstance(c[0],dict) and isinstance(c[0].get("text"),str):
+    try: inner=json.loads(c[0]["text"])
+    except Exception: print(-1); sys.exit(0)
+    print(rows(inner) if isinstance(inner,dict) else -1); sys.exit(0)
+print(rows(res))' 2>/dev/null  # envelope-ok: same closed-list count, python arm
+  fi
+}
+
+# runner_credential_field <body> <field> -> the TOP-LEVEL field's string value,
+# or "" when it is absent, non-string, or the body will not parse.
+#
+# The runner's OWN 401 (plan 2026-09-12-runner-loads-with-an-expired-coord-credential-and-tells-nobody,
+# DD4) carries {"code":"runner_credential_<posture>","since":…,"remedy":…} at the
+# TOP LEVEL, and DD4 also has coord's `credential_free_doors` catalogue riding
+# along in the same object — an array of door records whose keys this script does
+# not get to constrain, because they are copied from coord's last answer.
+#
+# A TEXTUAL read cannot be made safe against that, and the first cut of this
+# function proved it. `grep -o … | head -1` was chosen over a greedy `sed` so a
+# first-match beats a last-match, which is right — but it only helps for a key
+# that sorts BEFORE the catalogue. serde_json here is a BTreeMap (1.0.149, no
+# `indexmap`, so `preserve_order` is off), so the refusal body serializes SORTED:
+# cause, code, credential_free_doors, error, layer, next_door, posture,
+# posture_cause, probed_at, remedy, retryable, since, since_unix, success.
+# `code` sorts before the catalogue; `since`, `remedy`, `posture` and `next_door`
+# all sort AFTER it. Measured against a decoy catalogue, the textual reader
+# returned coord's catalogue entry for every one of those four.
+#
+# So the read is a real top-level parse, exactly as the METHOD_NOT_ALLOWED arm
+# below reads `error.data.cause`. `$JSON_READER` is guaranteed non-empty — this
+# script exits 127 at startup when neither jq nor a working python is present —
+# so there is no rung here that can silently degrade to the textual guess.
+runner_credential_field() {
+  if [ "$JSON_READER" = jq ]; then
+    printf '%s' "$1" | jq -r --arg k "$2" '((.[$k]?) // "") | if type == "string" then . else "" end' 2>/dev/null | tr -d '\r\n'  # envelope-ok: one TOP-LEVEL key of the runner's own 401 body; a nested catalogue entry is unreachable from `.[$k]`, which is the whole point
+  else
+    printf '%s' "$1" | "$JSON_READER" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print(); sys.exit(0)
+v=d.get(sys.argv[1]) if isinstance(d,dict) else None  # envelope-ok: same TOP-LEVEL read, python arm; a non-object body reads as absent, never as a value
+print(v if isinstance(v,str) else "")' "$2" 2>/dev/null | tr -d '\r\n'
+  fi
+}
+
+# runner_credential_code_textual <body> -> the `code` value, read without a parser.
+#
+# The ONE fallback, and only for `code`, because only `code` has a bound that
+# makes a textual read exact: it sorts before `credential_free_doors`, so
+# everything up to the catalogue is a region the catalogue cannot contaminate.
+# It exists so a body that will not PARSE — truncated mid-transfer, or an
+# envelope shape this script has not seen — still yields the posture rather than
+# collapsing the class verdict to `unstated`. `since` and `remedy` get no such
+# fallback: there is no safe textual read for a key that sorts after the
+# catalogue, and inventing one is how the defect above happened.
+runner_credential_code_textual() {
+  local head
+  head="${1%%\"credential_free_doors\"*}"
+  printf '%s' "$head" | tr -d '\n\r' \
+    | grep -o '"code"[[:space:]]*:[[:space:]]*"[^"]*"' \
+    | head -1 \
+    | sed 's/.*"\([^"]*\)"$/\1/'
+}
+
+# classify <curl_exit> <http_code> <body> [unauth-wording] -> typed verdict.
+# 401 wording is parameterized because on a loopback proxy it means "stale
+# proxy key" while on the direct bearer door it means "rejected bearer".
+#
+# INVARIANT: every path returns a NAMED cause. A verdict that names nothing is
+classify() {
+  local ce="$1" code="$2" body="$3" unauth="${4:-COORD_MCP_PROXY_UNAUTHORIZED (stale/evicted proxy key)}"
+  # curl can fail BEFORE the transfer starts (unopenable `--header @file`, bad
+  # URL). It then never writes its `-w` output, so $code arrives EMPTY — not
+  # "000", which is what curl reports for a failure during the transfer. An
+  # empty code fell through every branch below into the "HTTP_$code
+  # (unclassified: …)" tail and printed a bare `HTTP_ (unclassified: )`:
+  # exactly the undifferentiated mask this script exists to replace. Normalize
+  # first so the pre-transfer failures reach the same named causes.
+  [ -n "$code" ] || code="000"
+  if [ "$ce" = "7" ]; then echo "CONNECT_REFUSED (dead port - no listener)"; return; fi
+  # THE PROXY DID NOT ANSWER. Nothing came back inside the budget, so whether the
+  # proxy ever answered is UNKNOWN — this box abandoned the request. Deliberately
+  # NOT the same statement as TIMEOUT_UPSTREAM below, which is the proxy ANSWERING
+  # that its own upstream hung. Collapsing the two loses the one bit that decides
+  # what to do next: a door that never answered may still be alive and loaded,
+  # while a door that answered 504 is provably alive and its coord hop is not.
+  if [ "$ce" = "28" ]; then echo "TIMEOUT (no response reached this box within ${PROBE_TIMEOUT}s - the request was abandoned client-side, so whether the proxy answered at all is UNKNOWN; this is NOT the proxy reporting a stalled upstream, which is TIMEOUT_UPSTREAM). Often SATURATION rather than a dead door - do NOT restart the runner on this alone; re-run, or use another door"; return; fi
+  # 26 = "couldn't open/read the local data file", i.e. the auth-header file.
+  # This is a LOCAL fault and must never read as a coord verdict — the same
+  # rule coord-acting-bearer.sh states for its mint ("a 'Failed to open' here
+  # must not masquerade as 'coord down'").
+  if [ "$ce" = "26" ]; then
+    echo "AUTH_HEADER_UNREADABLE (curl could not open the staged header file - LOCAL fault, says nothing about coord)"; return
+  fi
+  # Also "the proxy did not answer", by a different route: the transfer failed
+  # before any status line arrived (DNS, TLS, a reset). `000` is curl's own
+  # no-status marker, so it is a statement about THIS BOX's reach, never about
+  # the upstream behind the proxy.
+  if [ "$ce" != "0" ] && [ "$code" = "000" ]; then echo "UNREACHABLE (curl exit $ce - the transfer never completed and NO HTTP status came back, so nothing here observed the proxy answering)"; return; fi
+  # Non-2xx guard on the body-marker match (asymmetry 2). Without it a healthy
+  # 200 whose payload merely CONTAINS the marker — a tool description or a PR
+  # body discussing this very verdict — classifies as CREDENTIAL_REFRESHING
+  # instead of LIVE: a confidently wrong DEAD verdict about a live door.
+  # Adopted from pr-status.sh's `[[ "$code" != 2* ]]`, which guarded it first.
+  # Latent, not live, when written: a real tools/list against the live loopback
+  # door returned 200 / 101499 bytes with 0 occurrences of either marker
+  # (measured 2026-07-31). The guard closes it before it becomes live.
+  case "$code" in
+    2*) ;;
+    *)
+      case "$body" in
+        *COORD_MCP_PROXY_CREDENTIAL_REFRESHING*|*CREDENTIAL_REFRESHING*)
+          echo "CREDENTIAL_REFRESHING (retry-safe - proxy up, withholding while its device JWT refreshes)"; return ;;
+        *runner_credential_*)
+          # READ BEFORE the nonce arm, and that order is the whole point. This
+          # 401 is the runner refusing the call out of its OWN credential state
+          # while the nonce it was handed is perfectly good; classified as
+          # COORD_MCP_PROXY_UNAUTHORIZED it would send the reader to rotate a
+          # key that is fine, and — worse — to re-provision, which evicts the
+          # live slot and still leaves the runner's dead device JWT dead. The
+          # runner's own breadcrumb spells the same fact RUNNER_CREDENTIAL_<POSTURE>;
+          # the verdict word is shared with it on purpose.
+          local rc_posture rc_since rc_remedy
+          rc_posture="$(runner_credential_field "$body" code)"
+          # Parser first, text only when the body would not parse at all.
+          [ -n "$rc_posture" ] || rc_posture="$(runner_credential_code_textual "$body")"
+          rc_posture="${rc_posture#runner_credential_}"
+          rc_since="$(runner_credential_field "$body" since)"
+          rc_remedy="$(runner_credential_field "$body" remedy)"
+          # An UNPARSEABLE posture is still this class — the marker matched —
+          # so it gets the class verdict with the posture named UNSTATED rather
+          # than silently falling through to the nonce arm.
+          [ -n "$rc_posture" ] || rc_posture="unstated"
+          echo "RUNNER_CREDENTIAL_$(printf '%s' "$rc_posture" | tr '[:lower:]' '[:upper:]') (HTTP 401 from the RUNNER, not from coord and NOT about your nonce: the forwarder refused to carry this call because its own coord credential is $rc_posture since ${rc_since:-unstated}. The key in this .mcp.json is FINE - do NOT rotate it and do NOT re-provision, which mints a new nonce for a credential that stays dead and evicts whatever holds this workdir's slot. L4/L5 carry their own credentials and DO answer. remedy=${rc_remedy:-unstated})"; return ;;
+        *COORD_MCP_PROXY_UNAUTHORIZED*)
+          echo "$unauth"; return ;;
+        *COORD_MCP_PROXY_METHOD_NOT_ALLOWED*)
+          # A `-32601` from the proxy has three causes -- stale binary, drift,
+          # deliberate -- and since plan 2026-09-03-coord-mcp-403-names-its-own-cause
+          # the refusal NAMES which one in `data.cause` (`stale_binary` | `drift`
+          # | `deliberate` | `unknown`; `method_not_allowed` for a refused
+          # METHOD) with a one-sentence `data.remedy`. Print exactly what the
+          # body carries: the `-32601` posture discloses nothing about coord's
+          # upstream grant, and neither does this verdict. A runner built before
+          # that plan emits only `data.code`; then the cause is UNSTATED -- not
+          # "drift", not "boundary" -- and the reader runs the by-hand lookups
+          # (GET /coord-mcp/tool-policy, /health buildDrift) instead.
+          local mna_cause mna_remedy
+          if [ "$JSON_READER" = jq ]; then
+            mna_cause=$(printf '%s' "$body" | jq -r '((.error? | objects | .data? | objects | .cause?) // "") | if type == "string" then . else "" end' 2>/dev/null | tr -d '\r')  # envelope-ok: reads the typed `cause` token the refusal body carries; an absent field is "" and prints as UNSTATED, never as a default cause
+            mna_remedy=$(printf '%s' "$body" | jq -r '((.error? | objects | .data? | objects | .remedy?) // "") | if type == "string" then . else "" end' 2>/dev/null | tr -d '\r\n')  # envelope-ok: same typed read for the one-sentence `remedy`
+          else
+            mna_cause=$(printf '%s' "$body" | "$JSON_READER" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print(); sys.exit(0)
+e=d.get("error") if isinstance(d,dict) else None
+x=e.get("data") if isinstance(e,dict) else None  # envelope-ok: the JSON-RPC error data object; a non-object reads as absent, never as a value
+v=x.get(sys.argv[1]) if isinstance(x,dict) else None
+print(v if isinstance(v,str) else "")' cause 2>/dev/null | tr -d '\r')
+            mna_remedy=$(printf '%s' "$body" | "$JSON_READER" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print(); sys.exit(0)
+e=d.get("error") if isinstance(d,dict) else None
+x=e.get("data") if isinstance(e,dict) else None  # envelope-ok: same typed read for the one-sentence `remedy`, python arm
+v=x.get(sys.argv[1]) if isinstance(x,dict) else None
+print(v if isinstance(v,str) else "")' remedy 2>/dev/null | tr -d '\r\n')
+          fi
+          if [ -n "$mna_cause" ]; then
+            echo "METHOD_NOT_ALLOWED (cause=$mna_cause remedy=${mna_remedy:-unstated})"
+          else
+            echo "METHOD_NOT_ALLOWED (cause=unstated (runner build predates the discriminator - read GET /coord-mcp/tool-policy and buildDrift))"
+          fi
+          return ;;
+      esac ;;
+  esac
+  case "$code" in
+    200)
+      # A JSON-RPC surface answers 200 even for in-band errors — LIVE requires
+      # an actual result object, or the caller re-issues into a broken door.
+      if printf '%s' "$body" | rpc_has_result; then
+        # …and a result that IS a tool envelope reporting isError:true is still a
+        # result: the transport is PROVEN end to end and the TOOL declined. See
+        # rpc_is_app_error's header for why this must never become a dead verdict.
+        if printf '%s' "$body" | rpc_is_app_error; then
+          echo "LIVE_APP_ERROR (transport PROVEN end to end - the door carried the call, coord ran the tool, and the TOOL answered isError:true. That is the tool's verdict, not the door's: treat this as LIVE)"
+        else
+          echo "LIVE"
+        fi
+      else
+        echo "HTTP_200_NOT_MCP (200 without a JSON-RPC result - treat as dead)"
+      fi
+      return ;;
+    401) echo "$unauth"; return ;;
+    408|504)
+      # THE PROXY ANSWERED, and what it answered is that its own upstream did
+      # not. Spelled to share the TIMEOUT* prefix so both carriers' retry picks
+      # it up; classified on the HTTP plane, not the transport one, because a
+      # status line came back.
+      echo "TIMEOUT_UPSTREAM (HTTP $code - the proxy ANSWERED and reported that ITS upstream did not: a live local door in front of a hop that hung. Distinct from TIMEOUT, where nothing answered at all and this box abandoned the request. Retry-safe)"; return ;;
+    502)
+      # The F2 class: proxy LIVE, coord /mcp hop DEAD. Matched on the envelope's
+      # typed `code`, deliberately NOT on its message — see rpc_error_code.
+      # An unrecognised 502 deliberately FALLS THROUGH to the unclassified tail
+      # below rather than borrowing this verdict: this script names causes it has
+      # tested, and a 502 from something that is not the coord-mcp proxy has not
+      # been.
+      case "$(printf '%s' "$body" | rpc_error_code | tr -d '\r')" in
+        COORD_MCP_PROXY_UPSTREAM_UNREACHABLE|COORD_MCP_PROXY_UPSTREAM_READ_FAILED|COORD_MCP_PROXY_UPSTREAM_NON_JSON_ERROR)
+          echo "PROXY_LIVE_UPSTREAM_DEAD (proxy answered, the coord /mcp hop failed - the F2 class; re-probe once, then treat as retryable-unknown)"; return ;;
+      esac ;;
+    503) echo "CREDENTIAL_REFRESHING (retry-safe - HTTP 503)"; return ;;
+  esac
+  local snippet
+  snippet=$(printf '%s' "$body" | tr -d '\n' | head -c 120)
+  echo "HTTP_$code (unclassified: ${snippet:-<empty body>})"
+}
+
+# ========================== END SHARED COORD-DOOR CLASSIFIER v1 ==========================
+
+# scripts/lib/envelope.sh: the typed envelope reader (an absent key is exit 3
+# with an `UNKNOWN:` line on stderr and NOTHING on stdout, never ""). It
+# inherits the reader chosen above rather than choosing its own. WHERE it is
+# found is the resolver's business, immediately below; the 31-of-32 measurement
+# that forced the walk is quoted there, once, rather than here as well.
+#
+# ONE resolver, and it spends NO subprocess per lookup.
+#
+# This file looks for FOUR sibling files under the config repo's `scripts/` --
+# lib/envelope.sh just below, coord-acting-bearer.sh at L3,
+# coord-provision-nonce.sh at L4 and lib/guard-decision-log.sh at L5 -- and each
+# carried its OWN copy of the rule for finding them. So when the walk was fixed
+# it was fixed for envelope.sh ONLY: the same 31-of-32 checkouts that could not
+# find the library went on reporting HELPER_NOT_FOUND for the acting-bearer and
+# nonce-mint helpers, and silently dropped the L5 counter. That is a LOCAL path
+# fault rendered as a named CREDENTIAL verdict -- precisely the
+# confidently-wrong answer this whole cascade exists to eliminate. pr-status.sh
+# looks for a fifth and carries its own copy of this block for the same reason.
+#
+# The rule the two fixed rungs get wrong: they assume $HERE sits THREE levels
+# below a directory that ALSO contains `scripts/` -- i.e. that this `.claude/`
+# is the config repo's own, or a symlink into it. True for
+# <workspace-root>/.claude and for qontinui-claude-config itself; FALSE for
+# every other checkout, because each carries its OWN REAL `.claude/` copy of
+# the skills bundle. `pwd -P` then has no symlink to resolve and lands back on
+# the first rung's non-existent path, leaving only $QONTINUI_ROOT -- routinely
+# unset. So walk UP instead of assuming a depth, testing each ancestor for
+# `scripts/<rel>` (the config repo at whatever depth) and for
+# `qontinui-claude-config/scripts/<rel>` (the workspace root, reached from a
+# sibling checkout). The fixed rungs are kept FIRST, so every layout that
+# resolved before still resolves on the first test.
+#
+# WHY IT IS WRITTEN THIS WAY rather than the obvious way: on Windows/MSYS a
+# FORK is the expensive operation, and the obvious spelling forks per ancestor.
+# Measured on the operator box, same process, same $HERE, $QONTINUI_ROOT unset:
+# the walk as first written took 32907 ms for ONE resolution, this one 4908 ms
+# cold and 157 ms for three further lookups. A fork measured 1098 ms against
+# ~22 ms for a `[ -f ]`, so the forks were ~50x the cost of the stat work they
+# surrounded. A diagnostic whose own door probes are budgeted at 15-20 s cannot
+# spend 33 s deciding where its library lives.
+#
+# So, in descending order of what it bought: this ASSIGNS to $__RFS_PATH instead
+# of printing, so no call site needs the `X="$(...)"` fork; `${var%/*}` replaces
+# `dirname`; first-hit return replaces materializing a candidate list (no
+# command substitution, no heredoc); and the only two facts that genuinely need
+# a subprocess -- the physical $HERE and the --git-common-dir workspace root --
+# are resolved ONCE into globals by __fleet_script_init rather than per lookup.
+# Steady state is zero forks per lookup and two for the whole script run.
+__FLEET_SCRIPT_INIT=""
+__FLEET_HERE_PHYS=""
+__FLEET_GIT_ROOT=""
+__RFS_PATH=""
+
+__fleet_script_init() {
+  [ -n "$__FLEET_SCRIPT_INIT" ] && return 0
+  __FLEET_SCRIPT_INIT=1
+  # The PHYSICAL $HERE, kept only when it actually differs -- <workspace-root>/
+  # .claude is a symlink into the config repo, and that is the layout this rung
+  # exists for. Equal to $HERE (every real checkout) it would only re-test paths
+  # the logical walk already covers.
+  #
+  # The `|| __FLEET_HERE_PHYS=""` is LOAD-BEARING, not defensive habit. Under
+  # `set -e` an assignment inherits the exit status of its command substitution,
+  # and `cd "$HERE" && pwd -P` exits non-zero whenever $HERE is no longer
+  # enterable -- a pruned worktree, a broken Windows junction, an ancestor that
+  # lost search permission. Without it the script DIES HERE, silently (the
+  # `2>/dev/null` hides the message but not the status) and with the same exit
+  # code it uses for "every door refused": a purely local path fault rendered as
+  # a door verdict, which is the exact class this whole resolver exists to stop.
+  __FLEET_HERE_PHYS="$(cd "$HERE" 2>/dev/null && pwd -P)" || __FLEET_HERE_PHYS=""
+  [ "$__FLEET_HERE_PHYS" = "$HERE" ] && __FLEET_HERE_PHYS=""
+  # The workspace root, derived the way this file's own root resolution and
+  # /policy Step 2 both derive it:
+  # `--git-common-dir`, NEVER `--show-toplevel`, which inside a LINKED WORKTREE
+  # returns the worktree path -- so the walk would climb the worktree container
+  # (`agent-worktrees/<uuid>`) instead of the workspace root. Sessions run under
+  # QONTINUI_AGENT_WORKTREE_MODE=1, so that is the common path, not the corner.
+  #
+  # TWO spellings, because `--path-format=absolute` needs git >= 2.31 (Mar 2021)
+  # and this fleet has Linux boxes on distro git -- Ubuntu 20.04 ships 2.25.
+  # There, the option is REJECTED and this rung would silently vanish. So fall
+  # back to the older `--git-common-dir` plus `cd && pwd`, which is what the
+  # code being replaced used and works on any git; it costs one extra fork, and
+  # only on the machines that need it.
+  __fleet_gc="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || __fleet_gc=""
+  case "$__fleet_gc" in
+    /*|[A-Za-z]:[/\\]*) ;;
+    *) __fleet_gc="$(git rev-parse --git-common-dir 2>/dev/null)" || __fleet_gc=""
+       [ -n "$__fleet_gc" ] && { __fleet_gc="$(cd "$__fleet_gc" 2>/dev/null && pwd)" || __fleet_gc=""; }
+       ;;
+  esac
+  if [ -n "$__fleet_gc" ]; then
+    __fleet_gc="${__fleet_gc%/}"      # <checkout>/.git
+    __fleet_gc="${__fleet_gc%/*}"     # <checkout>
+    __FLEET_GIT_ROOT="${__fleet_gc%/*}"
+  fi
+  unset __fleet_gc
+  return 0
+}
+
+# __rfs_try <path> -- record it in $__RFS_PATH iff it is a READABLE REGULAR file
+# and nothing has been found yet. `-f` AND `-r`, never `-x`: every target is
+# either `.`-sourced or run as `bash <path>`, both of which need it readable and
+# neither of which needs the exec bit -- routinely dropped on Windows/MSYS
+# checkouts, where testing for it would skip an available helper in silence.
+# Always exits 0: the callers run under `set -e`.
+__rfs_try() {
+  [ -n "$__RFS_PATH" ] && return 0
+  [ -f "$1" ] && [ -r "$1" ] && __RFS_PATH="$1"
+  return 0
+}
+
+# __resolve_fleet_script <rel> -- set $__RFS_PATH to the resolved path for
+# `scripts/<rel>`, or to the EMPTY STRING when there is none.
+#
+# It ASSIGNS rather than PRINTS, and every call site reads the variable on the
+# SAME LINE rather than spelling `X="$(__resolve_fleet_script ...)"`. Two
+# reasons, both of which bite here: a command substitution is a FORK, measured
+# at 1098 ms on the operator box, which is more than twice the ~440 ms of actual
+# stat work a lookup does -- so the idiom would cost more than the search; and a
+# `$( )` whose command exits non-zero aborts a `set -e` script before it can
+# reach its own HELPER_NOT_FOUND branch, which is the branch that exists to
+# explain the failure. This function is therefore never non-zero either.
+__resolve_fleet_script() {
+  __rfs_rel="$1"
+  __RFS_PATH=""
+  __fleet_script_init
+  # Rungs 1 and 2: the original fixed depth, logical then physical.
+  __rfs_try "$HERE/../../../scripts/$__rfs_rel"
+  [ -n "$__FLEET_HERE_PHYS" ] && __rfs_try "$__FLEET_HERE_PHYS/../../../scripts/$__rfs_rel"
+  # Rung 3: only when the variable is actually set. Unset, it degenerates to an
+  # absolute path off the filesystem root -- a candidate that could never exist,
+  # which would make the "searched" list in the refusal message a lie.
+  [ -n "${QONTINUI_ROOT:-}" ] && __rfs_try "${QONTINUI_ROOT}/qontinui-claude-config/scripts/$__rfs_rel"
+  # The walk: every ancestor of $HERE, logical and physical.
+  for __rfs_base in "$HERE" "$__FLEET_HERE_PHYS"; do
+    [ -n "$__RFS_PATH" ] && break
+    [ -n "$__rfs_base" ] || continue
+    __rfs_d="$__rfs_base"
+    while [ -n "$__rfs_d" ] && [ -z "$__RFS_PATH" ]; do
+      __rfs_try "$__rfs_d/scripts/$__rfs_rel"
+      __rfs_try "$__rfs_d/qontinui-claude-config/scripts/$__rfs_rel"
+      # `${var%/*}` is `dirname` without the fork. `*/?*` stops the walk at the
+      # filesystem root rather than testing `/scripts/<rel>`: on MSYS `/` is the
+      # Git installation, whose `scripts/` is not ours.
+      case "$__rfs_d" in */?*) __rfs_d="${__rfs_d%/*}" ;; *) __rfs_d="" ;; esac
+    done
+  done
+  [ -z "$__RFS_PATH" ] && [ -n "$__FLEET_GIT_ROOT" ] \
+    && __rfs_try "$__FLEET_GIT_ROOT/qontinui-claude-config/scripts/$__rfs_rel"
+  return 0
+}
+
+# __fleet_script_searched <rel> -- that same search as ONE line, for a refusal
+# message. A "not found" that does not say what it looked for cannot be told
+# apart from a "did not look", and this script's whole contract is that its
+# verdicts name their cause rather than leaving the reader to guess one. This
+# one DOES print, and its `$( )` fork is deliberate: it runs only on the failure
+# path, where one fork buys the entire diagnosis.
+#
+# Every rung it names is one that actually emitted a candidate. Two of them are
+# CONDITIONAL -- $QONTINUI_ROOT and the git root -- and a message that claimed
+# them unconditionally would be the very defect this function exists against,
+# worse for the git rung because a reader cannot check that one by hand.
+__fleet_script_searched() {
+  __fss_rel="$1"
+  __fleet_script_init
+  if [ -n "${QONTINUI_ROOT:-}" ]; then
+    # The CONCRETE path, not the literal "$QONTINUI_ROOT" -- the git rung below
+    # names its resolved root, and a message that names one rung by variable and
+    # the other by value makes the reader expand the first one by hand. This
+    # message exists to say what was actually looked at.
+    __fss_qr="${QONTINUI_ROOT}/qontinui-claude-config/scripts/$__fss_rel"
+  else
+    __fss_qr="(the \$QONTINUI_ROOT rung emitted no candidate: it is UNSET)"
+  fi
+  if [ -n "$__FLEET_GIT_ROOT" ]; then
+    __fss_gr="and $__FLEET_GIT_ROOT/qontinui-claude-config/scripts/$__fss_rel, the --git-common-dir workspace root"
+  else
+    __fss_gr="and NOT the --git-common-dir workspace root, which emitted no candidate: git did not resolve one from this cwd"
+  fi
+  printf '%s' "searched \$HERE/../../../scripts/$__fss_rel, the same path with \$HERE resolved physically, $__fss_qr, every ancestor of HERE=$HERE both logical and physical for scripts/$__fss_rel and qontinui-claude-config/scripts/$__fss_rel, $__fss_gr"
+}
+
+ENVELOPE_READER="$JSON_READER"
+__resolve_fleet_script "lib/envelope.sh"; ENVELOPE_LIB="$__RFS_PATH"
+if [ -z "$ENVELOPE_LIB" ]; then
+  echo "$DOOR_SCRIPT_NAME: ERROR: scripts/lib/envelope.sh not found — $(__fleet_script_searched "lib/envelope.sh"). Cannot read any door's answer (LOCAL fault, NOT a coord verdict: this says NOTHING about whether coord is reachable — probe a door directly before concluding anything about it)." >&2
+  exit 127
+fi
+# shellcheck source=../../../scripts/lib/envelope.sh
+. "$ENVELOPE_LIB"
+
+# Named loudly: every probe stages its auth header here, so a silent failure
+# would surface later as AUTH_HEADER_STAGING_FAILED with an empty path — the
+# symptom without the cause.
+TMPD="$(mktemp -d)" || { echo "$DOOR_SCRIPT_NAME: ERROR: mktemp -d failed — cannot stage probe headers (LOCAL fault, not a coord verdict)." >&2; exit 127; }
+trap 'rm -rf "$TMPD"' EXIT
+
+FAILS=()
+DOORS_PROBED=0
+LIVE_FILE=""
+LIVE_URL=""
+SEEN=""
+
+# The verdict probe_door actually won with. `live_exit` prints it, so a
+# qualified live verdict cannot reach the reader spelled as a bare LIVE.
+LIVE_VERDICT="LIVE"
+
+# is_live_verdict <verdict> — 0 iff this verdict means "this door works".
+#
+# THIS PREDICATE IS THE POINT OF THE WHOLE PHASE. There are now THREE live-class
+# verdicts, and every one of them used to be a string that is not the literal
+# "LIVE". A `[ "$verdict" = "LIVE" ]` anywhere in the caller silently drops two
+# of the three on the floor and walks on to report DEAD over a door that just
+# answered — the exact false-DEAD class this script exists to prevent, produced
+# by the change that was meant to sharpen it. Every comparison in probe_door goes
+# through here; none of them spells the literal any more.
+#
+#   LIVE                        the end-to-end tools/call answered isError:false
+#   LIVE_APP_ERROR              …answered isError:true. The TOOL complained; the
+#                               transport is proven. Still live.
+#   PROXY_LIVE_E2E_UNVERIFIED   tools/list answered and the e2e probe did not run
+#                               (disabled). Live as far as it was measured, and
+#                               it says so instead of overstating.
+#
+# PROXY_LIVE_UPSTREAM_DEAD is deliberately NOT here despite the name: the proxy
+# is live and no call can be carried over it, so it is a failure with an honest
+# cause, not a door to hand the caller.
+is_live_verdict() {
+  case "$1" in
+    LIVE|LIVE_APP_ERROR*|PROXY_LIVE_E2E_UNVERIFIED*) return 0 ;;
+  esac
+  return 1
+}
+
+# endpoint_hostport <url> — the host:port the URL resolves to, for the two
+# per-ENDPOINT joins below. Deliberately coarser than seen_endpoint()'s (url,
+# auth) signature: both properties below are about the PROCESS listening on that
+# port, which every credential and every path under it shares.
+endpoint_hostport() {
+  local u="${1#*://}"
+  printf '%s' "${u%%/*}"
+}
+
+# ----- the correlated-refresh short-circuit -----------------------------------
+# Every canonical door on this fleet now points at the SAME runner port, so a
+# device-JWT refresh makes ALL of them answer CREDENTIAL_REFRESHING together —
+# each paying two probes and a 3s sleep for a fact the first one already
+# established. Once one door has settled on CREDENTIAL_REFRESHING (settled = it
+# still said so AFTER its own bounded retry), sibling doors on the same
+# host:port share that upstream and are reported SKIPPED_SHARED_UPSTREAM_REFRESHING
+# rather than re-probed.
+#
+# WHY "SETTLED" AND NOT "ONCE": a door that says CREDENTIAL_REFRESHING and then
+# something else on the retry is not a withholding proxy, it is a WEDGE (below),
+# and a wedge must not be collapsed into one skipped verdict — its evidence IS
+# the mixed set. Only a door that answered 503 twice marks its upstream.
+#
+# It is a SKIP, not a verdict about the sibling, and it is named as one: nothing
+# here observed that door, and the DEAD block prints it as unprobed.
+REFRESHING_UPSTREAMS=""
+NO_UPSTREAM_SKIP="${COORD_REVIVE_NO_UPSTREAM_SKIP:-}"
+mark_upstream_refreshing() {
+  local hp; hp="$(endpoint_hostport "$1")"
+  [ -n "$hp" ] || return 0
+  case "$REFRESHING_UPSTREAMS" in *"|$hp|"*) return 0 ;; esac
+  REFRESHING_UPSTREAMS="${REFRESHING_UPSTREAMS}|$hp|"
+}
+upstream_is_refreshing() {
+  [ -z "$NO_UPSTREAM_SKIP" ] || return 1
+  local hp; hp="$(endpoint_hostport "$1")"
+  [ -n "$hp" ] || return 1
+  case "$REFRESHING_UPSTREAMS" in *"|$hp|"*) return 0 ;; esac
+  return 1
+}
+
+# ----- the wedge detector -----------------------------------------------------
+# SKILL.md has documented RUNNER_WEDGED since PR #259 and this script emitted the
+# string NOWHERE — a table row promising a verdict the tool cannot produce, which
+# is worse than no row: it sends a reader looking for output that will never
+# arrive. This is that verdict, computed from probes the sweep already pays for.
+#
+# THE SHAPE: ONE endpoint answering on BOTH planes inside ONE sweep.
+#   transport plane  TIMEOUT / CONNECT_REFUSED / UNREACHABLE — no HTTP status
+#                    came back at all.
+#   HTTP plane       a status line DID come back: 401-class, LIVE-class, 503,
+#                    HTTP_200_NOT_MCP, TIMEOUT_UPSTREAM, any HTTP_<code>.
+# No key fault and no config fault can produce both: a stale key 401s every time,
+# a dead port refuses every time. Mixing them means the process is INTERMITTENTLY
+# ACCEPTING — the runner is up and its HTTP surface is starved.
+#
+# Why it matters more than a nicer message: the default reading of the 401 in
+# that set is "stale proxy key", whose remedy is a re-provision, which EVICTS a
+# live peer's key. So on a wedge the ordinary advice actively worsens the
+# incident. On RUNNER_WEDGED the re-provision advice is suppressed.
+#
+# TIMEOUT_UPSTREAM is read BEFORE TIMEOUT so it lands on the HTTP plane where it
+# belongs: it is the proxy ANSWERING 504, not the proxy failing to answer. Get
+# that order wrong and every stalled coord hop starts corroborating a wedge that
+# is not happening.
+WEDGE_TRANSPORT=""
+WEDGE_HTTP=""
+WEDGED_ENDPOINTS=""
+verdict_plane() {
+  case "$1" in
+    TIMEOUT_UPSTREAM*)                                  echo http ;;
+    TIMEOUT*|CONNECT_REFUSED*|UNREACHABLE*)             echo transport ;;
+    LIVE|LIVE_APP_ERROR*|PROXY_LIVE_*|CREDENTIAL_REFRESHING*|HTTP_*) echo http ;;
+    *UNAUTHORIZED*)                                     echo http ;;
+    # A runner-credential refusal is an HTTP-plane ANSWER (the proxy replied
+    # 401 out of its own state machine), exactly as a nonce 401 is. Leaving it
+    # to the `none` arm would hide one half of a wedge from record_plane.
+    RUNNER_CREDENTIAL_*)                                echo http ;;
+    *)                                                  echo none ;;
+  esac
+}
+# record_plane <url> <verdict> — accumulate one probe's plane against its
+# endpoint and note the endpoint the moment it has answered on both.
+# is_loopback_endpoint <host:port> — 0 for an endpoint served by a process on
+# THIS box. The wedge verdict is a statement about THE RUNNER, which serves the
+# coord-mcp proxy on its own loopback port; L3/L4 probe the PUBLIC coord host
+# under several different credentials, and a 401 from one bearer beside a
+# timeout from another there is ordinary internet, not a starved runner. Naming
+# that RUNNER_WEDGED would be a confidently wrong verdict about a machine
+# nobody measured — the one thing this script exists not to do.
+#
+# STATED LIMIT: a runner reached over a non-loopback address is therefore never
+# reported wedged. That is the safe direction (a missed wedge costs a diagnosis;
+# a fabricated one costs a live peer's key), and on this fleet the proxy is
+# always loopback.
+is_loopback_endpoint() {
+  case "${1%%:*}" in
+    127.*|localhost|"[::1]"|::1) return 0 ;;
+  esac
+  return 1
+}
+record_plane() {
+  local hp plane
+  hp="$(endpoint_hostport "$1")"
+  [ -n "$hp" ] || return 0
+  is_loopback_endpoint "$hp" || return 0
+  plane="$(verdict_plane "$2")"
+  case "$plane" in
+    transport) case "$WEDGE_TRANSPORT" in *"|$hp|"*) ;; *) WEDGE_TRANSPORT="${WEDGE_TRANSPORT}|$hp|" ;; esac ;;
+    http)      case "$WEDGE_HTTP" in      *"|$hp|"*) ;; *) WEDGE_HTTP="${WEDGE_HTTP}|$hp|" ;; esac ;;
+    *)         return 0 ;;
+  esac
+  case "$WEDGE_TRANSPORT" in *"|$hp|"*) ;; *) return 0 ;; esac
+  case "$WEDGE_HTTP" in      *"|$hp|"*) ;; *) return 0 ;; esac
+  case " $WEDGED_ENDPOINTS " in *" $hp "*) return 0 ;; esac
+  WEDGED_ENDPOINTS="$WEDGED_ENDPOINTS $hp"
+}
+
+# ----- the RUNNER-CREDENTIAL fact, carried to the Next: line -------------------
+# classify() runs inside a command substitution, so anything it learns dies with
+# that subshell — the same reason record_plane() is called by the PARENT beside
+# it rather than from inside. This records the one fact the closing advice has
+# to branch on: a door answered 401 because THIS RUNNER's coord credential is
+# dead, not because the nonce it was handed is.
+#
+# It is deliberately about a POSTURE and not an endpoint. Every loopback door on
+# this box is served by the same runner process, so one runner-credential answer
+# settles it for all of them; a second door repeating it adds nothing.
+RUNNER_CREDENTIAL_POSTURE=""
+note_runner_credential() {
+  case "$1" in
+    RUNNER_CREDENTIAL_*) ;;
+    *) return 0 ;;
+  esac
+  [ -z "$RUNNER_CREDENTIAL_POSTURE" ] || return 0
+  # "RUNNER_CREDENTIAL_EXPIRED (…)" -> "expired". The verdict word is the
+  # authority here, not the body: classify() has already read the body and
+  # settled the posture, including the UNSTATED arm.
+  RUNNER_CREDENTIAL_POSTURE="$(printf '%s' "${1%% *}" | sed 's/^RUNNER_CREDENTIAL_//' | tr '[:upper:]' '[:lower:]')"
+}
+
+# ----- the sweep's wall-clock bound -------------------------------------------
+# $SECONDS is bash's own monotonic counter, so the bound costs no subprocess and
+# cannot be skewed by a clock change. It is sampled BETWEEN doors, never inside a
+# request: killing a probe mid-flight would leave a door with no verdict at all,
+# which is the undifferentiated silence this script replaces.
+PROBE_BUDGET_T0=$SECONDS
+BUDGET_TRIPPED=""
+DOORS_SKIPPED=0
+budget_left() {
+  [ $((SECONDS - PROBE_BUDGET_T0)) -lt "$PROBE_TOTAL_BUDGET" ]
+}
+# budget_skip <label> <name> — 0 (and records the skip) when the budget is gone.
+budget_skip() {
+  budget_left && return 1
+  BUDGET_TRIPPED=1
+  DOORS_SKIPPED=$((DOORS_SKIPPED + 1))
+  local v="SKIPPED_BUDGET_EXCEEDED (the ${PROBE_TOTAL_BUDGET}s sweep budget was spent before this door was reached, so it was NOT probed. UNKNOWN, never dead - raise \$COORD_REVIVE_TOTAL_BUDGET to reach it)"
+  echo "$1: $2 -> $v" >&2
+  FAILS+=("$1 $2: $v")
+  return 0
+}
+
+# seen_door <path> — 0 if this door was already probed (canonical-path dedup,
+# so a symlinked/re-spelled path can't burn extra probes); records it otherwise.
+#
+# Under Git Bash `realpath` does not settle ONE spelling for a file:
+#   * a path that crosses no link comes back in the spelling it was handed --
+#     L1's $OWN is built from $PWD (`/d/x`, `/tmp/x`), while L2's glob is built
+#     from $ROOT, which is drive-spelled both when `git rev-parse
+#     --path-format=absolute --git-common-dir` finds it (`D:/x/.git`) and when
+#     $QONTINUI_ROOT sets it (`C:\Users\...\x`);
+#   * a path that crosses a link (a junction) comes back as the TARGET in POSIX
+#     spelling (`/tmp/.../real/...`) even when it was handed `C:/...`.
+# Left alone, one file realpaths to two strings and L2 re-reads a door already
+# seen. So a `/`-leading answer is re-spelled with `cygpath -m`; a drive-spelled
+# answer costs no fork, and where cygpath is absent nothing changes.
+#
+# `-m` (C:/x), NOT `-u`: `-u` maps through the MSYS mount table, and with /tmp
+# mounted over the user Temp, `C:/Program Files/Git/tmp/x` and
+# `C:/Users/<u>/AppData/Local/Temp/x` BOTH print `/tmp/x` -- two different files
+# would dedup into one and the second door would never be read. `-m` keeps the
+# drive path. Paths that differ only in case are deliberately not folded.
+# Pinned by door-sweep-timeout-selftest.py property 10 (a junction fixture, with
+# a copy of this script that lacks the re-spell line as its mutant).
+seen_door() {
+  local rp
+  rp="$(realpath "$1" 2>/dev/null || printf '%s' "$1")"
+  case "$rp" in /*) if command -v cygpath >/dev/null 2>&1; then rp="$(cygpath -m "$rp" 2>/dev/null || printf '%s' "$rp")"; fi ;; esac
+  case "$SEEN" in *"|$rp|"*) return 0 ;; esac
+  SEEN="${SEEN}|$rp|"
+  return 1
+}
+
+# seen_endpoint <url> <header-name> <header-value> — 0 if this DOOR was already
+# probed, 1 (and counted) if it is new.
+#
+# seen_door() above dedups by canonical PATH. That is the right guard for the
+# SAME file reached twice through the glob, and it is the wrong guard for N
+# DISTINCT files that all name ONE door: every session's workdir gets its own
+# .mcp.json, so a workspace with 22 checkouts can hand this sweep 22 readable
+# files carrying the SAME url+nonce. Path-dedup passes all 22, we pay 22 probe
+# budgets against one endpoint, and the DEAD line then reports "22 probeable
+# doors" — which reads as 22 independent pieces of evidence when it is one door
+# probed 22 times. That inflated count is what makes a single flaky probe look
+# corroborated.
+#
+# The signature is (url, header-name, header-value) reduced through cksum, so
+# the accumulator never carries key material even though the inputs do. cksum
+# is POSIX and present wherever this script already assumes sh + curl. A hash
+# COLLISION would merge two doors (under-probe by one) and is vastly less likely
+# than the miscount it prevents; an UNUSABLE signature is handled separately
+# below and must never skip — see the fail-open guard.
+DISTINCT_DOORS=0
+SEEN_ENDPOINTS=""
+seen_endpoint() {
+  local sig
+  sig="$(printf '%s\n%s\n%s' "$1" "$2" "$3" | cksum 2>/dev/null | awk '{print $1}')"
+  # FAIL OPEN, never closed. If cksum is missing, errors, or (on a padding
+  # implementation) yields a non-numeric field, $sig is empty — and an empty
+  # signature makes the accumulator "||", after which the pattern *"||"* matches
+  # for EVERY later call and every genuinely distinct door is skipped. The script
+  # runs under `set -u` only, so nothing else would catch it, and the failure
+  # prints "same door as an earlier candidate" for doors that are not the same
+  # one and then VERDICT: DEAD — the false-DEAD this file exists to prevent.
+  # Under-probing is NOT the safe direction here (that reasoning holds only for a
+  # hash COLLISION, ~5e-8 at this N); an unusable signature must probe, not skip.
+  case "$sig" in ''|*[!0-9]*) DISTINCT_DOORS=$((DISTINCT_DOORS + 1)); return 1 ;; esac
+  case "$SEEN_ENDPOINTS" in *"|$sig|"*) return 0 ;; esac
+  SEEN_ENDPOINTS="${SEEN_ENDPOINTS}|$sig|"
+  DISTINCT_DOORS=$((DISTINCT_DOORS + 1))
+  return 1
+}
+
+# curl_path <file> — the spelling of $file that CURL can open. Git Bash's
+# mktemp hands out a POSIX path (/tmp/…) that a native curl.exe cannot open
+# when MSYS pathconv is off (MSYS_NO_PATHCONV=1 sessions); hand it the Windows
+# spelling instead. Same treatment, same reason, as the auth header in
+# scripts/coord-acting-bearer.sh.
+curl_path() {
+  if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else printf '%s' "$1"; fi
+}
+
+# probe_door <label> <name> <url> <header-name> <header-value> [unauth-wording]
+# NOTE for future callers: the retry case below prefix-matches CREDENTIAL_REFRESHING*
+# and TIMEOUT*, and [unauth-wording] is CALLER-SUPPLIED and reaches classify() as a
+# verdict. A caller whose wording begins with either prefix would silently acquire a
+# retry. Keep unauth wordings starting with their own distinct token.
+#
+# THAT HAZARD IS NOW WORSE, so the rule is stricter: is_live_verdict() matches
+# LIVE (exact), LIVE_APP_ERROR* and PROXY_LIVE_E2E_UNVERIFIED*. An unauth wording
+# beginning with any of those would make a 401 read as a WORKING DOOR — a false
+# LIVE, which is the one failure worse than the false DEADs the rest of this file
+# guards against. Every existing wording starts with its own *_UNAUTHORIZED
+# token; keep it that way.
+# Max 2 attempts; attempt 2 ONLY on the retry-safe verdicts CREDENTIAL_REFRESHING
+# and TIMEOUT. Returns 0 on any LIVE-CLASS verdict (is_live_verdict), NOT on the
+# literal string "LIVE" — there are three of them now and comparing to the
+# literal drops two on the floor.
+#
+# TWO STAGES since plan 2026-08-06-coord-mcp-post-remediation-plan Phase 1:
+#   1. tools/list  proves the PROXY (local hop, nonce, JSON-RPC framing).
+#   2. tools/call coord_query_identity {}  proves COORD is behind it. Runs only
+#      when stage 1 said LIVE, self-bounded at 2 attempts (the second only on
+#      PROXY_LIVE_UPSTREAM_DEAD / TIMEOUT / CREDENTIAL_REFRESHING), and it
+#      SUPPRESSES the outer retry once it has run, so a door costs at most 3
+#      requests: 2 tools/list, or 1 tools/list + 2 tools/call.
+# Skipping stage 2 ($COORD_REVIVE_E2E=0) yields PROXY_LIVE_E2E_UNVERIFIED, never
+# a bare LIVE.
+#
+# WHY TIMEOUT RETRIES (2026-09-02). A curl exit 28 is the one probe outcome that
+# says nothing about the door: it says this box did not get an answer inside
+# $PROBE_TIMEOUT. The fleet already diagnosed exactly this for the L4 mint and
+# fixed it THERE ONLY — MINT_TIMEOUT went 15s -> 60s on 2026-08-31 because
+# /health on this same runner samples 296ms..10120ms and a 15s budget was "enough
+# to turn a slow-but-healthy runner into VERDICT: DEAD". The probe budget that
+# gates the whole L1/L2 sweep was left at 15s with NO retry — the shorter budget
+# on the more frequent call. Measured consequence (finding 4e8bcd86): a session
+# swept its candidates, hit a loaded box, concluded "NO LIVE LOOPBACK DOOR",
+# published that in a merged PR body, and the door answered HTTP 200 on the very
+# next attempt.
+#
+# WORST-CASE WALL-CLOCK, stated as the 2026-07-27 retry plan requires. Per
+# TIMING-OUT door: 2 * $PROBE_TIMEOUT + 3s sleep = 33s at the 15s default (was
+# 15s). Only a door that times out TWICE pays it; every other verdict still
+# costs one attempt. The sweep's TOTAL budget nonetheless falls, because the
+# (url, auth) dedup in seen_endpoint() collapses N files naming one door to ONE
+# probe — the case that produced the 22-candidate sweeps this bound is measured
+# against. Bounded exactly as CREDENTIAL_REFRESHING is: one extra attempt, one
+# sleep 3, no loops.
+# The auth header travels via a private tmp file (curl -H @file), never argv —
+# keys must not be visible in the machine-wide process list.
+probe_door() {
+  local label="$1" name="$2" url="$3" hname="$4" hvalue="$5" unauth="${6:-}"
+  local attempt code ce verdict curlerr hdrpath bodypath e2e_ran e2e_attempt skipv
+  local hdrfile="$TMPD/hdr" bodyfile="$TMPD/body" errfile="$TMPD/err"
+  # TWO between-door checks, both BEFORE any request. Each is a SKIP with a named
+  # reason, never a verdict about the door: nothing here observed it.
+  if budget_skip "$label" "$name"; then return 1; fi
+  if upstream_is_refreshing "$url"; then
+    DOORS_SKIPPED=$((DOORS_SKIPPED + 1))
+    skipv="SKIPPED_SHARED_UPSTREAM_REFRESHING (a sibling door on $(endpoint_hostport "$url") already settled on CREDENTIAL_REFRESHING after its own retry, and this door shares that upstream process - re-probing it would spend another $((2 * PROBE_TIMEOUT + 3))s to learn the same fact. NOT a verdict about this door: it was not probed. Set \$COORD_REVIVE_NO_UPSTREAM_SKIP=1 to probe every sibling anyway)"
+    echo "$label: $name -> $skipv" >&2
+    FAILS+=("$label $name: $skipv")
+    return 1
+  fi
+  # Register the endpoint for the DISTINCT count regardless of rung. L1/L2 have
+  # already called this (so it returns 0 and does not double count); L3/L4 have
+  # not, and without it $DISTINCT_DOORS would count only the loopback rungs while
+  # $DOORS_PROBED counted every rung — two different populations printed side by
+  # side in the DEAD line, which produced "1 probe(s) across 0 distinct door(s)".
+  seen_endpoint "$url" "$hname" "$hvalue" || :
+  door_url_note "$label" "$name" "$url"
+  # Braces so 2>/dev/null is in effect for the redirection failure itself —
+  # `printf > file 2>/dev/null` applies redirections left to right, so the
+  # shell's "cannot create" reaches the console before the suppression does.
+  { printf '%s: %s\n' "$hname" "$hvalue" > "$hdrfile"; } 2>/dev/null
+  # An EMPTY header file is the dangerous failure: curl would send the request
+  # with no credential, coord would answer 401, and classify() would call that
+  # a stale/evicted proxy key — a confidently wrong verdict about a door that
+  # is fine. Catch the local fault here instead, and never probe unauthenticated.
+  if [ ! -s "$hdrfile" ]; then
+    verdict="AUTH_HEADER_STAGING_FAILED (could not write the header file under $TMPD - LOCAL fault, says nothing about coord)"
+    echo "$label: $name -> $verdict" >&2
+    FAILS+=("$label $name: $verdict")
+    return 1
+  fi
+  hdrpath="$(curl_path "$hdrfile")"
+  # The BODY file needs the same spelling for the same reason. `-o` is opened by
+  # the native curl.exe, not by bash, so under an inherited MSYS_NO_PATHCONV=1
+  # the POSIX "$TMPD/body" is passed through unconverted and Windows resolves it
+  # against the drive root. Two outcomes, both bad: if that directory does not
+  # exist curl dies with exit 23 ("client returned ERROR on write") having
+  # written nothing; if it DOES (mktemp -d under /tmp -> D:\tmp, which exists on
+  # this fleet) curl exits 0, reports the right http_code, and writes the body to
+  # a file bash never reads — silent. Either way the file bash reads is EMPTY, so
+  # classify() sees no body for a real HTTP 200 and returns HTTP_200_NOT_MCP
+  # ("treat as dead") — a confidently wrong DEAD verdict about a LIVE door,
+  # which is the worst output this script can produce (SKILL.md sells the DEAD
+  # line as honest blocked-evidence). curl_path existed here already and was
+  # applied to the header only; PR #171 fixed the identical omission in
+  # pr-status.sh after a live A/B surfaced it.
+  bodypath="$(curl_path "$bodyfile")"
+  e2e_ran=""
+  for attempt in 1 2; do
+    DOORS_PROBED=$((DOORS_PROBED + 1))   # ATTEMPTS, not doors — the DEAD line says "probe(s)"
+    : > "$bodyfile"
+    : > "$errfile"
+    # -S keeps curl's own diagnosis (e.g. "Failed to open/read local data")
+    # available instead of discarded: it lands in $errfile, off the console for
+    # expected failures, and is folded into every non-LIVE verdict below.
+    code=$(curl -sS -o "$bodypath" -w '%{http_code}' \
+      --connect-timeout "$PROBE_CONNECT_TIMEOUT" -m "$PROBE_TIMEOUT" \
+      -X POST "$url" -H "Content-Type: application/json" \
+      -H "@$hdrpath" -d "$RPC_LIST" 2>"$errfile")
+    ce=$?
+    verdict="$(classify "$ce" "$code" "$(cat "$bodyfile" 2>/dev/null)" ${unauth:+"$unauth"})"
+    record_plane "$url" "$verdict"
+    note_runner_credential "$verdict"
+
+    # ----- STAGE 2: the END-TO-END probe ---------------------------------------
+    # A bare LIVE here means only that the PROXY framed a tools/list. Spend one
+    # more cheap read to find out whether coord is behind it, and downgrade the
+    # verdict to PROXY_LIVE_E2E_UNVERIFIED when that read is not run — an
+    # unqualified LIVE this script has not earned is the same overstatement the
+    # PARTIAL machinery exists to prevent, one layer down.
+    if [ "$verdict" = "LIVE" ]; then
+      verdict="PROXY_LIVE_E2E_UNVERIFIED (the proxy framed a tools/list over this door, and the end-to-end tools/call was NOT run (\$COORD_REVIVE_E2E=0). The local hop, the nonce and the framing are proven; whether coord answers behind them is UNMEASURED)"
+      if [ "$PROBE_E2E" != "0" ]; then
+        e2e_ran=1
+        # Self-bounded exactly as the outer loop is: 2 attempts, one 3s sleep, no
+        # loops. Because it bounds itself, the OUTER retry is suppressed once this
+        # stage has run — otherwise a stalled coord hop would buy a second full
+        # tools/list that answers a question already answered.
+        for e2e_attempt in 1 2; do
+          DOORS_PROBED=$((DOORS_PROBED + 1))
+          : > "$bodyfile"
+          : > "$errfile"
+          code=$(curl -sS -o "$bodypath" -w '%{http_code}' \
+            --connect-timeout "$PROBE_CONNECT_TIMEOUT" -m "$PROBE_TIMEOUT" \
+            -X POST "$url" -H "Content-Type: application/json" \
+            -H "@$hdrpath" -d "$RPC_E2E" 2>"$errfile")
+          ce=$?
+          verdict="$(classify "$ce" "$code" "$(cat "$bodyfile" 2>/dev/null)" ${unauth:+"$unauth"})"
+          record_plane "$url" "$verdict"
+          note_runner_credential "$verdict"
+          if [ "$e2e_attempt" = "1" ]; then
+            case "$verdict" in
+              PROXY_LIVE_UPSTREAM_DEAD*|TIMEOUT*|CREDENTIAL_REFRESHING*)
+                echo "$label: $name -> $verdict [e2e attempt 1/2, re-probing once]" >&2
+                sleep 3; continue ;;
+            esac
+          fi
+          break
+        done
+      fi
+    fi
+
+    # UNREACHABLE and the TLS/DNS exits are exactly where a bare exit number is
+    # not yet a cause, and the invariant above says every path must name one.
+    if ! is_live_verdict "$verdict"; then
+      curlerr=$(tr -d '\r' < "$errfile" 2>/dev/null | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')
+      [ -n "$curlerr" ] && verdict="$verdict [curl: $curlerr]"
+    fi
+    # EVERY live-class verdict wins the door. A literal `= "LIVE"` here would
+    # drop LIVE_APP_ERROR and PROXY_LIVE_E2E_UNVERIFIED and walk on to report
+    # DEAD over a door that answered — read is_live_verdict's header.
+    if is_live_verdict "$verdict"; then
+      rm -f "$hdrfile"
+      echo "$label: $name -> $verdict ($url)" >&2
+      LIVE_FILE="$name"
+      LIVE_URL="$url"
+      LIVE_VERDICT="$verdict"
+      # The header pair the LIVE door answered to, kept for the floor claim's
+      # control read (Phase 2). Never printed; staged into a private file there
+      # exactly as it was here.
+      LIVE_HNAME="$hname"
+      LIVE_HVALUE="$hvalue"
+      return 0
+    fi
+    echo "$label: $name -> $verdict [probe $attempt/2]" >&2
+    if [ -z "$e2e_ran" ]; then
+      case "$verdict" in
+        CREDENTIAL_REFRESHING*|TIMEOUT*) if [ "$attempt" = "1" ]; then sleep 3; continue; fi ;;
+      esac
+    fi
+    break
+  done
+  rm -f "$hdrfile"
+  # SETTLED, i.e. after this door's own retry — see mark_upstream_refreshing.
+  case "$verdict" in
+    CREDENTIAL_REFRESHING*) mark_upstream_refreshing "$url" ;;
+  esac
+  FAILS+=("$label $name: $verdict")
+  return 1
+}
+
+# read_cfg <file> -> sets CFG_URL/CFG_KEY; 1 unless proxy-shaped coord-mcp entry
+# Feed jq via STDIN — bash opens the file, so no path ever crosses to the NATIVE
+# jq. Passing "$1" as an ARGUMENT fails under an inherited MSYS_NO_PATHCONV=1:
+# the POSIX spelling reaches jq.exe unconverted, jq exits 2 "Could not open
+# file", both vars come back EMPTY, and every candidate is then rejected as "no
+# proxy-shaped coord-mcp entry". L1 and L2 probe ZERO doors and the cascade
+# prints VERDICT: DEAD with a live door sitting there — the same false DEAD the
+# --show-toplevel bug caused (check #6), reached by a different route. PR #171
+# fixed this exact idiom in pr-status.sh's sweep.
+#
+# BOTH arms take the config on STDIN. The reason is the MSYS_NO_PATHCONV note
+# above — a POSIX path passed as an ARGUMENT reaches a NATIVE jq.exe/python.exe
+# unconverted and the open fails, emptying both vars for every candidate. It is
+# NOT about keeping the key off argv: the key is this function's OUTPUT and
+# leaves on stdout either way. Do not "simplify" back to a path argument.
+#
+# The python arm reads the file ONCE and prints url and key on two lines: this
+# runs when the operator is already blocked, and L2 sweeps every sibling repo
+# (~14 here), so one interpreter start per candidate instead of two halves the
+# wait.
+# BOTH header shapes are accepted, and the NAME the key was found under is
+# returned in $CFG_KEY_HEADER so probe_door replays the config verbatim.
+# Plan 2026-08-20-coord-mcp-reconnect-dcr-and-restart-orphaning Phase 2 moves the
+# proxy nonce out of the custom `X-Coord-Mcp-Proxy-Key` header and into
+# `Authorization: Bearer <nonce>` — because a custom header makes the MCP client
+# attach an OAuth auth provider, so a stale-key 401 ESCALATES into discovery and
+# then Dynamic Client Registration, which the runner 404s. The server keeps
+# accepting the legacy header, so BOTH shapes exist on disk simultaneously and
+# forever: configs are rewritten only on session spawn, never periodically.
+# Reading only the legacy name would empty $CFG_KEY on exactly the configs the
+# fix produces, and every candidate would then be rejected as "no proxy-shaped
+# coord-mcp entry" — VERDICT: DEAD over a live door, the same false DEAD the
+# MSYS_NO_PATHCONV bug caused, reached by a third route.
+#
+# `Authorization` WINS when both are present, mirroring the runner's own
+# precedence in `coord_mcp_proxy_handler`, so the script probes with whatever the
+# server would actually honour. The value is kept VERBATIM (the `Bearer ` prefix
+# included) precisely so the replay is byte-identical to what the client sends.
+# unstamped-floor-ok: the false-DEAD incidents above are history, not a live floor 2026-09-11
+read_cfg() {
+  CFG_KEY_HEADER="X-Coord-Mcp-Proxy-Key"
+  if [ "$JSON_READER" = jq ]; then
+    CFG_URL=$(jq -r '.mcpServers["coord-mcp"].url // ""' < "$1" 2>/dev/null)
+    CFG_KEY=$(jq -r '(.mcpServers["coord-mcp"].headers // {}) as $h
+      | if (($h.Authorization // "") | tostring) != "" then $h.Authorization
+        else ($h["X-Coord-Mcp-Proxy-Key"] // "") end' < "$1" 2>/dev/null)
+    if [ -n "$CFG_KEY" ] && jq -e '((.mcpServers["coord-mcp"].headers.Authorization // "") | tostring) != ""' < "$1" >/dev/null 2>&1; then
+      CFG_KEY_HEADER="Authorization"
+    fi
+  else
+    local _pair
+    _pair=$("$JSON_READER" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print(); print(); print(); sys.exit(0)
+c=((d.get("mcpServers",{}) or {}).get("coord-mcp",{}) or {})
+h=(c.get("headers",{}) or {})
+authz=h.get("Authorization","") or ""
+legacy=h.get("X-Coord-Mcp-Proxy-Key","") or ""
+print(c.get("url","") or "")
+print(authz or legacy)
+print("Authorization" if authz else "X-Coord-Mcp-Proxy-Key")' < "$1" 2>/dev/null)
+    # `tr -d '\r'` is NOT redundant. The reader here is a NATIVE Windows python
+    # whose text-mode stdout emits CRLF, so $_pair is literally "URL\r\nKEY":
+    # `$(...)` strips only the TRAILING CRLF, leaving a CR at the end of line 1.
+    # MSYS GNU sed happens to strip it, so this reads fine today — but `head -1`,
+    # `IFS= read -r`, `cut` and `mapfile` do NOT, and any of those is a natural
+    # "simplification" of the two lines below. A CR surviving into CFG_URL makes
+    # curl exit 3 with http_code 000, which classify reports as UNREACHABLE —
+    # i.e. VERDICT: DEAD over a live door, the exact false-DEAD this fix exists
+    # to kill, and invisible on Linux where python emits bare LF. Strip it here
+    # rather than depending on which line-tool a future edit reaches for.
+    CFG_URL=$(printf '%s\n' "$_pair" | sed -n '1p' | tr -d '\r')
+    CFG_KEY=$(printf '%s\n' "$_pair" | sed -n '2p' | tr -d '\r')
+    CFG_KEY_HEADER=$(printf '%s\n' "$_pair" | sed -n '3p' | tr -d '\r')
+    [ -n "$CFG_KEY_HEADER" ] || CFG_KEY_HEADER="X-Coord-Mcp-Proxy-Key"
+  fi
+  case "$CFG_URL" in *"/coord-mcp"*) ;; *) return 1 ;; esac
+  [ -n "$CFG_KEY" ] || return 1
+}
+
+# cfg_shape <file> -> a precise one-line reason this file is not a probeable door.
+#
+# "missing/unreadable/other shape" collapsed three very different states into one
+# message, and the STDIO one is not a defect at all: a session configured as
+# {"mcpServers":{"coord":{"command":...}}} reaches coord through a CHILD PROCESS,
+# so it exposes no loopback URL for this cascade to probe and never will. Calling
+# that "other shape" sends the reader hunting a config bug that does not exist —
+# and it hides the thing that actually matters, that such a session's NATIVE
+# coord_* tools may be perfectly healthy while every door here is dead (see the
+# SCOPE lines on the DEAD verdict).
+#
+# It also could not tell "no coord-mcp entry" from "entry present, key empty" —
+# and the second is the stale/evicted nonce, the single most common condition
+# this whole tool exists to name.
+#
+# Both readers emit a TOKEN and the wording lives in ONE place below, so the jq
+# and python paths cannot drift apart the way two copies of a message always
+# eventually do. The `type == "object"` guards are load-bearing, not defensive
+# noise: on a half-written .mcp.json a non-object server value makes jq's
+# `select(.command)` throw a RUNTIME error, and `jq -e` surfaces that as just
+# another non-zero exit — so without the guard one malformed entry poisons the
+# whole comprehension and a genuinely STDIO-shaped entry sitting after it is
+# never seen.
+cfg_shape_token() {
+  if [ "$JSON_READER" = jq ]; then
+    jq -r '
+      def srv: (.mcpServers // {});
+      if (srv | type) != "object" then "none"
+      elif ([srv[] | select(type == "object") | select(has("command"))] | length) > 0 then "stdio"
+      else
+        (srv["coord-mcp"] // {}) as $c
+        | (if ($c | type) == "object" then ($c.url // "") else "" end) as $u
+        | if (($u | tostring) | contains("/coord-mcp")) then
+            (($c.headers // {}) as $h
+             | if (($h | type) == "object")
+                  and (((($h["X-Coord-Mcp-Proxy-Key"] // "") | tostring) != "")
+                       or ((($h.Authorization // "") | tostring) != ""))
+               then "complete" else "stalekey" end)
+          else "none" end
+      end' < "$1" 2>/dev/null || echo badjson
+  else
+    "$JSON_READER" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print("badjson"); sys.exit(0)
+srv=d.get("mcpServers")
+if not isinstance(srv,dict): print("none"); sys.exit(0)
+if any(isinstance(v,dict) and v.get("command") for v in srv.values()): print("stdio"); sys.exit(0)
+c=srv.get("coord-mcp"); c=c if isinstance(c,dict) else {}
+if "/coord-mcp" in (c.get("url") or ""):
+    h=c.get("headers"); h=h if isinstance(h,dict) else {}
+    print("complete" if ((h.get("X-Coord-Mcp-Proxy-Key") or "") or (h.get("Authorization") or "")) else "stalekey")
+else:
+    print("none")' < "$1" 2>/dev/null | tr -d '\r' || echo badjson
+  fi
+}
+
+cfg_shape() {
+  local tok
+  [ -r "$1" ] || { echo "missing or unreadable"; return; }
+  tok="$(cfg_shape_token "$1")"
+  case "$tok" in
+    stdio)
+      echo "STDIO-shaped coord entry (command/args) - reaches coord via a child process, exposing no loopback URL this cascade can probe. NOT a defect, and says nothing about your native coord_* tools." ;;
+    stalekey)
+      echo "proxy-shaped coord-mcp entry IS present and its URL is fine, but it carries NEITHER an X-Coord-Mcp-Proxy-Key header NOR an Authorization header (stale/evicted key?)" ;;
+    complete)
+      # Unreachable from the cascade (cfg_shape only runs once read_cfg has
+      # already rejected the file), but a diagnostic must never assert a cause it
+      # has not tested — that is the habit this function exists to break.
+      echo "proxy-shaped coord-mcp entry looks complete (URL + key both present) - if it was still rejected, read the per-door probe verdicts above for the real cause" ;;
+    badjson)
+      echo "not valid JSON" ;;
+    *)
+      echo "no proxy-shaped coord-mcp entry (needs .mcpServers[\"coord-mcp\"].url plus either an X-Coord-Mcp-Proxy-Key or an Authorization header)" ;;
+  esac
+}
+
+# ----- The AXIS TABLE: what this run asked, and what it did not -------------
+# A verdict is only as wide as the axes it was computed from. Ten recorded
+# occurrences (dossier coord-transport-cascades-are-rooted-on-the-local-runner)
+# probed ONE host-and-prefix, received a credential-shaped status, and
+# generalised it to the capability -- honestly, by walking this cascade to its
+# end. So the terminal VERDICT: token is now emitted FROM this table, never
+# beside it. Every rung is a row over host x prefix x credential, and each row is
+#   LIVE           -- the door this run stopped at
+#   PROBED         -- asked, and answered something other than LIVE (the verdict
+#                     tokens recorded for it follow in brackets, one per
+#                     sub-source, so #785's four RUNNER_EVAL_* sub-verdicts read
+#                     as L4 sub-rows)
+#   SKIPPED        -- a skip was RECORDED (the sweep budget, an env opt-out)
+#   UNPROBED       -- never reached, because a LIVE door above it short-circuited
+#   NOT APPLICABLE -- a transport this script cannot reach at all (the session's
+#                     own native coord_* tools)
+# and DEAD is printable ONLY when every probeable row is PROBED. The rows are
+# DERIVED from FAILS[] and the LIVE state rather than set by hand at each site,
+# so a rung that gains a sub-source is in the table with no edit here.
+# Plan 2026-09-06-coord-reachability-verdicts-omit-the-host-axis, Phase 2.
+AXES_UNPROBED=""     # comma-separated keys of the rows that were SKIPPED or UNPROBED
+LIVE_RUNG=""         # set by live_exit from its transport, before the table prints
+axis_row_status() {
+  # <rung> -> LIVE | PROBED | SKIPPED | UNPROBED, from the recorded outcomes.
+  local rung="$1" f n=0 skipped=0
+  [ "$LIVE_RUNG" = "$rung" ] && { echo LIVE; return; }
+  for f in ${FAILS[@]+"${FAILS[@]}"}; do
+    case "$f" in "$rung "*)
+      n=$((n + 1))
+      case "$f" in *": SKIPPED_"*) skipped=$((skipped + 1)) ;; esac ;;
+    esac
+  done
+  if [ "$n" -eq 0 ]; then echo UNPROBED
+  elif [ "$skipped" -eq "$n" ]; then echo SKIPPED
+  else echo PROBED; fi
+}
+axis_row_tokens() {
+  # <rung> -> the verdict TOKENS recorded for it (the first word after the
+  # door name), one per sub-source, deduplicated -- e.g. the L4 row reads
+  # "env=ENV_UNSET file=DEVICE_JWT_UNAUTHORIZED ui-bridge-mint=RUNNER_EVAL_CSP_BLOCKED".
+  local rung="$1" f name tok out=""
+  for f in ${FAILS[@]+"${FAILS[@]}"}; do
+    case "$f" in "$rung "*)
+      name="${f#"$rung "}"; name="${name%%:*}"
+      tok="${f#*: }"; tok="${tok%% *}"
+      case "$name" in
+        'device-jwt@$COORD_DEVICE_JWT') name="env" ;;
+        device-jwt@*coord-device-jwt)   name="file" ;;
+        nonce-mint*)                    name="nonce-mint" ;;
+        mint@*|device-jwt@*source=*)    name="ui-bridge-mint" ;;
+        web-host@*)                     name="web-host" ;;
+        sibling-sweep@*)                name="sibling-sweep" ;;
+      esac
+      case " $out " in *" $name=$tok "*) ;; *) out="${out:+$out }$name=$tok" ;; esac ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+axes_block() {
+  # Printed under EVERY terminal line -- LIVE, UNKNOWN, BUDGET_EXCEEDED and DEAD
+  # alike -- because a LIVE that stopped at L1 has said nothing about the web
+  # host either, and this table is what says so. Sets $AXES_UNPROBED; the
+  # caller prints the `axes:` roster line beside its own verdict.
+  local rung host prefix cred key st toks unprobed=""
+  echo "AXES (host x prefix x credential -- what this run asked, and what it did not):"
+  while IFS='|' read -r rung host prefix cred key; do
+    st="$(axis_row_status "$rung")"
+    toks="$(axis_row_tokens "$rung")"
+    printf '  %-3s %-22s %-32s %-30s %s%s\n' "$rung" "$host" "$prefix" "$cred" "$st" "${toks:+  [$toks]}"
+    case "$st" in SKIPPED|UNPROBED) unprobed="${unprobed:+$unprobed,}$key" ;; esac
+  done <<'AXES'
+L1|127.0.0.1 (loopback)|/coord-mcp|proxy-nonce (own .mcp.json)|L1-proxy-nonce
+L2|127.0.0.1 (loopback)|/coord-mcp|proxy-nonce (sibling .mcp.json)|L2-proxy-nonce
+L3|coord.qontinui.io|/mcp|acting-bearer ($COORD_AGENT_JWT)|L3-acting-bearer
+L4|coord.qontinui.io|/mcp|device-jwt (env, file, mints)|L4-device-jwt
+L5|coord.qontinui.io|/agents/credential + /coord/agent-|bootstrap-agent-jwt (anonymous mint)|L5-bootstrap-agent-jwt
+L6|api.qontinui.io|/api/v1|user-device-jwt (env, file)|L6-user-device-jwt
+AXES
+  printf '  %-3s %-22s %-32s %-30s %s\n' "--" "(this session)" "native coord_* MCP tools" "session .mcp.json" "NOT APPLICABLE - a separate transport this script cannot probe; ask it yourself with one cheap coord_gate_inspect"
+  AXES_UNPROBED="${unprobed:+$unprobed,}native-coord-mcp-tools"
+}
+
+# live_exit <transport> [partial-block]
+#
+# The optional second argument is a pre-formatted block of `PARTIAL: ` lines
+# naming what this door CANNOT do. When present the verdict line gains a
+# trailing ` PARTIAL` token and the block is printed under it. L1/L2/L3 pass no
+# second argument, so their output is byte-identical to before.
+#
+# INVARIANT (the reach half of the named-cause rule on classify()): a qualified
+# LIVE must name its limit. `LIVE … PARTIAL` with no reason would be the mask
+# this script exists to replace, wearing a success label.
+live_exit() {
+  local transport="$1" partial="${2:-}" v="${LIVE_VERDICT:-LIVE}"
+  case "$transport" in
+    loopback-proxy) if [ "$LIVE_FILE" = "$OWN" ]; then LIVE_RUNG=L1; else LIVE_RUNG=L2; fi ;;
+    https-acting-bearer) LIVE_RUNG=L3 ;;
+    https-device-jwt*|loopback-proxy-minted) LIVE_RUNG=L4 ;;
+    https-bootstrap-agent-jwt) LIVE_RUNG=L5 ;;
+    https-web-device-jwt) LIVE_RUNG=L6 ;;
+  esac
+  # The verdict NAME leads, because there are three live-class ones and only one
+  # of them is a bare LIVE. Printing "LIVE" over a PROXY_LIVE_E2E_UNVERIFIED
+  # would be the same overstatement PARTIAL exists to prevent, one layer down.
+  # $v carries classify()'s parenthetical, so the line stays self-explaining.
+  if [ -n "$partial" ]; then
+    echo "VERDICT: $v door=$LIVE_FILE url=$LIVE_URL transport=$transport PARTIAL"
+    echo "$partial"
+  else
+    echo "VERDICT: $v door=$LIVE_FILE url=$LIVE_URL transport=$transport"
+  fi
+  # The stamped claim, ALWAYS - a LIVE door is a measurement too, and a pasted
+  # LIVE block that carries its probe time is what lets a later reader tell it
+  # from a stale one. Under --floor-claim the prose NOTEs below are suppressed
+  # so the block pastes on its own, and the control read runs first.
+  floor_control_read
+  floor_claim_block LIVE
+  if [ "$FLOOR_CLAIM" = "1" ]; then
+    # The table and the roster ride on the pasted LIVE block too (check #58):
+    # a door that answered at L1 has said nothing about L3-L6.
+    axes_block
+    echo "axes: hosts=127.0.0.1,coord.qontinui.io,api.qontinui.io prefixes=/coord-mcp,/mcp,/agents/credential,/coord/agent-,/api/v1 credentials=proxy-nonce,acting-bearer,device-jwt,bootstrap-agent-jwt,user-device-jwt unprobed=$AXES_UNPROBED"
+    wedge_block
+    approval_verdict_block
+    exit 0
+  fi
+  # Unconditional, by design. This script cannot observe the session's native
+  # coord_* MCP tools (the SCOPE note at the end of this file says so), so it
+  # cannot tell an agent whether those tools are alive - only what a LIVE door
+  # does and does not prove. The line is true either way: a door answering here
+  # never restores a client-side tool list. Plan
+  # 2026-09-02-coord-access-dies-by-eviction-not-expiry Phase S1.
+  echo "NOTE: a LIVE door here does NOT restore this session's native coord_* MCP tools - the MCP client read .mcp.json once at connect and never re-reads it, so if those tools are answering 401 or \"Command failed with no output\" they stay dead for the life of this session. That is the expected post-eviction steady state, not a fault to diagnose."
+  echo "NOTE: the remaining path is this door, by hand - coord-revive.sh call <tool> '<json>' (and coord-revive.sh tools) run any allowed coord MCP tool over the same nonce - or a NEW session, which pairs a fresh key with a fresh client. Never restart the runner for it."
+  case "$v" in
+    LIVE_APP_ERROR*)
+      echo "NOTE: the end-to-end probe reached coord and the TOOL answered isError:true. The DOOR is proven - re-issue over it. The tool's own complaint is about the CALL (arguments, authority, or that tool's state), not about the transport, and it is not evidence your lost write failed." ;;
+    PROXY_LIVE_E2E_UNVERIFIED*)
+      echo "NOTE: only the PROXY was measured (tools/list). Whether coord answers behind it was NOT tested on this run, so re-issue your call and read the ANSWER rather than treating this verdict as end-to-end proof. Unset \$COORD_REVIVE_E2E to run the end-to-end probe." ;;
+  esac
+  if [ "$transport" = "https-web-device-jwt" ]; then
+    echo "NOTE: this LIVE is the WEB host (api.qontinui.io, the qontinui-web backend), NOT a coord door: it carries /api/v1 (plan-library, memory) and cannot re-issue a coord MCP tool call or reach /coord/*. Every coord.qontinui.io row below reads as recorded - a lost COORD write is still presumed LOST until verified by read over a coord door or your native coord_* tools."
+  else
+    echo "Re-issue the lost call over this door, then VERIFY BY READ (a \"no output\" write is presumed LOST - findings 2026-07-26 section 3)."
+  fi
+  # ── The closeout-spool drain (plan
+  # 2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline, R2.3)
+  #
+  # Only the two rungs that yield a BEARER. L1/L2 are the loopback proxy, and a
+  # live proxy means a live RUNNER, whose own drain owns that file — draining it
+  # from here would be a second writer where the first one is healthy. L3's
+  # acting bearer and L6's web host reach neither /coord/work-units nor
+  # /coord/agent-findings, so neither can carry these rows.
+  #
+  # The bearer is resolved BY TRANSPORT rather than carried in a variable set at
+  # each probe: a variable set before a probe that then FAILED would still be
+  # holding a dead token when a later rung wins, and handing the drainer the
+  # wrong credential would produce a 401 it would report as a refusal of the
+  # rows. The names below are the ones the winning rung actually populated.
+  if [ "${COORD_REVIVE_NO_DRAIN:-}" != "1" ]; then
+    local drain_bearer=""
+    case "$transport" in
+      https-device-jwt-env)      drain_bearer="${ENVJWT:-}" ;;
+      https-device-jwt-file)     drain_bearer="${FILEJWT:-}" ;;
+      https-device-jwt)          drain_bearer="${MJWT:-}" ;;
+      https-bootstrap-agent-jwt) drain_bearer="${BOOT_TOKEN:-}" ;;
+    esac
+    if [ -n "$drain_bearer" ]; then
+      local drainer="" drain_hdr="$TMPD/drainhdr" drain_rc=""
+      # Found through the ONE fleet-script resolver, exactly like the L3/L4/L5
+      # helpers. A fixed `$(dirname "$0")/../../../scripts` resolves only where
+      # this `.claude/` IS the config repo's (directly, or via the
+      # <workspace-root>/.claude symlink, which bash's `cd` rescues by falling
+      # back to the physical path). From every checkout carrying its OWN real
+      # `.claude/` copy -- a runner-provisioned worktree of any other repo, and
+      # the runner-bundled skill -- it names `<that repo>/scripts/`, where the
+      # drainer never is, so the drain never ran. The resolver's walk reaches a
+      # config checkout from there -- which still has to be new enough to ship
+      # the drainer (a shared primary checkout routinely lags main). An absent
+      # drainer is a statement about THE CHECKOUTS IN REACH, and says what it
+      # searched.
+      __resolve_fleet_script "drain-closeout-spool.sh"; drainer="$__RFS_PATH"
+      { printf 'Authorization: Bearer %s\n' "$drain_bearer" > "$drain_hdr"; } 2>/dev/null
+      if [ ! -s "$drain_hdr" ]; then
+        echo "DRAIN: header staging failed under $TMPD - the spool was NOT drained. LOCAL fault; it says nothing about coord or about whether rows are pending."
+      elif [ -z "$drainer" ]; then
+        echo "DRAIN: not attempted - scripts/drain-closeout-spool.sh not found ($(__fleet_script_searched "drain-closeout-spool.sh")). NOT a statement that the spool is empty; run it by hand from a qontinui-claude-config checkout."
+      else
+        echo "DRAIN: replaying unacked closeout rows over this door (push-only; nothing is written to any outbox or cursor). \$COORD_REVIVE_NO_DRAIN=1 opts out."
+        # `bash <path>`, never `"$path"`: the resolver admits a readable file
+        # without the exec bit (routinely dropped on Windows/MSYS checkouts).
+        bash "$drainer" --header-file "$drain_hdr" 2>&1 | sed 's/^/  /'
+        # The pipe to sed spends the drainer's status, and the indented table
+        # does not carry it. Its precedence matters when reading it: 4 wins
+        # over 5, so a run with BOTH a refused and an undelivered row exits 4 --
+        # which is why the 4 line below still points at the table.
+        drain_rc="${PIPESTATUS[0]}"
+        case "$drain_rc" in
+          0) echo "DRAIN: exit 0 - every eligible row accepted, or none pending." ;;
+          3) echo "DRAIN: exit 3 - no readable spool on THIS box, or no python to parse one; read the drainer's own line above. Absence or a LOCAL fault - not delivery, and not a coord verdict." ;;
+          4) echo "DRAIN: exit 4 - at least one row REFUSED by coord (4xx) or UNSENDABLE (no buildable URL), neither retried; other rows in this run may still be UNDELIVERED and retryable - read the table above." ;;
+          5) echo "DRAIN: exit 5 - at least one row UNDELIVERED (transport or 5xx) and none refused; retryable, re-run coord-revive or the drainer." ;;
+          *) echo "DRAIN: exit $drain_rc - unexpected drainer status; treat every row as UNKNOWN." ;;
+        esac
+      fi
+      rm -f "$drain_hdr"
+    fi
+  fi
+  # The table rides on LIVE too: a door that answered at L1 has said nothing
+  # about L3-L6, and the rows below it read UNPROBED, which is the truth.
+  axes_block
+  echo "axes: hosts=127.0.0.1,coord.qontinui.io,api.qontinui.io prefixes=/coord-mcp,/mcp,/agents/credential,/coord/agent-,/api/v1 credentials=proxy-nonce,acting-bearer,device-jwt,bootstrap-agent-jwt,user-device-jwt unprobed=$AXES_UNPROBED"
+  # The approval half rides ON the LIVE verdict, not only on DEAD. A door
+  # answering says nothing about whether the session's native coord_* tools were
+  # ever allowed to load, and LIVE is exactly where that distinction gets lost:
+  # an agent reads "LIVE", is told to re-issue over this door, and still has no
+  # coord tools. PR #370 named this shape as the reason it left the gap open.
+  # stdout, deliberately -- a pasted LIVE verdict must carry it, the same reason
+  # the DEAD block repeats the breadcrumb.
+  wedge_block
+  approval_verdict_block
+  exit 0
+}
+
+# wedge_block -- print VERDICT: RUNNER_WEDGED when one endpoint answered on both
+# planes inside this sweep. Emitted on the LIVE path too: another door carrying
+# the call does not un-wedge the wedged one, and an agent about to "fix" that
+# port's key needs to see this before it re-provisions and evicts a live peer.
+#
+# It never changes the primary verdict and never suppresses a door -- it is a
+# SECOND verdict about a PORT, printed beside the first, which is about a DOOR.
+wedge_block() {
+  [ -n "$WEDGED_ENDPOINTS" ] || return 0
+  local hp
+  for hp in $WEDGED_ENDPOINTS; do
+    echo "VERDICT: RUNNER_WEDGED endpoint=$hp"
+  done
+  echo "  One endpoint answered on BOTH planes inside this single sweep - a transport-level verdict (TIMEOUT / CONNECT_REFUSED / UNREACHABLE, i.e. no HTTP status came back at all) interleaved with an HTTP-level one (a 401-class answer, a LIVE-class answer, 503, TIMEOUT_UPSTREAM, or any HTTP_<code>). NO key fault and NO config fault can produce that set: a stale key 401s every time, a dead port refuses every time. The process is INTERMITTENTLY ACCEPTING - the runner is up and its HTTP surface is starved."
+  echo "  DO NOT RE-PROVISION OR ROTATE THE PROXY KEY. The key is fine, and a re-provision EVICTS a live peer's binding - during a wedge the ordinary 401 advice makes the incident worse. The re-provision advice is deliberately suppressed on this run."
+  echo "  DO NOT restart or kill the runner (served policy production-and-cost runner-lifecycle); a restart destroys in-flight sessions and this evidence with them. Probe /livez on that port to tell one stuck handler from a starved runtime (a 404 there means the build predates the endpoint - inconclusive, not healthy). Treat every in-flight coord write as LOST and verify by read: the coord-mcp proxy is served BY the runner, so a wedge takes it down for every session on the box at once. Observed wedges have resolved on their own - waiting is a legitimate move."
+}
+
+# approval_verdict_block -- re-emit the approval summary on STDOUT beside a
+# verdict. Defined before live_exit's first caller and guarded on the summary
+# actually having been computed, because live_exit is reachable from a probe
+# that runs before the approval block on any future re-ordering; printing
+# nothing is the honest behaviour there, and a bare "APPROVAL:" prefix with an
+# empty body would be a named-but-empty cause.
+approval_verdict_block() {
+  [ -n "${APPROVAL_VERDICT:-}" ] || return 0
+  echo "APPROVAL: $APPROVAL_VERDICT"
+  echo "  (the approval half is INDEPENDENT of every door above: .mcp.json declares the server, a settings key approves it, and Claude Code will not load a project-scoped server it has not approved. Full per-layer readings are on stderr above. This never changed the verdict.)"
+}
+
+# The runner-mint door's PARTIAL block. Every clause here was MEASURED over a
+# live L4 door on 2026-08-13; do not soften it into a hypothetical.
+#
+# Terminology matters and is the whole reason the caveat lands:
+# get_access_token_for_websocket returns the runner's COGNITO ACCESS TOKEN
+# (qontinui-runner src-tauri/src/commands/auth.rs -> AuthManager::get_access_token),
+# NOT a coord-issued device JWT. coord accepts it as a bearer, but it
+# authenticates as the OPERATOR's own Cognito user and tenant rather than as a
+# fleet service identity — which is exactly why the fleet's canonical_repos
+# authority rows are absent: they are not this tenant's rows. The door is real;
+# the IDENTITY is different.
+PARTIAL_RUNNER_MINT="PARTIAL: on the builds measured, this door authenticates as the OPERATOR's own Cognito user/tenant, NOT as a fleet service identity. get_access_token_for_websocket and get_coord_device_token read the SAME access_token slot under two names, so preferring the ungated spelling removes a tier refusal and does NOT upgrade the token's authority - probe the door, never infer from the name.
+PARTIAL: so TENANT-SCOPED AUTHORITY reads come back VACUOUS over it. Measured 2026-08-13: coord_query_merge_economics answered \"qontinui-<repo> is not in your tenant's coord authority (canonical_repos tenant/global rows union tenant_repos) - no economics computed\" for ALL SIX fleet repos.
+PARTIAL: PATH-KEYED reads work normally over the same door - coord_pr_status, and POST /pr-merge/prs/<owner>/<repo>/<n>/reevaluate returned refreshed_from_github: true.
+PARTIAL: a vacuous or empty authority answer over THIS door is UNKNOWN, NEVER ZERO. An agent that reads \"no economics computed\" as \"no merge activity\" draws exactly the wrong conclusion (same rule as served policy verification-and-evidence silent-empty-is-unknown). Re-ask over a door with fleet authority, or say UNKNOWN."
+
+# The STATIC-source PARTIAL block. Deliberately weaker than the one above and it
+# SAYS SO: a token in $COORD_DEVICE_JWT or ~/.qontinui/coord-device-jwt may be a
+# genuine coord-issued device JWT with fleet authority, or a copy of the same
+# operator-tenant Cognito token — this script cannot tell from the bearer alone,
+# and asserting either would be a cause it has not tested.
+PARTIAL_STATIC_JWT="PARTIAL: this is a STATIC bearer of unverified identity - it may be a coord-issued device JWT with fleet authority, or an operator-tenant token like the runner mint's. This script cannot tell which from the bearer alone and does not guess.
+PARTIAL: so before trusting any TENANT-SCOPED AUTHORITY read over it (coord_query_merge_economics and friends), check the answer itself. A \"not in your tenant's coord authority\" or empty reply is UNKNOWN, NEVER ZERO - never read it as \"no merge activity\".
+PARTIAL: PATH-KEYED reads (coord_pr_status, /pr-merge/.../reevaluate) are unaffected."
+
+# L5's PARTIAL block. Different subject from the two above: theirs is about
+# REACH (what the door can read), this one is about PROVENANCE and BLAST RADIUS.
+# The bootstrap token is an AGENT principal minted against a device UUID, not a
+# device principal, and this script asserts nothing beyond what its control read
+# actually measured.
+PARTIAL_BOOTSTRAP="PARTIAL: the url= above is the MINT, not a door to re-issue a write over. This rung yields a BEARER; spend it on the device-authed hand-written \${COORD_HTTP_URL}/coord/... REST routes, which /gate's write-forwarder REST rung spells out. It is NOT carried onto \${COORD_HTTP_URL}/mcp - that door's device-JWT-only constraint is unchanged.
+PARTIAL: this bearer is sub_type=agent with a DEVICE subject (sub=device:<uuid>) and NO agent_id claim - measured 2026-09-04 - so it is scoped by whatever coord grants such a principal in this tenant, which is not the same set the L1/L2 proxy or an L4 device JWT carries. coord's own agent-refresh helper will not refresh it for that reason (agent-only route); re-mint instead.
+PARTIAL: VERIFIED here: the control read GET \${COORD_HTTP_URL}/coord/agent-findings?limit=1 answered 200. Measured 2026-09-04 the same bearer also read \${COORD_HTTP_URL}/coord/agent-prompt-documents and one policy document at 200, so tenant resolution DID work on those routes - but that is those routes' evidence, not a general guarantee: a 403 cannot-resolve-tenant elsewhere is THAT route's verdict, not a refutation of the credential.
+PARTIAL: it is SHORT-LIVED - ~4h (14400s, measured). It is NOT over-broad: measured 2026-09-04 every scope in the minted token was empty or false (git_push [], merge_propose false, build_submit false, strategy_admin false, introspect false, no NATS subjects), which is NARROWER than the sibling allocate route's token (that one carries git_push scoped to the reserved branch plus agent NATS subjects; neither mints merge_propose). Use it for the read or write you came for and DISCARD it: never persist it, never print it, never put it on any process's argv.
+PARTIAL: the anonymity of the SIBLING /agents/allocate route is UNKNOWN - neither gated nor cleared. It was escalated as coord gate ece99898-30c6-4f8c-be8e-1de5f09abebc, which reads WITHDRAWN (re-verify with coord_gate_inspect before citing it anywhere); its successor 3c9b18ca-3300-4dbe-a2f4-1d6db5e5a6d5 is withdrawn too ('DECIDED, not escalated: do NOT clamp', read 2026-09-11) and names allocate's anonymity as the residual for the narrower MintCaller route (plan 2026-08-31-coord-mcp-credential-selection-by-binding-provenance decision (3)). UNKNOWN is not permission: nothing here licenses that route, and this credential is never preferred anywhere a device JWT resolves."
+
+# ----- runner-origin bookkeeping (feeds L4) -----------------------------------
+# Every proxy-shaped .mcp.json names a RUNNER: the proxy is served BY the runner
+# on its own HTTP API, so `http://127.0.0.1:9877/coord-mcp` tells us a runner
+# answers at `http://127.0.0.1:9877`. Collecting origins here means L4 finds a
+# runner that has moved off the default port without any configuration — the
+# same reason L2 sweeps siblings rather than assuming one port.
+RUNNER_ORIGINS=""
+note_origin() {
+  case "$1" in http://*|https://*) ;; *) return 0 ;; esac
+  local o="${1%/coord-mcp*}"
+  case " $RUNNER_ORIGINS " in *" $o "*) return 0 ;; esac
+  RUNNER_ORIGINS="$RUNNER_ORIGINS $o"
+}
+
+# read_minted_jwt: stdin = the UI-Bridge evaluate response, stdout = the token.
+# Same dual-reader discipline as read_cfg, and the same CR strip: a NATIVE
+# Windows jq/python emits CRLF, and a CR surviving into an Authorization header
+# makes curl exit 3 with http_code 000, which classify() reports as UNREACHABLE
+# — a false DEAD over a live door, invisible on Linux.
+# `.data.value` is the LIVE shape and is read FIRST; `.data.result.value` is kept
+# only as a fallback. The runner unwraps the frontend's `result` envelope before
+# it reaches HTTP (qontinui-runner `ui_bridge/page.rs` ->
+# `Ok(resp.result.unwrap_or(...))`), so a healthy runner answers
+# {"success":true,"data":{"value":"<jwt>","type":"scalar"}} with NO `result` key.
+# Reading `result` alone returned "" from a runner that was holding a valid
+# token, which classify() then reported as a DEAD door — the false-DEAD this
+# function's own CR-strip comment above exists to prevent, reached by a
+# different route.
+# The INVOKE door answers the runner's ApiResponse envelope with `data` as the
+# command's bare return value - {"success":true,"data":"<jwt>"} - so a string
+# `data` is read too. One function, three envelopes, ONE reader:
+# envelope_first_present with the tuple live-first, boxed second, bare-string
+# last, and the non-empty-string predicate that stops the always-present `data`
+# OBJECT from winning. An unreadable body is exit 3 with an `UNKNOWN:` line on
+# stderr and NOTHING on stdout -- the caller's `[ -z "$MJWT" ]` then goes to
+# read_eval_error for the cause, exactly as before, but the reader itself can
+# no longer print "" as if it were a value. Same tuple as install-claude-settings.sh
+# `cmd_mintedjwt`; lint-jwt-cascade-parity.py D1/D3 pin both.
+read_minted_jwt() {
+  envelope_first_present "runner-mint" "data.value,data.result.value,data" -
+}
+
+# read_eval_error: stdin = the UI-Bridge evaluate response, stdout = the ERROR
+# string it carried, or empty. This is the missing half of read_minted_jwt:
+# that function returns "" for "no token", "no answer" and "wrong route" alike,
+# so `[ -z "$MJWT" ]` at the call site cannot tell a signed-out runner from a
+# broken one — an empty string reads as a VALUE. (Same class as
+# reference_missing_schema_object_swallow_arm_hides_wrong_column_forever.)
+#
+# It reads ONLY error-carrying fields and NEVER either token path
+# (`.data.value` or `.data.result.value`), so no token can escape through this
+# path even if the runner ever put one in an error string.
+read_eval_error() {
+  if [ "$JSON_READER" = jq ]; then
+    jq -r '[.error?, (.data? | objects | .error?), (.data? | objects | .result? | objects | .error?), .message?]
+           | map(select(type == "string" and . != "")) | (.[0] // "")' 2>/dev/null  # envelope-ok: the ERROR-path reader; "" here means "no error string", never a value, and the token paths are read_minted_jwt's
+  else
+    "$JSON_READER" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print(); sys.exit(0)
+def g(o,*ks):
+    for k in ks:
+        if not isinstance(o,dict): return ""
+        o=o.get(k)
+    return o if isinstance(o,str) else ""
+for v in (g(d,"error"), g(d,"data","error"), g(d,"data","result","error"), g(d,"message")):
+    if v:
+        print(v); sys.exit(0)
+print()' 2>/dev/null
+  fi
+}
+
+# one_line <max> — collapse a captured string to a single trimmed line, capped.
+# Used on curl's stderr and on evaluate error strings so a multi-line payload
+# cannot break the one-verdict-per-line contract the log format depends on.
+#
+# The trim must apply in BOTH modes. `read_eval_error` prints a bare newline
+# when there is no error, and `tr '\n' ' '` turns that into a single SPACE that
+# `$(...)` does NOT strip — so a caller that skips the trim sees a non-empty
+# string, takes the "there WAS an error" branch, and prints an empty error to
+# show. That regression was live for exactly one edit here; the emptiness test
+# and the display string must come from the SAME trimmed value.
+one_line() {
+  local out
+  out="$(tr -d '\r' | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')"
+  if [ -n "${1:-}" ]; then printf '%s' "$out" | head -c "$1"; else printf '%s' "$out"; fi
+}
+
+# jwt_shaped <token> — 0 iff the token is 3 dot-separated base64url parts.
+# Factored out of L4's inline check so the static sources and the runner mint
+# share ONE shape test; two copies of a credential check drift.
+#
+# The CHARACTER-SET half is not pedantry. A dot count alone accepts
+# `{"token":"a.b.c"}` — a plausible thing to find in ~/.qontinui/coord-device-jwt
+# if a mint script ever wrote the whole response — which would then be SENT, draw
+# a 401, and be reported as DEVICE_JWT_UNAUTHORIZED: a coord verdict for a purely
+# local malformation, the exact thing this check exists to prevent.
+jwt_shaped() {
+  case "$1" in
+    "" | *[!A-Za-z0-9._-]* ) return 1 ;;
+  esac
+  [ "$(printf '%s' "$1" | tr -cd '.' | wc -c | tr -d '[:space:]')" = "2" ]
+}
+
+# ----- The execute door: `call <tool> '<json-args>'` and `tools` ------------
+# Diagnosis exists; execution did not - in bash. This script reported which
+# door is LIVE and stopped there, so a session that had diagnosed correctly
+# still had no way to ACT without hand-rolling a JSON-RPC client (which the
+# 2026-09-02 session did). These two verbs are that client, once, as a port of
+# lib/coord-credential.psm1's Invoke-CoordProxyTool: one JSON-RPC shape in each
+# language, no third. Plan
+# 2026-09-02-steering-layers-unreadable-without-a-credential, Phase 1c.
+#
+# THE DOOR IS THE CALLER'S OWN NONCE, and the verbs NEVER MINT. They read the
+# nearest proxy-shaped .mcp.json walking UP from $PWD (a linked worktree's
+# config sits one or two levels above it), both header shapes accepted, and
+# replay it verbatim. They never call /coord-mcp/provision-session: minting
+# there re-provisions the ONE-SLOT workdir key and EVICTS the live peer's
+# binding - the exact failure class Phase 1a of that plan exists to end. The
+# cascade's own mint (L4 source 3) is bounded to run only after L1 and L2 have
+# PROBED this workdir's key and found it dead; a verb that runs on every call
+# has no such bound, so it has no mint at all. A 401 here is therefore final
+# for THIS verb and names its recovery instead.
+#
+# The nonce never touches argv or stdout: it is staged into a private header
+# file (curl -H @file), the same discipline as probe_door. The RESULT is
+# printed on stdout for the caller to pipe; everything else goes to stderr.
+CALL_TIMEOUT="${COORD_REVIVE_CALL_TIMEOUT:-60}"
+
+verb_usage() {
+  cat >&2 <<'EOF'
+usage: coord-revive.sh                          run the transport cascade (default)
+       coord-revive.sh --floor-claim            the same cascade; stdout is ONE pasteable block
+                                                headed by a FLOOR-CLAIM: line that carries the
+                                                probe time, the runner build, the box's load and
+                                                a per-door table - the only sanctioned form of
+                                                "coord was unavailable". Exit 5 = UNKNOWN: the
+                                                sample was taken under this box's own load.
+       coord-revive.sh tools                    list the tools this session's own nonce may call
+       coord-revive.sh call <tool> ['<json-object>']
+                                                EXECUTE one coord MCP tool over that nonce - whatever
+                                                it is allowed, reads AND writes; verify a write by read
+Both verbs read the nearest .mcp.json above $PWD and never mint a nonce.
+EOF
+}
+
+# find_own_cfg -> sets CFG_URL / CFG_KEY / CFG_KEY_HEADER / OWN_CFG_PATH from the
+# first proxy-shaped .mcp.json on the walk up from $PWD; 1 (with the shapes of
+# every rejected candidate in $CFG_TRIED) when none.
+find_own_cfg() {
+  local d="$PWD" f p
+  OWN_CFG_PATH=""; CFG_TRIED=""
+  while [ -n "$d" ]; do
+    f="$d/.mcp.json"
+    if [ -r "$f" ]; then
+      if read_cfg "$f"; then OWN_CFG_PATH="$f"; return 0; fi
+      CFG_TRIED="$CFG_TRIED
+  $f: $(cfg_shape "$f")"
+    fi
+    p="$(dirname "$d")"
+    [ "$p" = "$d" ] && break
+    d="$p"
+  done
+  return 1
+}
+
+# caller_session_id -> this session's own coord agent_session_id on stdout, or
+# NOTHING (and a non-zero exit) when it cannot be established.
+#
+# Plan `2026-09-09-non-runner-sessions-are-unattributable-to-coord` Phase 3. The
+# value is `$CLAUDE_CODE_SESSION_ID` and that is NOT an approximation: coord's
+# `session_on_device` reads `coord.agent_sessions`, whose `id` column coord's own
+# `create_session` upserts FROM the harness session id, and the runner's
+# `anchor_as_caller_session` (qontinui-runner `src-tauri/src/mcp_api.rs:2262-2282`)
+# puts exactly this value on the header for the same reason -- naming the
+# per-boot `coord.sessions.id` instead is the id-space error that runner comment
+# records as "why the Phase-0 chain could not work even fully armed".
+#
+# STRICT UUID or nothing, mirroring the runner's `parse_attribution_session`
+# (`policy_context.rs:288-295`): a non-UUID is dropped rather than forwarded, so
+# a shell that exports something else can never make coord count a `malformed`
+# on this door's behalf. Never fabricated and never substituted from another
+# source -- coord validates the id fail-closed against the caller's own device
+# before trusting it, so a wrong value is not a security problem, it is a silent
+# mis-attribution, which is worse to debug.
+caller_session_id() {
+  # VALIDATE-THEN-FALL-THROUGH, not first-non-empty-then-validate. A stale
+  # `QONTINUI_AGENT_SESSION_ID` left in a shell profile would otherwise mask a
+  # perfectly good `CLAUDE_CODE_SESSION_ID` and silently disable attribution for
+  # every call from that session -- the exact outcome this plan exists to end,
+  # and indistinguishable in the output from "no id was available". Trying each
+  # candidate in order and taking the first that VALIDATES keeps a deliberate
+  # override working (a valid agent id still wins) while making a junk one
+  # harmless. Pinned by scripts/caller-session-header-test.sh.
+  local _c
+  for _c in "${QONTINUI_AGENT_SESSION_ID:-}" "${CLAUDE_CODE_SESSION_ID:-}"; do
+    # Enumerated hex class, NOT the ranges [0-9a-fA-F]. Shell bracket RANGES are
+    # collation-dependent under LC_COLLATE unless `globasciiranges` is on (bash
+    # >= 5.0 defaults it on, bash 4.x does not), and a glibc UTF-8 collation can
+    # place accented characters inside `a-f`. An enumeration is ASCII by
+    # construction on every shell and costs nothing.
+    case "$_c" in
+      [0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF]-[0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF]-[0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF]-[0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF]-[0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF])
+        printf '%s' "$_c"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# build_rpc <method> <tool> <args-json> -> the JSON-RPC payload on stdout, or
+# exit 1 with the reason on stderr. The args are parsed by the JSON reader, so
+# a malformed object is refused HERE with its parse error, and an array or a
+# scalar is refused as not-an-object - the forwarder would otherwise answer a
+# JSON-RPC error that reads like coord's verdict on a local typo. The reader
+# does the escaping; nothing here string-splices the caller's JSON.
+build_rpc() {
+  if [ "$JSON_READER" = jq ]; then
+    if [ "$1" = "tools/list" ]; then
+      jq -cn '{jsonrpc:"2.0",id:1,method:"tools/list",params:{}}'
+    else
+      jq -cn --arg n "$2" --argjson a "$3"         'if ($a|type) != "object" then error("arguments must be a JSON object ({...}), not \($a|type)")
+         else {jsonrpc:"2.0",id:1,method:"tools/call",params:{name:$n,arguments:$a}} end'
+    fi
+  else
+    RPC_METHOD="$1" RPC_TOOL="$2" RPC_ARGS="$3" "$JSON_READER" -c 'import json,os,sys
+m=os.environ["RPC_METHOD"]
+if m=="tools/list":
+    print(json.dumps({"jsonrpc":"2.0","id":1,"method":m,"params":{}})); sys.exit(0)
+try: a=json.loads(os.environ.get("RPC_ARGS") or "{}")
+except Exception as e:
+    sys.stderr.write("arguments are not valid JSON: %s\n" % e); sys.exit(1)
+if not isinstance(a,dict):
+    sys.stderr.write("arguments must be a JSON object ({...}), not %s\n" % type(a).__name__); sys.exit(1)
+print(json.dumps({"jsonrpc":"2.0","id":1,"method":m,"params":{"name":os.environ["RPC_TOOL"],"arguments":a}}))' | tr -d '\r'
+  fi
+}
+
+# rpc_print_result: stdin = the JSON-RPC body. Prints `.result` on stdout and
+# returns 0; prints `.error` on stderr and returns 3; returns 1 for neither.
+# Both keys are read through envelope_require: `error` first (its presence IS
+# the answer), then `result`, whose absence the helper reports as a typed
+# UNKNOWN on stderr -- mapped to 1 here so the caller's HTTP_200_NOT_MCP arm
+# still fires. A `result` holding null is PRESENT and printed as `null`.
+rpc_print_result() {
+  local body err rc
+  body="$(cat)"
+  if err="$(printf '%s' "$body" | envelope_require "coord-mcp tools/call" error - 2>/dev/null)" \
+     && [ -n "$err" ] && [ "$err" != "null" ]; then
+    printf '%s\n' "$err" >&2
+    return 3
+  fi
+  printf '%s' "$body" | envelope_require "coord-mcp tools/call" result -
+  rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# --floor-claim: a MODE of the cascade, not a verb (plan
+# 2026-09-03-capability-floor-claims-carry-their-probe, D1). The cascade runs
+# unchanged; only what stdout carries at the end differs (floor_claim_block).
+FLOOR_CLAIM=0
+if [ "${1:-}" = "--floor-claim" ]; then
+  FLOOR_CLAIM=1
+  shift
+  [ $# -eq 0 ] || { echo "coord-revive: --floor-claim runs the cascade and takes no verb or argument" >&2; verb_usage; exit 4; }
+fi
+
+if [ $# -gt 0 ]; then
+  case "$1" in
+    call|tools) ;;
+    -h|--help|help) verb_usage; exit 0 ;;
+    *) echo "coord-revive: unknown argument '$1'" >&2; verb_usage; exit 4 ;;
+  esac
+  VERB="$1"; shift
+  V_TOOL=""; V_ARGS="{}"
+  if [ "$VERB" = "call" ]; then
+    V_TOOL="${1:-}"
+    [ -n "$V_TOOL" ] || { echo "coord-revive: call needs a tool name" >&2; verb_usage; exit 4; }
+    [ $# -le 2 ] || { echo "coord-revive: call takes ONE JSON argument - quote the object as a single argument" >&2; verb_usage; exit 4; }
+    V_ARGS="${2:-}"
+    [ -n "$V_ARGS" ] || V_ARGS='{}'
+    V_METHOD="tools/call"
+  else
+    [ $# -eq 0 ] || { echo "coord-revive: tools takes no arguments" >&2; verb_usage; exit 4; }
+    V_METHOD="tools/list"
+  fi
+
+  if ! build_rpc "$V_METHOD" "$V_TOOL" "$V_ARGS" > "$TMPD/rpc" 2>"$TMPD/rpcerr"; then
+    echo "coord-revive: $VERB -> BAD_ARGUMENTS ($(one_line 300 < "$TMPD/rpcerr")). Local, before any request was sent." >&2
+    exit 4
+  fi
+
+  if ! find_own_cfg; then
+    echo "coord-revive: $VERB -> NO_PROXY_CONFIG (no proxy-shaped coord-mcp .mcp.json with a key on the walk up from $PWD).${CFG_TRIED}" >&2
+    echo "  This session has no provisioned nonce to ride - a LOCAL fact, not a coord verdict. This verb does not mint one (that would evict a live peer's workdir slot): use a session the runner provisioned, /gate for a gate write, or the PowerShell coord-read.ps1 read verbs." >&2
+    exit 1
+  fi
+
+  # The nonce and, when this session can prove one, its own caller-session id.
+  # Both go in the SAME file because the nonce must never reach argv (served
+  # policy `security-and-autonomy` credential hygiene) and `curl -H @file` reads
+  # every line of it as a separate header. The session id is not a credential,
+  # but splitting it onto a second `-H` would buy nothing and lose the single
+  # staging failure mode below.
+  {
+    printf '%s: %s\n' "$CFG_KEY_HEADER" "$CFG_KEY"
+    if V_CALLER_SESSION="$(caller_session_id)"; then
+      printf 'X-Coord-Caller-Session: %s\n' "$V_CALLER_SESSION"
+    fi
+  # `2>/dev/null` BEFORE `>` deliberately: bash applies redirections left to
+  # right, so with the file redirect first a failure to OPEN it is printed on
+  # the original stderr before the suppression takes effect -- a raw shell line
+  # ahead of the typed AUTH_HEADER_STAGING_FAILED diagnostic below, in a script
+  # whose whole design is typed diagnostics. This ordering preserves what the
+  # previous `{ printf ... > file; } 2>/dev/null` nesting gave for free.
+  } 2>/dev/null > "$TMPD/vhdr"
+  if [ ! -s "$TMPD/vhdr" ]; then
+    echo "coord-revive: $VERB -> AUTH_HEADER_STAGING_FAILED (could not write the header file under $TMPD - LOCAL fault, says nothing about coord)" >&2
+    exit 1
+  fi
+  : > "$TMPD/vbody"; : > "$TMPD/verr"
+  VCODE=$(curl -sS -o "$(curl_path "$TMPD/vbody")" -w '%{http_code}' \
+    --connect-timeout "$PROBE_CONNECT_TIMEOUT" -m "$CALL_TIMEOUT" \
+    -X POST "$CFG_URL" -H "Content-Type: application/json" \
+    -H "@$(curl_path "$TMPD/vhdr")" --data-binary "@$(curl_path "$TMPD/rpc")" 2>"$TMPD/verr")
+  VCE=$?
+  rm -f "$TMPD/vhdr"
+  VBODY="$(cat "$TMPD/vbody" 2>/dev/null)"
+  VCURLERR="$(one_line 200 < "$TMPD/verr")"
+  [ -n "$VCODE" ] || VCODE="000"
+  case "$VCE:$VCODE" in
+    0:200)
+      # A JSON-RPC surface answers 200 for in-band errors too; the reader
+      # decides which it was and prints to the matching stream.
+      printf '%s' "$VBODY" | rpc_print_result
+      VRC=$?
+      case "$VRC" in
+        0)
+          # The envelope advisory (Phase 2 of plan
+          # 2026-09-03-capability-floor-claims-carry-their-probe): a result that
+          # parsed to ZERO rows under a known list key is UNKNOWN(envelope), not
+          # an empty corpus, until a control read against a known-present record
+          # confirms the key. stderr only - stdout stays the raw result so
+          # scripted callers are unchanged. `-1` (no known key at all) says
+          # nothing either way and prints nothing.
+          if [ "$(printf '%s' "$VBODY" | rpc_result_rows)" = "0" ]; then
+            echo "coord-revive: $VERB -> 0 rows under known list keys (hits/records/results/items/findings/documents/work_units/gates/tools/alerts) - UNKNOWN(envelope) until confirmed against a known-present record; do not read this as an empty corpus" >&2
+          fi
+          echo "coord-revive: $VERB -> OK over $CFG_URL (nonce from $OWN_CFG_PATH, header $CFG_KEY_HEADER; source=own-mcp-json, nothing minted)" >&2; exit 0 ;;
+        3) echo "coord-revive: $VERB -> RPC_ERROR (the tool answered with a JSON-RPC error - printed above; that is ITS answer, the door carried the call)" >&2; exit 3 ;;
+        *) echo "coord-revive: $VERB -> HTTP_200_NOT_MCP (200 without a JSON-RPC result or error - treat the door as dead: $(printf '%s' "$VBODY" | one_line 200))" >&2; exit 1 ;;
+      esac ;;
+    *:401)
+      # TWO different 401s arrive here and they have OPPOSITE recoveries, so the
+      # body decides before the wording does. `runner_credential_*` is the
+      # runner refusing the call out of its own dead coord credential while the
+      # nonce is fine (plan 2026-09-12-runner-loads-with-an-expired-coord-credential-and-tells-nobody,
+      # DD4); everything else is the nonce.
+      case "$VBODY" in
+        *runner_credential_*)
+          VRC_POSTURE="$(runner_credential_field "$VBODY" code)"
+          [ -n "$VRC_POSTURE" ] || VRC_POSTURE="$(runner_credential_code_textual "$VBODY")"
+          VRC_POSTURE="${VRC_POSTURE#runner_credential_}"
+          [ -n "$VRC_POSTURE" ] || VRC_POSTURE="unstated"
+          VRC_SINCE="$(runner_credential_field "$VBODY" since)"
+          VRC_REMEDY="$(runner_credential_field "$VBODY" remedy)"
+          echo "coord-revive: $VERB -> RUNNER_CREDENTIAL_$(printf '%s' "$VRC_POSTURE" | tr '[:lower:]' '[:upper:]') (the forwarder at $CFG_URL answered 401 ITSELF; HTTP 401 with code=runner_credential_$VRC_POSTURE since ${VRC_SINCE:-unstated}). The nonce in $OWN_CFG_PATH is FINE and the TRANSPORT is healthy - what is dead is THIS RUNNER's own coord credential." >&2
+          echo "  Next: the nonce is fine; the runner's credential is $VRC_POSTURE; the L4/L5 doors will work and a re-provision will NOT. Run 'bash coord-revive.sh' (no verb) and re-issue over the bearer rung it names - L4 (\$COORD_DEVICE_JWT, ~/.qontinui/coord-device-jwt, the runner mint) and L5 (the bootstrap credential) carry their OWN credentials and do not go through this forwarder. A new session will not help either: every session on this box shares the runner that is refusing. Do NOT rotate the key, do NOT re-provision (it mints a fresh nonce for a credential that stays dead and evicts whatever holds this workdir's slot), and do NOT restart the runner (served policy production-and-cost runner-lifecycle). remedy=${VRC_REMEDY:-unstated}" >&2
+          exit 1 ;;
+      esac
+      echo "coord-revive: $VERB -> COORD_MCP_PROXY_UNAUTHORIZED (the forwarder at $CFG_URL rejected the nonce in $OWN_CFG_PATH; HTTP 401). The BINDING was superseded or never registered - the TRANSPORT is healthy." >&2
+      echo "  Recovery for THIS caller: the file was re-read just now, so the key on disk is itself stale - run 'bash coord-revive.sh' (no verb) for the full cascade, which finds a sibling key or a bearer. Recovery for the NATIVE MCP client: it cannot re-read .mcp.json, so start a NEW SESSION. NEVER restart the runner over this, and this verb never mints (a /coord-mcp/provision-session mint evicts the live peer holding this workdir's slot)." >&2
+      exit 1 ;;
+    *)
+      VV="$(classify "$VCE" "$VCODE" "$VBODY")"
+      [ -n "$VCURLERR" ] && VV="$VV [curl: $VCURLERR]"
+      echo "coord-revive: $VERB -> $VV (door $CFG_URL from $OWN_CFG_PATH; the call was NOT carried - a write here is presumed LOST, re-issue and verify by read)" >&2
+      exit 1 ;;
+  esac
+fi
+
+# ----- Spawn-time breadcrumb: the runner's OWN reason, when it left one --------
+# `.coord-mcp-status` is a breadcrumb the RUNNER's coord-mcp provisioning
+# drops into the workdir it is provisioning (for an agent session,
+# that agent's PRIMARY worktree) when that provisioning went DEGRADED —
+# `qontinui-runner/src-tauri/src/coord_mcp.rs`, `write_degraded_breadcrumb`.
+# This script only READS it; /gate and /policy instruct an agent to read it, and
+# the runner's own `qontinui-pr` CLI POINTS at it in its no-credential error
+# without opening it; none of them writes it.
+#
+# It is read here because six of its fourteen reasons say THAT provisioning pass
+# wrote no `.mcp.json` (no device JWT in the runner's access_token slot; a
+# bearer whose `sub_type` is neither device nor agent; a workdir the
+# non-clobber guard refused (a foreign `.mcp.json`, an unparseable one, or no
+# file at all at a secondary runner's umbrella root); an unresolvable bound API
+# port, device or agent path; an agent JWT with no `sub`). In those cases L1
+# finding nothing in your own cwd is not a second mystery — it is the documented
+# consequence of a fault the runner already diagnosed. Without this line the
+# cascade reports the SYMPTOM while the CAUSE sits one directory read away.
+#
+# The other eight are the PROBE's typed verdicts — TIMEOUT (the 12s budget
+# expired; NOT known dead, the runner may merely be saturated),
+# CONNECT_REFUSED, UNAUTHORIZED (401), CREDENTIAL_REFRESHING (503), some other
+# HTTP status, HTTP_200_NOT_MCP, an unclassified TRANSPORT error, and the
+# runner-credential verdict (the .mcp.json and its nonce are FINE; the RUNNER's
+# own coord credential is the half at fault, so a new session will not
+# help) — and they
+# mean the opposite: a `.mcp.json` WAS written. The first seven say the probe
+# got no usable answer at spawn; the eighth says the RUNNER's own credential is
+# dark, and its provision-time writer runs before any probe at all.
+# The first seven reuse the same vocabulary this script's own per-door table
+# uses, on purpose, and so does the eighth: classify() has a runner_credential_*
+# arm, read BEFORE the nonce arm, and prints RUNNER_CREDENTIAL_<POSTURE>. Same
+# word in the breadcrumb and at the live door, so one grep spans both — and the
+# same recovery from either, which is L4/L5 rather than a re-provision.
+# Fourteen reasons across SIXTEEN call sites (the writer's own two
+# files): two reasons are each written from two of them. A breadcrumb whose
+# parenthetical still GUESSES a three-way cause — a dead port, or a stale nonce
+# 401, or coord being down — came from a runner build predating those verdicts.
+# It established none of them; read it as "no 2xx within 3s" and nothing more.
+# (The disjunction is described here rather than quoted: a verbatim copy is the
+# thing a runner test now asserts is unreconstructible, and it should not be
+# re-seeded from a reader either.)
+#
+# Count the reasons from the source, never from this comment: the set moves in
+# both directions. Re-derive it with scripts/breadcrumb-reason-drift.py; since
+# 2026-09-06 that script runs in CI (.github/workflows/doc-transcription-parity.yml)
+# against runner main, so a stale count here reddens a PR.
+#
+# NOT "the session never had a .mcp.json": `coord_mcp_safe_to_write` passes a
+# workdir whose file is absent OR holds solely our own coord-mcp config, and the
+# refusal arms return either side of that check (three of the eight never reach
+# it) and none of them DELETES — so a RE-provision of a workdir that
+# already carried one leaves the stale file in place. L1 probing a stale port or
+# an evicted nonce is fully consistent with a "NOT written" breadcrumb.
+#
+# It NEVER changes the verdict. Three limits, all stated in the output rather
+# than left to the reader:
+#   - PRESENCE is spawn-time, and this reader SAYS HOW OLD. The runner clears it
+#     (`clear_degraded_breadcrumb`) on a successful probe, but whether anything
+#     re-evaluates it BETWEEN provisioning passes is a property of the runner
+#     build, so a session that recovered on its own can keep a stale file. A
+#     stamped breadcrumb carries `written_at` on line 2; past the TTL below it
+#     is reported STALE — not as a fault, not as health, and never as a reason
+#     to skip a probe. An UNSTAMPED (legacy) one has UNKNOWN age and gets the
+#     same treatment, which is the common case while older builds are still on
+#     the fleet. (A re-provision of the same workdir — a second terminal, a
+#     looping agent — can clear or rewrite it on any build; a boot reconcile or
+#     a periodic sweep on a newer build can clear or re-date one, but neither
+#     ever CREATES one.)
+#   - ABSENCE is UNKNOWN, never health. A healthy provision writes nothing, and
+#     so does a hand-typed session, a workdir the runner never provisioned, and
+#     a build predating the breadcrumb. One further silence is DELIBERATE and is
+#     an absence over a LIVE door: when the non-clobber guard refuses a workdir
+#     that already DECLARES a coord-mcp (an agent-JWT config held by the
+#     no-downgrade guard, or a secondary runner declining the primary's
+#     shared-root config) the runner writes nothing, because a permanent
+#     never-cleared UNREACHABLE line in a session that works is worse than none.
+#     Declared is only a `/mcpServers/coord-mcp` key test, never proof the door
+#     answers, so a dead entry buys the same silence.
+#     A non-device/agent `sub_type` is NOT in this list — that arm breadcrumbs
+#     unconditionally; this comment claimed otherwise until 2026-08-28.
+#     Reporting an absent breadcrumb as "coord-mcp was fine at spawn" would be
+#     exactly the silent-empty-is-unknown error this script exists to stop
+#     making.
+#   - SCOPE is the cwd, deliberately. L2 sweeps siblings for `.mcp.json` because
+#     ANY live door serves you; a breadcrumb is the opposite — it describes ONE
+#     workdir's provisioning, so a sibling's copy is another session's evidence
+#     and quoting it here would be the inference this script refuses to make.
+#     But the runner writes into the workdir IT provisioned, which on a linked
+#     worktree may be the primary checkout rather than your cwd (measured: the
+#     worktree copy was gone 29h later while the checkout's survived — plan
+#     2026-08-20-worktree-spawn-autonomy-and-trust-preconditions, finding 18),
+#     so the absent case says where else to look instead of implying nothing
+#     exists anywhere.
+
+# ----- Freshness: the file is a SNAPSHOT, so this reader must say WHEN --------
+# A stamping runner appends a SECOND line — one JSON object carrying
+# `written_at`, `workdir`, `port`, `verdict`, `build_id` and `schema`. Reading it
+# is what lets a three-second-old verdict be told from a three-week-old one.
+#
+# THE SPLIT MUST HAPPEN BEFORE `one_line`, NOT AFTER. `one_line` maps every
+# newline to a space, so piping the whole file through it CONCATENATES line 2
+# onto line 1 — raw JSON glued to the end of the `BREADCRUMB:` line, and again
+# inside the DEAD verdict block that is written to be pasted as evidence. The
+# 4KB read cap and the 400-char flatten of line 1 are unchanged; only the order
+# is. (This is why this script had to change BEFORE the stamping runner reached
+# a box, not after.)
+CRUMB_TTL_SECS=1800   # 30 min. Past it the breadcrumb EXPLAINS; it never CONCLUDES.
+
+# read_crumb_meta: stdin = line 2. stdout = EXACTLY four lines — written_at,
+# verdict, workdir, schema — or NOTHING when the line is not a JSON object.
+# Emitting nothing rather than four empties is what lets the caller tell
+# "unstamped or unparseable" from "stamped with a field missing"; an empty
+# string that reads as a VALUE is the failure class read_eval_error exists for.
+read_crumb_meta() {
+  if [ "$JSON_READER" = jq ]; then
+    jq -r 'if type == "object"
+           then [(.written_at // ""), (.verdict // ""), (.workdir // ""), (.schema // "")]
+                | map(if type == "string" then . else tostring end) | .[]
+           else empty end' 2>/dev/null
+  else
+    "$JSON_READER" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(0)
+if not isinstance(d, dict): sys.exit(0)
+for k in ("written_at","verdict","workdir","schema"):
+    v=d.get(k)
+    if v is None: v=""
+    if not isinstance(v,str): v=json.dumps(v)
+    print(v.replace("\r"," ").replace("\n"," "))' 2>/dev/null
+  fi
+}
+
+# crumb_age_secs <iso8601-utc> — whole seconds since that stamp, empty if it
+# cannot be read. Deliberately NOT `date -d`: a BSD/macOS date rejects `-d` and
+# would silently print nothing, which would read as "no stamp" over a perfectly
+# good one. The reader this script already proved working does the arithmetic.
+crumb_age_secs() {
+  [ -n "${1:-}" ] || return 0
+  if [ "$JSON_READER" = jq ]; then
+    jq -rn --arg t "$1" 'try ((now | floor) - ($t | fromdateiso8601)) catch empty' 2>/dev/null
+  else
+    "$JSON_READER" -c 'import sys,time,calendar
+s=sys.argv[1].strip()
+for f in ("%Y-%m-%dT%H:%M:%SZ","%Y-%m-%dT%H:%M:%S"):
+    try:
+        print(int(time.time()) - calendar.timegm(time.strptime(s,f))); break
+    except ValueError:
+        continue' "$1" 2>/dev/null
+  fi
+}
+
+# fmt_age <seconds> -> 45s / 4m / 2h13m / 3d4h. Coarse on purpose: the decision
+# is fresh-vs-stale, and a precise age would invite reading it as precision
+# about coord, which this file never had.
+fmt_age() {
+  local s=$1
+  if   [ "$s" -lt 60 ];    then printf '%ds' "$s"
+  elif [ "$s" -lt 3600 ];  then printf '%dm' "$((s / 60))"
+  elif [ "$s" -lt 86400 ]; then printf '%dh%dm' "$((s / 3600))" "$(((s % 3600) / 60))"
+  else printf '%dd%dh' "$((s / 86400))" "$(((s % 86400) / 3600))"
+  fi
+}
+
+CRUMB_FILE="$PWD/.coord-mcp-status"
+CRUMB=""            # line 1 — the statement every reader quotes
+CRUMB_META=""       # line 2 — the JSON stamp, when the writing build made one
+CRUMB_QUAL="age UNKNOWN"
+CRUMB_NOTE=""
+CRUMB_WRITTEN_AT=""
+CRUMB_VERDICT=""
+CRUMB_WORKDIR=""
+CRUMB_SCHEMA=""
+# Capped at READ time: the breadcrumb is two short lines, so a stray large file
+# here costs a 4KB read rather than a full slurp into a shell variable.
+if [ -r "$CRUMB_FILE" ]; then
+  CRUMB_RAW="$(head -c 4096 < "$CRUMB_FILE" 2>/dev/null)"
+  CRUMB="$(printf '%s\n' "$CRUMB_RAW" | sed -n '1p' | one_line 400)"
+  CRUMB_META="$(printf '%s\n' "$CRUMB_RAW" | sed -n '2p' | one_line 2048)"
+fi
+if [ -n "$CRUMB" ]; then
+  CRUMB_AGE=""
+  if [ -n "$CRUMB_META" ]; then
+    CRUMB_FIELDS="$(printf '%s' "$CRUMB_META" | read_crumb_meta)"
+    if [ -n "$CRUMB_FIELDS" ]; then
+      CRUMB_WRITTEN_AT="$(printf '%s\n' "$CRUMB_FIELDS" | sed -n '1p')"
+      CRUMB_VERDICT="$(printf '%s\n' "$CRUMB_FIELDS" | sed -n '2p')"
+      CRUMB_WORKDIR="$(printf '%s\n' "$CRUMB_FIELDS" | sed -n '3p')"
+      CRUMB_SCHEMA="$(printf '%s\n' "$CRUMB_FIELDS" | sed -n '4p')"
+      CRUMB_AGE="$(crumb_age_secs "$CRUMB_WRITTEN_AT")"
+      # Non-numeric OR NEGATIVE is UNKNOWN, not zero: a stamp in the future is a
+      # clock disagreement, and "0s old" would be the freshest possible reading
+      # of the least trustworthy possible file.
+      case "$CRUMB_AGE" in ''|*[!0-9]*) CRUMB_AGE="" ;; esac
+    fi
+  fi
+  if [ -z "$CRUMB_AGE" ]; then
+    if [ -z "$CRUMB_META" ]; then
+      CRUMB_NOTE=" [LEGACY: line 1 only, no stamp - written by a runner build predating the stamped breadcrumb, so its age is UNKNOWN. Treated exactly like an expired one: STALE, NOT evidence of the current state. The probes below decide.]"
+    else
+      CRUMB_NOTE=" [UNSTAMPED AGE: line 2 is present but carries no readable written_at (unparseable, or a clock ahead of this one), so its age is UNKNOWN. STALE - NOT evidence of the current state. The probes below decide.]"
+    fi
+  elif [ "$CRUMB_AGE" -gt "$CRUMB_TTL_SECS" ]; then
+    CRUMB_QUAL="age $(fmt_age "$CRUMB_AGE")"
+    CRUMB_NOTE=" [STALE: older than the ${CRUMB_TTL_SECS}s TTL, so it is NOT evidence of the current state - it explains, it does not conclude. The probes below decide.]"
+  else
+    CRUMB_QUAL="age $(fmt_age "$CRUMB_AGE")"
+    CRUMB_NOTE=" [within the ${CRUMB_TTL_SECS}s TTL - still SPAWN-TIME evidence about ONE provisioning pass, never a probe of coord now.]"
+  fi
+  [ -n "$CRUMB_VERDICT" ] && CRUMB_QUAL="$CRUMB_QUAL, verdict $CRUMB_VERDICT"
+  [ -n "$CRUMB_WORKDIR" ] && CRUMB_QUAL="$CRUMB_QUAL, workdir $CRUMB_WORKDIR"
+  if [ -n "$CRUMB_WORKDIR" ] && [ "$CRUMB_WORKDIR" != "$PWD" ]; then
+    CRUMB_NOTE="$CRUMB_NOTE [WORKDIR MISMATCH: it describes $CRUMB_WORKDIR, not this cwd ($PWD). The runner writes into the workdir IT provisioned, which from a linked worktree is often the primary checkout - so this is another directory's evidence.]"
+  fi
+  if [ -n "$CRUMB_SCHEMA" ] && [ "$CRUMB_SCHEMA" != "1" ]; then
+    CRUMB_NOTE="$CRUMB_NOTE [SCHEMA $CRUMB_SCHEMA: this reader knows schema 1, so anything beyond written_at/verdict/workdir may be misread - open the file yourself.]"
+  fi
+  echo "BREADCRUMB ($CRUMB_QUAL): $CRUMB_FILE (runner, spawn-time): $CRUMB$CRUMB_NOTE" >&2
+else
+  echo "BREADCRUMB: none in this cwd ($CRUMB_FILE: absent, unreadable or empty) - UNKNOWN, not health. A healthy provision writes nothing, and so does a workdir the runner never provisioned. The runner writes into the workdir IT provisioned, which on a linked worktree may be the primary checkout rather than here." >&2
+fi
+
+# ----- The APPROVAL half: DECLARED is not the same as ALLOWED TO LOAD ----------
+# The whole cascade below probes ONE half of the wiring. `.mcp.json` DECLARES the
+# coord-mcp server; a settings key APPROVES it, and Claude Code will not load a
+# project-scoped server it has not approved. The two halves fail INDEPENDENTLY
+# and only the declaration half leaves a `.coord-mcp-status` breadcrumb, so an
+# absent `coord_*` tool has at least two causes and everything above this block
+# can distinguish exactly one of them.
+#
+# That is not a hypothetical: PR #370 restored the approval key after PR #256
+# deleted it, and closed with the gap this block fills -- "/coord-revive cannot
+# name this failure mode. Its L1 door re-reads .mcp.json, which comes back
+# healthy in exactly this case, so the cascade would report a LIVE transport
+# while tools stay masked." A recovery tool that reports LIVE at the exact moment
+# an agent has no coord tools is the mask this script exists to replace, wearing
+# a success label -- the same defect class as the false DEADs the cascade already
+# guards against, with the sign flipped.
+#
+# WHAT THIS BLOCK IS NOT. It reports what it READ; it does not reproduce Claude
+# Code's resolution and never claims to. Three documented facts make a
+# file-reading reporter unable to decide approval on its own, and all three are
+# printed rather than silently assumed:
+#
+#   1. A repository's OWN approvals are gated on WORKSPACE TRUST. An approval in
+#      the project's `.claude/settings.json` does not count in a folder you have
+#      not trusted: interactively "Claude Code asks you before connecting them.
+#      The repository's own approvals don't count". Approvals from `~/.claude.json`
+#      and from managed settings still apply there.
+#   2. Trust is keyed on the GIT REPOSITORY ROOT, and in a linked worktree on the
+#      MAIN CHECKOUT's root -- which is why the key below is resolved from
+#      `--git-common-dir` rather than from $PWD. It is stored as
+#      `projects["<root>"].hasTrustDialogAccepted` in `~/.claude.json`, the key
+#      the docs name for trusting a folder by hand.
+#   3. In a `claude -p` run or an SDK session the trust dialog never appears and
+#      project servers are "connected without asking, approved or not". So a
+#      HELD_UNTRUSTED reading is NOT a prediction that your tools are masked --
+#      it is a statement about one input, in a session type this script cannot
+#      observe from inside a shell.
+#
+# The one asymmetry worth acting on: `disabledMcpjsonServers` "still rejects the
+# server, even in an untrusted folder", in any settings file and every permission
+# mode. It is the only reading here that is decisive on its own, which is why it
+# outranks every other token in the summary.
+#
+# IT NEVER CHANGES THE VERDICT, for the same reason the breadcrumb does not: the
+# doors below are a DIFFERENT transport from the session's native coord_* tools,
+# and the approval half governs only the latter. A LIVE door plus a withheld
+# approval is a perfectly coherent pair -- and it is precisely the pair no line
+# in this script could previously print.
+#
+# $HOME_DIR is hoisted here from L4 (source 2 re-uses it); $USERPROFILE is the
+# documented fallback rather than an improvisation -- see the note there.
+# $OWN is hoisted for the same reason: this block and L1 read the same file, and
+# a second variable naming one path is how two readers of "the config" drift.
+HOME_DIR="${HOME:-${USERPROFILE:-}}"
+OWN="$PWD/.mcp.json"
+
+# WHERE CLAUDE CODE ACTUALLY KEEPS THESE TWO FILES.
+#
+# $CLAUDE_CONFIG_DIR relocates BOTH of them, and reading the home-derived paths
+# on a machine that sets it is not a near miss -- it is a different file with a
+# different answer. Measured on the operator box 2026-08-30, where
+# CLAUDE_CONFIG_DIR=C:\claude\.claude-tiohorst:
+#
+#   ~/.claude.json                    mtime 2026-07-17,  7 projects, 1 trusted,
+#                                     NO entry for the config repo
+#   $CLAUDE_CONFIG_DIR/.claude.json   mtime 2026-08-30, 12 projects, 8 trusted,
+#                                     config repo hasTrustDialogAccepted: true
+#
+# Reading the first reports `noentry` -> APPROVAL_TRUST_UNKNOWN for a folder
+# whose trust IS recorded -- the silent always-UNKNOWN this file calls the worst
+# shape a diagnostic can take, on the very machine the block was written for.
+# This class has burned this fleet before and is recorded in
+# `.claude/commands/cleanup-steward.md`: a flag written to ~/.claude/settings.json
+# while $CLAUDE_CONFIG_DIR pointed elsewhere, so the file Claude Code loads never
+# carried it.
+#
+# THE TWO SHAPES DIFFER, so this is a per-file resolution and not one prefix
+# swap. Unset: settings at `~/.claude/settings.json`, store at `~/.claude.json`
+# -- a directory apart. Set: BOTH sit directly in $CLAUDE_CONFIG_DIR (verified
+# on the operator box, both files present).
+#
+# Backslashes normalised -- the variable arrives as `C:\claude\...` on Windows
+# while every other path here is forward-slash. Same handling as
+# `scripts/lib/claude-registry-name.sh`.
+#
+# Empty means UNRESOLVED, not "use the default": with neither $CLAUDE_CONFIG_DIR
+# nor a home directory there is no path to read, and the layer says so rather
+# than reporting an absence it never looked for.
+if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+  CC_DIR="${CLAUDE_CONFIG_DIR//\\//}"
+  CC_SETTINGS="$CC_DIR/settings.json"
+  CC_STORE="$CC_DIR/.claude.json"
+elif [ -n "$HOME_DIR" ]; then
+  CC_SETTINGS="$HOME_DIR/.claude/settings.json"
+  CC_STORE="$HOME_DIR/.claude.json"
+else
+  CC_SETTINGS=""
+  CC_STORE=""
+fi
+
+# approval_keys -- reads ONE settings-shaped JSON doc on STDIN and prints three
+# space-separated tokens: <enabled> <all> <disabled>.
+#
+#   enabled/disabled : named | unnamed | absent | badtype
+#   all              : true | false | absent | badtype
+#   whole line       : badjson, when the document does not parse
+#
+# STDIN, not a path argument, for the reason spelled out on read_cfg: under an
+# inherited MSYS_NO_PATHCONV a POSIX path reaches a NATIVE jq.exe/python.exe
+# unconverted, the open fails, and every field comes back EMPTY -- which here
+# would print "no approval found anywhere" for a machine that is correctly
+# approved. Same wording-in-one-place discipline as cfg_shape_token: both readers
+# emit TOKENS and the prose lives below, so the two arms cannot drift.
+#
+# The `type` guards are load-bearing, not defensive noise: `enabledMcpjsonServers`
+# set to a string rather than an array is a real hand-edit mistake, and reporting
+# it as `absent` would name a cause that is WRONG rather than merely missing.
+approval_keys() {
+  if [ "$JSON_READER" = jq ]; then
+    jq -r '
+      def arr(k): (.[k]) as $v
+        | if $v == null then "absent"
+          elif ($v | type) != "array" then "badtype"
+          elif ($v | index("coord-mcp")) != null then "named"
+          else "unnamed" end;
+      def flag: (.enableAllProjectMcpServers) as $v
+        | if $v == null then "absent"
+          elif ($v | type) != "boolean" then "badtype"
+          elif $v then "true" else "false" end;
+      if type != "object" then "badjson"
+      else arr("enabledMcpjsonServers") + " " + flag + " " + arr("disabledMcpjsonServers") end
+      ' 2>/dev/null || echo badjson
+  else
+    "$JSON_READER" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print("badjson"); sys.exit(0)
+if not isinstance(d,dict): print("badjson"); sys.exit(0)
+def arr(k):
+    v=d.get(k)
+    if v is None: return "absent"
+    if not isinstance(v,list): return "badtype"
+    return "named" if "coord-mcp" in v else "unnamed"
+f=d.get("enableAllProjectMcpServers")
+flag="absent" if f is None else ("badtype" if not isinstance(f,bool) else ("true" if f else "false"))
+print(arr("enabledMcpjsonServers"),flag,arr("disabledMcpjsonServers"))' 2>/dev/null || echo badjson
+  fi
+}
+
+# claude_json_project -- the same three tokens plus a trust token, read out of
+# the `projects` map of `~/.claude.json` for ONE key.
+#
+# The key travels in the ENVIRONMENT, never on argv -- which keeps a filesystem
+# layout off the process list, the habit `.claude/**` is linted for.
+#
+# That is NOT because the environment is a safe channel for a path. This comment
+# claimed until 2026-08-30 that "an env value is not path-converted", and the
+# claim is false: MSYS rewrites a POSIX-LOOKING value on its way into a native
+# child through EITHER channel. Measured under Git Bash with jq 1.8.2, and again
+# with the python fallback, which saw the identical rewrite. The caller is what
+# makes this channel safe -- it names the variable in `MSYS2_ENV_CONV_EXCL`
+# before spawning the reader. Read that block before changing how the key
+# arrives; dropping the exclusion reintroduces a permanent, silent `noentry`.
+#
+#   trust : accepted | declined | noentry | nomap
+#
+# `noentry` and `declined` are kept APART on purpose. "No entry at all" is a
+# folder Claude Code has never been started in; "false" is one it has, and where
+# trust was not granted. Collapsing them would report a never-visited path as a
+# refusal.
+claude_json_project() {
+  if [ "$JSON_READER" = jq ]; then
+    jq -r '
+      def arr($o; k): ($o[k]) as $v
+        | if $v == null then "absent"
+          elif ($v | type) != "array" then "badtype"
+          elif ($v | index("coord-mcp")) != null then "named"
+          else "unnamed" end;
+      (env.COORD_REVIVE_TRUST_KEY // "") as $k
+      | if type != "object" or ((.projects // null) | type) != "object" then "nomap absent absent absent"
+        elif (.projects | has($k)) | not then "noentry absent absent absent"
+        else (.projects[$k]) as $p
+          | (if ($p | type) != "object" then "nomap"
+             elif ($p.hasTrustDialogAccepted // false) == true then "accepted"
+             else "declined" end)
+            + " " + arr($p; "enabledMcpjsonServers")
+            + " " + (($p.enableAllProjectMcpServers) as $f
+                     | if $f == null then "absent"
+                       elif ($f | type) != "boolean" then "badtype"
+                       elif $f then "true" else "false" end)
+            + " " + arr($p; "disabledMcpjsonServers")
+        end' 2>/dev/null || echo "badjson absent absent absent"
+  else
+    "$JSON_READER" -c 'import json,os,sys
+try: d=json.load(sys.stdin)
+except Exception: print("badjson absent absent absent"); sys.exit(0)
+k=os.environ.get("COORD_REVIVE_TRUST_KEY","")
+pr=d.get("projects") if isinstance(d,dict) else None
+if not isinstance(pr,dict): print("nomap absent absent absent"); sys.exit(0)
+if k not in pr: print("noentry absent absent absent"); sys.exit(0)
+p=pr[k]
+if not isinstance(p,dict): print("nomap absent absent absent"); sys.exit(0)
+def arr(key):
+    v=p.get(key)
+    if v is None: return "absent"
+    if not isinstance(v,list): return "badtype"
+    return "named" if "coord-mcp" in v else "unnamed"
+f=p.get("enableAllProjectMcpServers")
+flag="absent" if f is None else ("badtype" if not isinstance(f,bool) else ("true" if f else "false"))
+print(("accepted" if p.get("hasTrustDialogAccepted") is True else "declined"),arr("enabledMcpjsonServers"),flag,arr("disabledMcpjsonServers"))' 2>/dev/null || echo "badjson absent absent absent"
+  fi
+}
+
+# resolve_main_checkout -- the folder workspace trust is KEYED on.
+#
+# NOT $PWD and NOT --show-toplevel. The documented rule is the git repository
+# root, and "in a worktree, it uses the MAIN checkout's root". `--git-common-dir`
+# points at the main repo's .git from a linked worktree and from the canonical
+# checkout alike, so ONE dirname yields the main checkout in both -- the same
+# anchor resolve_root() uses, stopped one level earlier. Reading the worktree's
+# own path instead would look up a `projects` key that has never existed and
+# report `noentry` for a repository whose trust was granted years ago.
+#
+# $PWD ONLY -- and this is a DELIBERATE divergence from resolve_root(), which
+# falls back to $HERE. The two are answering different questions. resolve_root
+# hunts for the fleet's workspace root, and any anchor that finds it is as good
+# as another. Trust is a property of the folder the SESSION is in: outside a
+# repository the documented key is "the directory you started from". $HERE is
+# where this skill file happens to live -- always inside qontinui-claude-config
+# -- so accepting it as a fallback would report THAT repository's trust for a
+# session running somewhere else entirely, which is a named-but-WRONG cause and
+# strictly worse than the honest $PWD the caller falls back to.
+# It is right for a normal checkout (`<repo>/.git` -> `<repo>`), from a
+# subdirectory of one, and for a linked worktree (the common dir is the MAIN
+# repo's `.git` wherever you stand). It is NOT right under `--separate-git-dir`
+# or in a bare repo, where the git dir is not `<checkout>/.git` and the dirname
+# lands on an unrelated parent. Neither shape exists on this fleet; a wrong key
+# there reports `noentry`, which the output already states as UNKNOWN rather
+# than as a refusal, so the failure mode is a shrug and not a false verdict.
+resolve_main_checkout() {
+  local gc out
+  gc="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || { printf ''; return; }
+  case "$gc" in ""|"."|"..") printf ''; return ;; esac
+  out="$(dirname "$gc")"
+  # Guarded AFTER the dirname as well as before it. `--path-format=absolute` is
+  # honoured by every git this fleet runs, but a git that accepted the flag and
+  # returned a bare `.git` would leave `dirname` = `.`, which is NON-EMPTY -- so
+  # the caller's `-n` test passes, TRUST_KEY becomes "." and every lookup
+  # silently reports `noentry` for a machine whose trust is recorded. The
+  # pre-dirname guard was inherited from resolve_root() and does not cover this.
+  case "$out" in ""|"."|"..") printf ''; return ;; esac
+  printf '%s' "$out"
+}
+
+# read_one <file> — bash opens it, so no path crosses to a native reader.
+#
+# A leading UTF-8 BOM is stripped, because the two readers DISAGREE about one.
+# Measured 2026-08-30: `/c/Users/<windows-user>/.claude/settings.json` starts EF BB BF
+# (PowerShell writes it that way); jq 1.8.2 parses it fine, `python -c
+# json.load` fails with "Expecting value: line 1 column 1". Without this the
+# same file reads as real settings on a jq box and as `does not parse as JSON`
+# on a python one -- a platform-dependent answer from a tool whose whole point
+# is a typed, reproducible cause.
+#
+# The BOM bytes are built with printf rather than written literally, so this
+# file stays pure ASCII for the lint that checks exactly that.
+approval_read() {
+  [ -r "$1" ] || return 1
+  local content bom
+  content="$(cat < "$1" 2>/dev/null)" || return 1
+  bom="$(printf '\357\273\277')"
+  printf '%s' "${content#"$bom"}"
+}
+
+APPROVAL_LINES=""
+approval_note() { APPROVAL_LINES="${APPROVAL_LINES}APPROVAL: $1
+"; }
+
+# The declaration half, restated here in the approval block's own terms. This is
+# only a `/mcpServers/coord-mcp` KEY test -- the same test the runner's
+# non-clobber guard makes, and never proof the door answers. L1 above is what
+# says whether it answers; the point here is that with NO declaration there is
+# nothing for a settings key to approve, so a missing approval is not the story.
+APPROVAL_DECLARED="unreadable"
+if [ -r "$OWN" ]; then
+  if [ "$JSON_READER" = jq ]; then
+    APPROVAL_DECLARED="$(jq -r 'if (type == "object") and (((.mcpServers // null) | type) == "object") and (.mcpServers | has("coord-mcp")) then "yes" else "no" end' < "$OWN" 2>/dev/null || echo badjson)"
+  else
+    APPROVAL_DECLARED="$("$JSON_READER" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print("badjson"); sys.exit(0)
+s=d.get("mcpServers") if isinstance(d,dict) else None
+print("yes" if isinstance(s,dict) and "coord-mcp" in s else "no")' < "$OWN" 2>/dev/null || echo badjson)"
+  fi
+  [ -n "$APPROVAL_DECLARED" ] || APPROVAL_DECLARED="badjson"
+fi
+case "$APPROVAL_DECLARED" in
+  yes)        approval_note "declaration $OWN: coord-mcp DECLARED (a /mcpServers/coord-mcp key test only - L1 above is what says whether it ANSWERS)" ;;
+  no)         approval_note "declaration $OWN: no coord-mcp entry - there is nothing here for a settings key to approve, so the missing half is the DECLARATION (see the breadcrumb above), not the approval" ;;
+  badjson)    approval_note "declaration $OWN: does not parse as JSON - the declaration half is UNKNOWN from here" ;;
+  *)          approval_note "declaration $OWN: absent or unreadable - UNKNOWN, and the same absence the breadcrumb above describes" ;;
+esac
+
+# The trust anchor, and the settings layers, in the documented precedence order:
+# managed settings, then `--settings`, then project-local, then shared project,
+# then user. Managed settings and `--settings` are deliberately NOT guessed at --
+# their locations are platform- and invocation-specific, and inventing a path to
+# report "absent" for would be a named-but-wrong cause.
+TRUST_KEY="$(resolve_main_checkout)"
+[ -n "$TRUST_KEY" ] || TRUST_KEY="$PWD"
+APPROVAL_ENABLED_IN=""   # layers naming coord-mcp in an approving key
+APPROVAL_UNGATED=""      # ...of those, the ones workspace trust does NOT gate
+APPROVAL_DISABLED_IN=""  # layers naming it in disabledMcpjsonServers
+
+approval_layer() {  # <label> <path> <trust-gated: yes|no>
+  local label="$1" path="$2" gated="$3" toks e a dis
+  if [ ! -r "$path" ]; then
+    approval_note "$label $path: absent or unreadable - a statement of ABSENCE, not of a withheld approval"
+    return
+  fi
+  toks="$(approval_read "$path" | approval_keys | one_line 200)"
+  # `read`, not `set --`: this runs at script scope via its caller and clobbering
+  # the positional parameters is a side effect a diagnostic must not have.
+  read -r e a dis <<<"$toks"
+  [ -n "$e" ] || e="badjson"; [ -n "$a" ] || a="absent"; [ -n "$dis" ] || dis="absent"
+  if [ "$e" = "badjson" ]; then
+    # No claim about what Claude Code would make of the same file. This line used
+    # to add "and Claude Code would not read an approval out of it either",
+    # which nothing here tested -- and a BOM'd settings file, the most likely way
+    # to reach this arm on Windows, is one Claude Code plainly does load. UNKNOWN
+    # is the honest stopping point; asserting the consequence is a named-but-wrong
+    # cause.
+    approval_note "$label $path: does not parse as JSON for this reader - UNKNOWN"
+    return
+  fi
+  approval_note "$label $path: enabledMcpjsonServers=$e enableAllProjectMcpServers=$a disabledMcpjsonServers=$dis"
+  if [ "$e" = "named" ] || [ "$a" = "true" ]; then
+    APPROVAL_ENABLED_IN="$APPROVAL_ENABLED_IN $label"
+    [ "$gated" = "yes" ] || APPROVAL_UNGATED="$APPROVAL_UNGATED $label"
+  fi
+  [ "$dis" = "named" ] && APPROVAL_DISABLED_IN="$APPROVAL_DISABLED_IN $label"
+  return 0
+}
+
+# Project-supplied layers are read at $PWD -- the SAME anchor as the `.mcp.json`
+# above, and deliberately NOT the trust key.
+#
+# Those are two different questions and conflating them was this block's first
+# bug (caught in pre-PR review). Project settings are read from the PROJECT
+# directory; only TRUST is keyed on the repository root and, in a worktree, on
+# the main checkout. Reading the approval at the main checkout while reading the
+# declaration at $PWD meant a session in `agent-worktrees/<uuid>` whose own
+# `.claude/settings.local.json` approves coord-mcp would be told
+# NO_APPROVAL_FOUND -- a false negative on a correctly approved session, and on
+# this fleet the DEFAULT path rather than an edge, since sessions run under
+# QONTINUI_AGENT_WORKTREE_MODE=1. `settings.local.json` is per-machine and
+# gitignored, so it is also the file most likely to differ between the two.
+approval_layer "project-local" "$PWD/.claude/settings.local.json" yes
+approval_layer "project-shared" "$PWD/.claude/settings.json" yes
+if [ -n "$CC_SETTINGS" ]; then
+  # UNGATED, and this one is quoted rather than reasoned to: the approvals that
+  # "still apply in an untrusted folder" are `~/.claude/settings.json`, managed
+  # settings, and settings passed with `--settings`. This is that first entry --
+  # at whichever path $CLAUDE_CONFIG_DIR puts it.
+  approval_layer "user" "$CC_SETTINGS" no
+else
+  approval_note "user settings: neither \$CLAUDE_CONFIG_DIR nor \$HOME/\$USERPROFILE is set, so this layer has no path to read - a LOCAL environment fault (HOME_UNRESOLVED), not an absent approval"
+fi
+
+# The user store (`.claude.json`) is where the INTERACTIVE approval actually
+# lands, and it is one of the sources that keeps applying in an untrusted folder
+# -- so it is read even though it is not a settings file. It also carries the
+# trust bit itself. $CC_STORE, not a home-derived path: see the resolution block
+# above for the measurement that made that distinction load-bearing.
+APPROVAL_TRUST="unknown"
+if [ -n "$CC_STORE" ] && [ -r "$CC_STORE" ]; then
+  # EXPORTED, not an assignment-prefix. `VAR=x cmd1 | cmd2` sets VAR for cmd1
+  # ONLY, and the reader is cmd2 -- the key would arrive empty, no `projects`
+  # entry would ever match, and every machine would report `noentry` (UNKNOWN)
+  # for a folder whose trust is recorded. A silent always-UNKNOWN is the worst
+  # shape a diagnostic can take: it looks like an answer.
+  #
+  # ...and EXCLUDED from MSYS's env path conversion, which is the half this
+  # comment used to get WRONG. `claude_json_project`'s header claimed an env
+  # value "is not path-converted" and that argv was the only hazard. Measured on
+  # the operator box 2026-08-30, jq 1.8.2 under Git Bash: with the shell holding
+  # `/tmp/tmp.ABC/c5/proj`, native jq read `env.X` as
+  # `C:/Users/<windows-user>/AppData/Local/Temp/tmp.ABC/c5/proj`. MSYS rewrites
+  # POSIX-LOOKING VALUES on the way into a native child whether they ride on argv
+  # or in the environment -- the python fallback reader saw the identical
+  # rewrite, so this is the MSYS runtime, not a jq behaviour.
+  #
+  # The rewritten key then matches no `projects` entry and the block reports
+  # `noentry` forever: exactly the silent always-UNKNOWN the paragraph above
+  # calls the worst shape a diagnostic can take, arrived at by a different route.
+  #
+  # NOT live on this fleet, and the reason is worth stating so nobody "simplifies"
+  # this away: TRUST_KEY normally comes from `--git-common-dir`, which already
+  # yields a native `D:/...` spelling that MSYS passes through untouched
+  # (measured in the same run). The bug bites where the key is POSIX-spelled --
+  # a session started outside a repo under an MSYS mount, and the self-test's own
+  # `mktemp -d` sandbox, which is what caught it.
+  #
+  # Scoped to a COMMAND SUBSTITUTION subshell so both variables die with it.
+  # MSYS2_ENV_CONV_EXCL is read by the MSYS runtime for every native child, and
+  # the L1-L4 doors below spawn native curl -- widening their environment as a
+  # side effect of a settings read is not a trade this block gets to make.
+  # Appended rather than assigned, so an outer value keeps its entries.
+  CJ_TOKS="$(
+    export COORD_REVIVE_TRUST_KEY="$TRUST_KEY"
+    case ";${MSYS2_ENV_CONV_EXCL-};" in
+      *";COORD_REVIVE_TRUST_KEY;"*) ;;
+      *) export MSYS2_ENV_CONV_EXCL="${MSYS2_ENV_CONV_EXCL:+$MSYS2_ENV_CONV_EXCL;}COORD_REVIVE_TRUST_KEY" ;;
+    esac
+    approval_read "$CC_STORE" | claude_json_project | one_line 200
+  )"
+  # EMPTY means the reader produced nothing, and that is NOT the same as "not
+  # read". jq exits 0 printing NOTHING on empty input, so its `|| echo badjson`
+  # fallback cannot fire -- a zero-byte ~/.claude.json would report
+  # "was not read" on CI (jq) and "badjson" on Windows (python), for the same
+  # file. Normalising here keeps the two readers on one vocabulary; the guard
+  # belongs at the call site because only the caller knows the file WAS opened.
+  [ -n "$CJ_TOKS" ] || CJ_TOKS="badjson absent absent absent"
+  read -r APPROVAL_TRUST CJ_E CJ_A CJ_D <<<"$CJ_TOKS"
+  [ -n "$APPROVAL_TRUST" ] || APPROVAL_TRUST="badjson"
+  [ -n "$CJ_E" ] || CJ_E="absent"; [ -n "$CJ_A" ] || CJ_A="absent"; [ -n "$CJ_D" ] || CJ_D="absent"
+  # The RESOLVED path, not the literal `~/.claude.json` this line used to print.
+  # Every other layer names the file it opened; this one did not, so the single
+  # line that would let a reader notice the wrong store was read was the one line
+  # that hid it -- which is how the $CLAUDE_CONFIG_DIR bug above survived being
+  # looked at.
+  approval_note "user-store $CC_STORE projects[$TRUST_KEY]: enabledMcpjsonServers=$CJ_E enableAllProjectMcpServers=$CJ_A disabledMcpjsonServers=$CJ_D"
+  # Counted as an APPROVAL, but NOT as an ungated one. `~/.claude.json` is where
+  # the interactive approval lands and it is plainly a user-level store, so it is
+  # tempting to file it beside the user settings file above -- but the documented
+  # list of what still applies in an untrusted folder names
+  # `~/.claude/settings.json`, managed settings and `--settings`, and not this.
+  # Asserting ungated here would be extending a citation rather than reading one,
+  # which is the one thing the summary must not do. Left gated, an approval found
+  # only here reports TRUST_UNKNOWN instead of a confident APPROVED_UNGATED --
+  # the conservative direction, and it says which fact it is missing.
+  if [ "$CJ_E" = "named" ] || [ "$CJ_A" = "true" ]; then
+    APPROVAL_ENABLED_IN="$APPROVAL_ENABLED_IN user-store"
+  fi
+  [ "$CJ_D" = "named" ] && APPROVAL_DISABLED_IN="$APPROVAL_DISABLED_IN user-store"
+else
+  approval_note "user-store ${CC_STORE:-<unresolved: neither \$CLAUDE_CONFIG_DIR nor \$HOME/\$USERPROFILE is set>}: absent or unreadable - the trust bit and any stored approval are UNKNOWN from here"
+fi
+case "$APPROVAL_TRUST" in
+  accepted) approval_note "trust $TRUST_KEY: ACCEPTED (hasTrustDialogAccepted true) - repository-supplied approvals count in this folder" ;;
+  declined) approval_note "trust $TRUST_KEY: NOT accepted (hasTrustDialogAccepted is not true - either explicitly false, or absent from an entry that does exist; this reading does not separate those) - a repository's OWN approvals do not count here, though the user store and managed settings still do" ;;
+  noentry)  approval_note "trust $TRUST_KEY: no projects entry at all - UNKNOWN, and NOT the same as a refusal: this is a folder Claude Code has no record of being started in. Trust is keyed on the git repository root, and on the MAIN checkout's root from a worktree, which is the key resolved here" ;;
+  nomap|badjson) approval_note "trust $TRUST_KEY: the user store has no readable projects map - UNKNOWN" ;;
+  *)        approval_note "trust $TRUST_KEY: UNKNOWN (~/.claude.json was not read)" ;;
+esac
+
+# Trim the leading space the accumulators carry, so a summary reads
+# "(project-shared)" rather than "( project-shared)".
+APPROVAL_ENABLED_IN="${APPROVAL_ENABLED_IN# }"
+APPROVAL_UNGATED="${APPROVAL_UNGATED# }"
+APPROVAL_DISABLED_IN="${APPROVAL_DISABLED_IN# }"
+
+# The summary.
+#
+# THE DECLARATION IS TESTED FIRST, ahead of the rejection. Those are not
+# competing claims about one question -- NOT_APPLICABLE is a statement about the
+# declaration and REJECTED about the approval -- and putting the rejection first
+# printed "Remove the entry; no door below can work around it" for a server that
+# is not declared here at all, suppressing the line that points at the half
+# actually missing. Within the approval question the rejection still outranks
+# everything, because it is the one reading that is decisive on its own.
+#
+# `$APPROVAL_DECLARED` has FOUR values, not two. Testing it for exactly "no"
+# let `badjson` and the `unreadable` initialiser fall through to the final else,
+# whose text asserts "coord-mcp is declared" -- flatly contradicting the
+# declaration line printed moments earlier on stderr, and reachable by simply
+# running this from a directory with no `.mcp.json`, which is what the knowledge
+# base tells people to do in the sibling repos. A missing declaration and an
+# unreadable one are different answers and get different tokens.
+if [ "$APPROVAL_DECLARED" = "no" ]; then
+  APPROVAL_VERDICT="NOT_APPLICABLE - no coord-mcp is declared in this cwd, so there is no project-scoped server here to approve. The missing half is the DECLARATION; read the breadcrumb line above, not this block."
+elif [ "$APPROVAL_DECLARED" != "yes" ]; then
+  APPROVAL_VERDICT="DECLARATION_UNKNOWN - this cwd's .mcp.json was absent, unreadable or unparseable ($APPROVAL_DECLARED), so whether there is anything here to approve is UNKNOWN and the approval half cannot be summarised. That is a statement about THIS directory only; the layer readings above still stand on their own."
+elif [ -n "$APPROVAL_DISABLED_IN" ]; then
+  APPROVAL_VERDICT="REJECTED - coord-mcp is named in disabledMcpjsonServers ($APPROVAL_DISABLED_IN). That rejects the server in EVERY permission mode and in an untrusted folder too, so it outranks every approval above. Remove the entry; no door below can work around it."
+elif [ -n "$APPROVAL_UNGATED" ]; then
+  APPROVAL_VERDICT="APPROVED_UNGATED - an approval sits in a layer workspace trust does not gate ($APPROVAL_UNGATED), so it applies whether or not this folder is trusted."
+elif [ -n "$APPROVAL_ENABLED_IN" ] && [ "$APPROVAL_TRUST" = accepted ]; then
+  APPROVAL_VERDICT="APPROVED_TRUST_GATED - the only approval found is trust-gated ($APPROVAL_ENABLED_IN) and this folder IS trusted, so it counts. It would stop counting in a folder that is not."
+elif [ -n "$APPROVAL_ENABLED_IN" ] && [ "$APPROVAL_TRUST" = declined ]; then
+  # "has an entry whose bit is not true", NOT "the bit is present and not
+  # accepted". The reader's `declined` arm is `hasTrustDialogAccepted is not
+  # true`, which covers an explicit false AND a key absent from an entry that
+  # exists; it never tested presence. Claiming presence here would assert a fact
+  # no reading produced -- the same overstatement the noentry/declined split two
+  # hundred lines up exists to avoid, one field further in.
+  APPROVAL_VERDICT="APPROVAL_HELD_UNTRUSTED - the only approval found is trust-gated ($APPROVAL_ENABLED_IN) and this folder HAS a projects entry whose hasTrustDialogAccepted is not true (explicitly false, or absent from that entry - this does not separate them). Interactively a repository's own approvals do not count until the folder is trusted. This is NOT a prediction that your tools are masked: a claude -p or SDK session connects project servers without asking, approved or not."
+elif [ -n "$APPROVAL_ENABLED_IN" ]; then
+  # `noentry`, `nomap`, `badjson`, `unknown` -- every state that is not a
+  # recorded refusal. This block keeps `noentry` and `declined` apart two
+  # hundred lines up, on the grounds that a never-visited folder is not a
+  # refusal; collapsing them back together HERE, in the one token an agent
+  # greps for, would undo exactly that care.
+  APPROVAL_VERDICT="APPROVAL_TRUST_UNKNOWN - the only approval found is trust-gated ($APPROVAL_ENABLED_IN) and this folder's trust could not be established (trust=$APPROVAL_TRUST). That is UNKNOWN, NOT a refusal: nothing here observed a withheld trust. Read the trust line above for which of absent-entry, absent-map and unparseable it was."
+else
+  APPROVAL_VERDICT="NO_APPROVAL_FOUND - coord-mcp is declared but no readable layer names it in enabledMcpjsonServers and none sets enableAllProjectMcpServers. UNKNOWN rather than proof: managed settings and a --settings file are real approval sources this script does not guess at a path for."
+fi
+approval_note "$APPROVAL_VERDICT"
+approval_note "These are UNIONED readings across the layers, NOT a resolved effective value: an approval in ANY readable layer counts, so a higher-precedence enableAllProjectMcpServers=false is printed above and then not subtracted. Only disabledMcpjsonServers is treated as decisive, and only because it is documented as rejecting the server from any settings file. Where the layers disagree, read the per-layer lines rather than the summary token."
+approval_note "This block READ files; it does not reproduce Claude Code's own resolution and never changes the verdict below. The doors below are a DIFFERENT transport from your native coord_* tools - a LIVE door beside a withheld approval is a coherent pair, and it is the pair no line here could print before."
+printf '%s' "$APPROVAL_LINES" >&2
+
+# ----- The capability-floor claim: the probe carries its own stamp ------------
+# Plan 2026-09-03-capability-floor-claims-carry-their-probe (dossier
+# stale-capability-floor). A session probes a transport, correctly observes it
+# down, and asserts that floor in a durable artifact minutes-to-hours later
+# without re-probing; or it samples at the moment of its OWN peak build load and
+# publishes the worst possible reading as an environmental fact (occurrence 9:
+# /health timed out at 20s behind the session's cargo builds, "the coord write
+# doors are dead" went to the operator in writing, and 30 minutes later every
+# one of them answered in 26ms). Nothing in the sentence the session writes
+# carries a probe, a time, or a load context, so nothing downstream can tell a
+# fresh measurement from a stale one or a real floor from a self-generated one.
+#
+# So the session stops authoring the sentence. THIS SCRIPT emits it, stamped:
+#
+#   FLOOR-CLAIM: verdict=<LIVE|FLOOR|UNKNOWN> probed_at=<ISO8601Z> runner_build=<buildId|UNKNOWN — unrecorded> load=<1m>/<nproc> build_procs=<n> health_ms=<n|timeout|UNKNOWN> doors=<n> live=<n>[ reason=…][ envelope=UNKNOWN(key not confirmed)]
+#     <one line per door: <rung> <host+prefix or name> -> <verdict token>>
+#
+# and check #60 (scripts/lint-capability-floor-stamp.py) refuses the unstamped
+# form in every durable text it reaches. Printed UNCONDITIONALLY on both exits,
+# so the lint's "the emitter's line" binding is reachable from every existing
+# run; --floor-claim only suppresses the surrounding prose.
+#
+# THE LOAD GATE ANSWERS UNKNOWN, NEVER FLOOR (D2). `verdict=FLOOR` is emitted
+# only when every door is dead AND the box is not under heavy local load. "Own
+# load" is the BOX's load, not attributed to a session: every session on a box
+# here runs as one user, so same-user rustc/cargo/cc1/ld processes, the 1-minute
+# load average over nproc, and a /health slower than the slow-threshold are the
+# honest proxies. A load or process count that could not be READ is UNKNOWN and
+# also blocks FLOOR (served policy verification-and-evidence
+# silent-empty-is-unknown). A peer's build blocks this session's FLOOR too -
+# that is the correct direction of error, and the line says so.
+#
+# Exit codes: 0 LIVE, 1 DEAD/FLOOR (unchanged), 5 UNKNOWN sampled under own
+# load (verified unused before this: the script exited 0, 1, 3, 4, 127 only). No
+# consumer maps the cascade's exit status (measured 2026-09-11: every scripted
+# caller invokes the `call`/`tools` verbs, whose codes are untouched).
+COORD_REVIVE_LOAD_RATIO="${COORD_REVIVE_LOAD_RATIO:-1.0}"
+COORD_REVIVE_BUILD_PROCS="${COORD_REVIVE_BUILD_PROCS:-0}"
+COORD_REVIVE_HEALTH_SLOW_MS="${COORD_REVIVE_HEALTH_SLOW_MS:-5000}"
+# A non-numeric override is refused loudly and replaced by the default rather
+# than silently read as 0 by awk / as noise by `[ -gt ]` -- either of which
+# would flip the gate one way for every run without saying so.
+case "$COORD_REVIVE_LOAD_RATIO" in ''|*[!0-9.]*|.|*.*.*) echo "coord-revive: \$COORD_REVIVE_LOAD_RATIO='$COORD_REVIVE_LOAD_RATIO' is not a number - using 1.0" >&2; COORD_REVIVE_LOAD_RATIO="1.0" ;; esac
+case "$COORD_REVIVE_BUILD_PROCS" in ''|*[!0-9]*) echo "coord-revive: \$COORD_REVIVE_BUILD_PROCS='$COORD_REVIVE_BUILD_PROCS' is not an integer - using 0" >&2; COORD_REVIVE_BUILD_PROCS="0" ;; esac
+case "$COORD_REVIVE_HEALTH_SLOW_MS" in ''|*[!0-9]*) echo "coord-revive: \$COORD_REVIVE_HEALTH_SLOW_MS='$COORD_REVIVE_HEALTH_SLOW_MS' is not an integer - using 5000" >&2; COORD_REVIVE_HEALTH_SLOW_MS="5000" ;; esac
+# The claim line's own grammar, EXPORTED so floor-claim-test.sh parses a real
+# run back with it and check #60 copies (never imports) the same one. POSIX ERE.
+# Keep the em dash / hyphen alternation: `UNKNOWN — unrecorded` is the honest
+# arm #44 already accepts, and the ASCII spelling must parse on a cp1252 box.
+FLOOR_CLAIM_LINE_RE='^FLOOR-CLAIM: verdict=(LIVE|FLOOR|UNKNOWN) probed_at=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z runner_build=(UNKNOWN (—|-) unrecorded|[A-Za-z0-9._-]+) load=([0-9]+(\.[0-9]+)?|UNKNOWN)/([0-9]+|UNKNOWN) build_procs=([0-9]+|UNKNOWN) health_ms=([0-9]+|timeout|UNKNOWN) doors=[0-9]+ live=[0-9]+( reason=[^ ].*)?( envelope=UNKNOWN\(key not confirmed\))?$'
+# Filled at L4 from the SAME /health read the headless arm keys on
+# (coord-provision-nonce.sh frontend-state, which prints buildId= and healthMs=
+# beside frontendReady=). Until then, and when that read never ran, the honest
+# arm: the literal `UNKNOWN — unrecorded`, never an id invented after the fact.
+RUNNER_BUILD_ID="UNKNOWN — unrecorded"
+HEALTH_MS="UNKNOWN"
+# The envelope verdict of the Phase 2 control read; empty until it runs.
+FLOOR_ENVELOPE=""
+# <label> <name> <url> -> remembered so the door table can print the host and
+# prefix a door was probed at, not only the file that named it (dossier
+# coord-transport-cascades-are-rooted-on-the-local-runner, direction 7: never a
+# single DEAD/LIVE over one axis).
+DOOR_URL_MAP=""
+door_url_note() {
+  DOOR_URL_MAP="$DOOR_URL_MAP
+$1 $2	$3"
+}
+# floor_capture -- probed_at, the 1-minute load, nproc and the same-user build
+# process count, read ONCE before L1 so every door in this run shares one
+# sample. Each read that fails renders UNKNOWN: pgrep exiting other than 0/1
+# is a failed read, not zero processes.
+floor_capture() {
+  PROBED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+  [ -n "$PROBED_AT" ] || PROBED_AT="UNKNOWN"
+  LOAD1="UNKNOWN"
+  local lf="${COORD_REVIVE_LOADAVG_FILE:-/proc/loadavg}" up
+  if [ -r "$lf" ]; then
+    LOAD1="$(cut -d' ' -f1 < "$lf" 2>/dev/null)"
+  elif command -v uptime >/dev/null 2>&1; then
+    # Portable fallback: `load average: 0.52, 0.58, 0.59` (GNU) or
+    # `load averages: 1.23 1.10 1.00` (BSD/macOS). First figure only.
+    up="$(uptime 2>/dev/null)"
+    LOAD1="$(printf '%s' "$up" | sed -n 's/.*load average[s]*: *\([0-9][0-9.]*\).*/\1/p' | head -n 1)"
+  fi
+  case "$LOAD1" in
+    ''|*[!0-9.]*|.|*.*.*) LOAD1="UNKNOWN" ;;
+  esac
+  NPROC="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null)"
+  case "$NPROC" in ''|*[!0-9]*|0) NPROC="UNKNOWN" ;; esac
+  BUILD_PROCS="UNKNOWN"
+  local who rc
+  if command -v pgrep >/dev/null 2>&1; then
+    who="${USER:-$(id -un 2>/dev/null)}"
+    pgrep -u "$who" -x 'rustc|cargo|cc1|cc1plus|ld|lld' > "$TMPD/build-procs" 2>/dev/null
+    rc=$?
+    # 0 = matches, 1 = none. Anything else is pgrep failing, which is UNKNOWN.
+    case "$rc" in
+      # `grep -c` prints its 0 AND exits 1 on an empty file, so an `|| echo 0`
+      # here would splice a second line into the count. Read the count, then
+      # default only an EMPTY read.
+      0|1) BUILD_PROCS="$(grep -c . "$TMPD/build-procs" 2>/dev/null)"; [ -n "$BUILD_PROCS" ] || BUILD_PROCS=0 ;;
+    esac
+  elif command -v tasklist >/dev/null 2>&1; then
+    # Git Bash ships no pgrep. Without this arm every all-dead run on a Windows
+    # box -- the fleet's majority -- would render build_procs=UNKNOWN and so
+    # never FLOOR, while Phase 4 makes FLOOR the only sanctioned "unavailable".
+    # tasklist is box-wide rather than same-user, which is the load the gate
+    # actually asks about ("own load" is the BOX's load, see the header).
+    # MSYS would rewrite `/FO` into `C:/Program Files/Git/FO` (the hazard
+    # behind the `cmd //c` idiom); both variables pin the arguments verbatim
+    # and are no-ops everywhere else. A failure here is NAMED on stderr rather
+    # than swallowed -- an unexplained UNKNOWN is the state this arm exists to end.
+    if MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' tasklist /FO CSV /NH > "$TMPD/build-procs" 2>/dev/null; then
+      BUILD_PROCS="$(tr -d '\r' < "$TMPD/build-procs" | grep -c -i -E '^"(rustc|cargo|cc1|cc1plus|ld|lld|rust-lld|link)\.exe"' 2>/dev/null)"
+      [ -n "$BUILD_PROCS" ] || BUILD_PROCS=0
+    else
+      echo "coord-revive: build_procs=UNKNOWN (tasklist failed on this box; no pgrep either) - FLOOR is withheld on that alone" >&2
+    fi
+  fi
+}
+# floor_gate_reason -> prints the reason FLOOR must not be emitted, or nothing.
+floor_gate_reason() {
+  local r=""
+  if [ "$LOAD1" = "UNKNOWN" ] || [ "$NPROC" = "UNKNOWN" ]; then
+    r="load-unreadable"
+  elif awk -v l="$LOAD1" -v n="$NPROC" -v r="$COORD_REVIVE_LOAD_RATIO" 'BEGIN { exit !((l / n) > r) }'; then
+    r="sampled-under-own-load"
+  fi
+  if [ "$BUILD_PROCS" = "UNKNOWN" ]; then
+    r="${r:-build-procs-unreadable}"
+  elif [ "$BUILD_PROCS" -gt "$COORD_REVIVE_BUILD_PROCS" ] 2>/dev/null; then
+    r="sampled-under-own-load"
+  fi
+  case "$HEALTH_MS" in
+    timeout) r="sampled-under-own-load" ;;
+    ''|*[!0-9]*) ;;
+    *) [ "$HEALTH_MS" -gt "$COORD_REVIVE_HEALTH_SLOW_MS" ] 2>/dev/null && r="sampled-under-own-load" ;;
+  esac
+  [ -n "$r" ] && printf '%s' "$r"
+  return 0
+}
+# floor_door_rows -- one line per door, from the same FAILS[] the DEAD block
+# prints, plus the LIVE door when there is one. The verdict is reduced to its
+# TOKEN (the first word) so a row is one line; the parentheticals stay in the
+# DEAD list above it.
+floor_door_rows() {
+  local f key tok url
+  # Guarded: on the LIVE path FAILS is empty, and a bare "${FAILS[@]}" is an
+  # unbound-variable abort under set -u on bash < 4.4 (the axis_row_* idiom).
+  for f in ${FAILS[@]+"${FAILS[@]}"}; do
+    key="${f%%: *}"
+    tok="${f#*: }"; tok="${tok%% *}"
+    url="$(printf '%s\n' "$DOOR_URL_MAP" | awk -F'\t' -v k="$key" '$1 == k { print $2; exit }')"
+    echo "  $key -> $tok${url:+ ($url)}"
+  done
+  if [ -n "$LIVE_URL" ]; then
+    if [ -n "$FLOOR_ENVELOPE" ]; then
+      echo "  LIVE $LIVE_FILE -> LIVE-BUT-EMPTY ($LIVE_URL; $FLOOR_ENVELOPE)"
+    else
+      echo "  LIVE $LIVE_FILE -> ${LIVE_VERDICT%% *} ($LIVE_URL)"
+    fi
+  fi
+}
+# floor_control_read -- Phase 2's envelope arm, run under --floor-claim once a
+# door is LIVE. `tools/list` must return >= 1 tool, and -- the door being the
+# full MCP surface -- `coord_memory_search {"query":"DOSSIER","limit":1}` must
+# return >= 1 row under `hits`. A 2xx control read with zero rows under every
+# known key sets FLOOR_ENVELOPE, which renders `live=0
+# envelope=UNKNOWN(key not confirmed)` on the claim line and LIVE-BUT-EMPTY in
+# the door table: the claim never reports a capability as "present but empty"
+# from an unconfirmed key. A control read the door REFUSES (a JSON-RPC error,
+# a non-2xx) is neither confirmation nor an envelope verdict; it is named on
+# stderr and the line stays as the probe left it. The header pair is the one
+# the LIVE door answered to, staged into a private file exactly as probe_door
+# stages it; the L5 bootstrap route is REST, carries no MCP header pair, and is
+# skipped by construction.
+floor_control_read() {
+  [ "$FLOOR_CLAIM" = "1" ] || return 0
+  [ -n "${LIVE_HNAME:-}" ] && [ -n "${LIVE_URL:-}" ] || return 0
+  local hdr="$TMPD/ctl-hdr" body="$TMPD/ctl-body" errf="$TMPD/ctl-err" code ce rows what payload
+  { printf '%s: %s\n' "$LIVE_HNAME" "$LIVE_HVALUE" > "$hdr"; } 2>/dev/null
+  [ -s "$hdr" ] || { echo "control-read: SKIPPED (could not stage the header file - LOCAL fault)" >&2; return 0; }
+  for what in tools/list coord_memory_search; do
+    if [ "$what" = "tools/list" ]; then
+      payload="$RPC_LIST"
+    else
+      payload='{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"coord_memory_search","arguments":{"query":"DOSSIER","limit":1}}}'
+    fi
+    : > "$body"; : > "$errf"
+    code=$(curl -sS -o "$(curl_path "$body")" -w '%{http_code}' \
+      --connect-timeout "$PROBE_CONNECT_TIMEOUT" -m "$PROBE_TIMEOUT" \
+      -X POST "$LIVE_URL" -H "Content-Type: application/json" \
+      -H "@$(curl_path "$hdr")" -d "$payload" 2>"$errf")
+    ce=$?
+    if [ "$ce" != "0" ] || [ "$code" != "200" ]; then
+      echo "control-read: $what -> NOT CONFIRMED (curl exit $ce, HTTP ${code:-000}) - the control read did not answer; the claim line is left as the probe measured it" >&2
+      break
+    fi
+    if ! rpc_has_result < "$body"; then
+      echo "control-read: $what -> REFUSED ($(rpc_error_code < "$body" | tr -d '\r')${code:+ HTTP $code}) - a JSON-RPC error is the tool's answer, not an envelope verdict" >&2
+      break
+    fi
+    rows="$(rpc_result_rows < "$body")"
+    case "$rows" in
+      ''|*[!0-9-]*) rows=-1 ;;
+    esac
+    if [ "$rows" -ge 1 ] 2>/dev/null; then
+      echo "control-read: $what -> $rows row(s) under a known list key (confirmed)" >&2
+      continue
+    fi
+    FLOOR_ENVELOPE="$what answered 2xx with $rows row(s) under every known list key (hits/records/results/items/findings/documents/work_units/gates/tools/alerts)"
+    echo "control-read: $what -> UNKNOWN(envelope): $FLOOR_ENVELOPE - the key is unconfirmed, so this is NOT 'present but empty'" >&2
+    break
+  done
+  rm -f "$hdr"
+}
+# floor_claim_block <LIVE|DEAD|BUDGET|UNPROBED> -- prints the block on stdout and sets FLOOR_EXIT (0 LIVE, 1 FLOOR/DEAD/BUDGET/UNPROBED, 5
+# UNKNOWN-under-load). UNPROBED is #888's third terminal verdict: no door
+# answered among the axes asked and at least one axis was not asked, which is
+# UNKNOWN by construction and never a FLOOR, however idle the box.
+floor_claim_block() {
+  local mode="$1" verdict live=0 reason="" tail="" doors="${DISTINCT_DOORS:-0}"
+  # No second argument: the transport is already on the VERDICT line above.
+  case "$mode" in
+    LIVE)
+      verdict="LIVE"; live=1; FLOOR_EXIT=0
+      if [ -n "$FLOOR_ENVELOPE" ]; then
+        # A 2xx that parsed to zero rows under every known key is not a
+        # capability "present but empty" - the key is unconfirmed (D3).
+        live=0; tail=" envelope=UNKNOWN(key not confirmed)"
+      fi ;;
+    BUDGET)
+      verdict="UNKNOWN"; FLOOR_EXIT=1
+      reason="budget-exceeded (${DOORS_SKIPPED:-0} door(s) never probed) - raise \$COORD_REVIVE_TOTAL_BUDGET and re-run; do NOT write \"unavailable\" from this sample" ;;
+    UNPROBED)
+      verdict="UNKNOWN"; FLOOR_EXIT=1
+      reason="axis-unprobed (unprobed=${AXES_UNPROBED:-?}) - probe the unprobed axis and re-run; do NOT write \"unavailable\" from this sample" ;;
+    *)
+      reason="$(floor_gate_reason)"
+      if [ -z "$reason" ]; then
+        verdict="FLOOR"; FLOOR_EXIT=1
+      else
+        verdict="UNKNOWN"; FLOOR_EXIT=5
+        reason="$reason (load=$LOAD1/$NPROC, build_procs=$BUILD_PROCS, health_ms=$HEALTH_MS) - re-run after the builds finish; do NOT write \"unavailable\" from this sample"
+      fi ;;
+  esac
+  echo "FLOOR-CLAIM: verdict=$verdict probed_at=$PROBED_AT runner_build=$RUNNER_BUILD_ID load=$LOAD1/$NPROC build_procs=$BUILD_PROCS health_ms=$HEALTH_MS doors=$doors live=$live${reason:+ reason=$reason}$tail"
+  floor_door_rows
+}
+floor_capture
+
+# ----- L1: re-read OWN cwd's .mcp.json ----------------------------------------
+# THE SWEEP BUDGET STARTS HERE, not at process start. Everything above this line
+# is local file reads (the approval layers, the breadcrumb) that no probe budget
+# should be charged for: a slow filesystem must not spend the allowance that
+# exists to bound NETWORK doors, or the run would report doors skipped for a
+# reason that has nothing to do with them.
+PROBE_BUDGET_T0=$SECONDS
+# $OWN is set in the approval block above -- one variable, one path, two readers.
+if [ -r "$OWN" ] && read_cfg "$OWN"; then
+  seen_door "$OWN"
+  seen_endpoint "$CFG_URL" "$CFG_KEY_HEADER" "$CFG_KEY" || :
+  note_origin "$CFG_URL"
+  probe_door "L1" "$OWN" "$CFG_URL" "$CFG_KEY_HEADER" "$CFG_KEY" && live_exit "loopback-proxy"
+else
+  L1WHY="$(cfg_shape "$OWN")"
+  echo "L1: $OWN -> $L1WHY" >&2
+  FAILS+=("L1 $OWN: $L1WHY")
+fi
+
+# ----- L2: sibling-key sweep (workspace root + every child repo) --------------
+# Workspace root = the directory containing the repo checkouts. $QONTINUI_ROOT
+# overrides; otherwise the parent of the MAIN checkout, derived from
+# `--git-common-dir`. Same resolution as the /gate Step-2 sweep.
+#
+# NOT `--show-toplevel`: in a LINKED GIT WORKTREE that returns the worktree's
+# own path, so its parent is the worktree container (`.claude/worktrees`,
+# `agent-worktrees/<uuid>`, `qontinui-worktrees/<uuid>`) — a directory that
+# holds no repo `.mcp.json` at all. The sweep then probes ZERO doors and the
+# cascade reports a FALSE DEAD while a live door sits at the real workspace
+# root. That is the worst failure this script can produce (SKILL.md sells the
+# DEAD line as honest blocked-evidence), and it was the DEFAULT path on this
+# fleet: sessions run under QONTINUI_AGENT_WORKTREE_MODE=1. `--git-common-dir`
+# points at the MAIN repo's .git from a worktree and from the canonical
+# checkout alike, so dirname-twice yields the workspace root in both.
+resolve_root() {
+  local gc anchor
+  if [ -n "${QONTINUI_ROOT:-}" ]; then printf '%s' "$QONTINUI_ROOT"; return; fi
+  # Anchor on $PWD first (the caller's real repo), then on this script's own
+  # location, so a run from a non-repo cwd still finds the config repo's
+  # workspace instead of silently sweeping an unrelated directory.
+  # `--path-format=absolute` (git >= 2.31) rather than absolutising a relative
+  # `.git` with `cd "$gc" && pwd`: when that cd fails the substitution is EMPTY
+  # and dirname-twice collapses to `.`, i.e. a plausible-looking wrong root
+  # instead of a detectable failure. One less way for this cascade to sweep the
+  # wrong directory and print a false DEAD.
+  for anchor in "$PWD" "$HERE"; do
+    gc="$(cd "$anchor" 2>/dev/null && git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || continue
+    case "$gc" in ""|"."|"..") continue ;; esac
+    printf '%s' "$(dirname "$(dirname "$gc")")"
+    return
+  done
+  printf ''
+}
+ROOT="$(resolve_root)"
+if [ -z "$ROOT" ] || [ "$ROOT" = "." ]; then
+  echo "L2: not inside a git checkout — assuming \$PWD is the workspace root (set \$QONTINUI_ROOT to override)" >&2
+  ROOT="$PWD"
+fi
+# The sweep RECORDS its own outcome even when it probes nothing. Every exit from
+# the loop below is a `continue` (unreadable, the door L1 already probed, an
+# unparseable file, a sibling naming a door already probed), so a sweep that
+# ends with no probe used to leave no trace in FAILS[] -- and the AXES table,
+# which derives each row from FAILS[], then read L2 as UNPROBED and withheld
+# DEAD for an axis that had nothing left to probe. On this fleet that is the
+# ORDINARY shape: dozens of checkouts share one door, so L2 usually dedups
+# everything against L1. NO_CANDIDATE is a PROBED outcome: the sweep ran and
+# established that no second door exists under $ROOT.
+L2_PROBES=0; L2_SEEN=0
+for f in "$ROOT/.mcp.json" "$ROOT"/*/.mcp.json; do
+  [ -r "$f" ] || continue
+  L2_SEEN=$((L2_SEEN + 1))
+  seen_door "$f" && continue # canonical-path dedup: L1 (or an earlier glob hit) already probed it
+  read_cfg "$f" || continue
+  # (url, auth) dedup — a DIFFERENT file naming a door already probed is not a
+  # second door. Must follow read_cfg (it sets CFG_*) and precede probe_door.
+  if seen_endpoint "$CFG_URL" "$CFG_KEY_HEADER" "$CFG_KEY"; then
+    echo "L2: $f -> same door as an earlier candidate ($CFG_URL) - not re-probed" >&2
+    continue
+  fi
+  note_origin "$CFG_URL"
+  L2_PROBES=$((L2_PROBES + 1))
+  probe_door "L2" "$f" "$CFG_URL" "$CFG_KEY_HEADER" "$CFG_KEY" && live_exit "loopback-proxy"
+done
+if [ "$L2_PROBES" -eq 0 ]; then
+  echo "L2: sibling-sweep@$ROOT -> NO_CANDIDATE ($L2_SEEN readable .mcp.json file(s) seen; every one was unparseable, or named the door L1 already probed. The sweep RAN and found no second loopback door - an established outcome, not an unprobed axis)" >&2
+  FAILS+=("L2 sibling-sweep@$ROOT: NO_CANDIDATE ($L2_SEEN readable .mcp.json file(s) seen under \$ROOT; every one was unparseable or named the door L1 already probed - the sweep ran and established that no second loopback door exists here)")
+fi
+
+# ----- L3: acting-bearer fallback (direct coord MCP over HTTPS) ---------------
+# Resolved by __resolve_fleet_script above, NOT by the fixed three-levels-up
+# path this comment used to teach -- that rung refuses from inside an ordinary
+# repo checkout, which is where this skill runs. The helper's stderr flows
+# through (it names the credential source, never the token) and its exit code is
+# mapped to a typed cause.
+__resolve_fleet_script "coord-acting-bearer.sh"; AB="$__RFS_PATH"
+if [ -z "$AB" ]; then
+  echo "L3: acting-bearer -> HELPER_NOT_FOUND (coord-acting-bearer.sh: $(__fleet_script_searched "coord-acting-bearer.sh")). LOCAL fault - it says NOTHING about whether the acting-bearer door would have answered" >&2
+  FAILS+=("L3 acting-bearer: HELPER_NOT_FOUND (coord-acting-bearer.sh not found from HERE=$HERE - a LOCAL path fault, not a credential verdict)")
+else
+  OUT="$(bash "$AB")"
+  RC=$?
+  TOKEN="$(printf '%s' "$OUT" | tr -d '\r\n')"
+  if [ "$RC" = "0" ] && [ -n "$TOKEN" ]; then
+    probe_door "L3" "acting-bearer" "${COORD_URL}/mcp" "Authorization" "Bearer $TOKEN" \
+      "BEARER_UNAUTHORIZED (acting-bearer rejected - mint again or check device binding)" \
+      && live_exit "https-acting-bearer"
+  else
+    case "$RC" in
+      2)   L3V="NO_TOKEN (\$COORD_AGENT_JWT unset/empty - it is the helper's only credential source)" ;;
+      3)   L3V="MINT_FAILED (coord rejected or never answered the acting-user mint - device unknown / no bound user / coord down)" ;;
+      127) L3V="HELPER_DEPS_MISSING (coord-acting-bearer.sh: curl missing, or no working JSON reader)" ;;
+      *)   L3V="HELPER_FAILED (coord-acting-bearer.sh exit $RC)" ;;
+    esac
+    echo "L3: acting-bearer -> $L3V" >&2
+    FAILS+=("L3 acting-bearer: $L3V")
+  fi
+fi
+
+# ----- L4: device-JWT bearer, three sources in the documented order -----------
+# Sources 1 and 2 are STATIC; source 3 mints from a live runner. Independent of
+# BOTH failure modes above: none of them cares that every proxy key rotated
+# (L1/L2), and none needs $COORD_AGENT_JWT (L3).
+#
+# l4_fail <name> <verdict> — one place that logs and records an L4 cause, so a
+# new arm cannot forget half of it (the DEAD block prints FAILS; a verdict that
+# only reached stderr is invisible there).
+l4_fail() {
+  echo "L4: $1 -> $2" >&2
+  FAILS+=("L4 $1: $2")
+}
+
+# ----- L4 source 1: $COORD_DEVICE_JWT ------------------------------------------
+# A stale STATIC token is EXPECTED (they live ~4h and nothing refreshes an env
+# var), so its 401 is recorded and the cascade CONTINUES. Exiting here would
+# turn a stale credential into a false DEAD.
+if [ -n "${COORD_DEVICE_JWT:-}" ]; then
+  ENVJWT="$(printf '%s' "$COORD_DEVICE_JWT" | tr -d '[:space:]')"
+  if jwt_shaped "$ENVJWT"; then
+    probe_door "L4" "device-jwt@\$COORD_DEVICE_JWT" "${COORD_URL}/mcp" "Authorization" "Bearer $ENVJWT" \
+      "DEVICE_JWT_UNAUTHORIZED (coord rejected the STATIC \$COORD_DEVICE_JWT - device JWTs live ~4h so a stale env var is the normal cause; NOT terminal, falling through to the next source)" \
+      && live_exit "https-device-jwt-env" "$PARTIAL_STATIC_JWT"
+  else
+    l4_fail "device-jwt@\$COORD_DEVICE_JWT" "DEVICE_JWT_ENV_MALFORMED (\$COORD_DEVICE_JWT is set but is not JWT-shaped - a JWT is 3 dot-separated base64url parts. NOT sent: an unshaped bearer would draw a 401 this script would then report against coord)"
+  fi
+else
+  l4_fail "device-jwt@\$COORD_DEVICE_JWT" "ENV_UNSET (\$COORD_DEVICE_JWT is unset or empty - source 1 of the fleet's three-source device-JWT cascade)"
+fi
+
+# ----- L4 source 2: ~/.qontinui/coord-device-jwt -------------------------------
+# bash opens the file (no path crosses to a native binary), so no MSYS spelling
+# issue here. Whitespace is stripped whole: a JWT contains none, and a trailing
+# CR from a Windows-written file becomes an Authorization header curl cannot
+# send (exit 3 / http_code 000 -> UNREACHABLE, i.e. a false DEAD).
+#
+# $USERPROFILE is the documented fallback rather than an improvisation:
+# scripts/render-memory-cache.ps1 resolves this same "source 2" from
+# $env:USERPROFILE, and the two implementations of one documented cascade must
+# not disagree about WHERE source 2 lives. They coincide under Git Bash; they
+# need not under every shell. An unresolvable home is named as such rather than
+# reported as a missing file — the guard knows the real cause, so discarding it
+# would be a named-but-WRONG cause, which the named-cause invariant does not buy.
+# $HOME_DIR itself is resolved once, in the approval block above (this same
+# idiom); source 2 only names the file under it.
+STATIC_JWT_FILE="$HOME_DIR/.qontinui/coord-device-jwt"
+if [ -z "$HOME_DIR" ]; then
+  l4_fail "device-jwt@~/.qontinui/coord-device-jwt" "HOME_UNRESOLVED (neither \$HOME nor \$USERPROFILE is set, so source 2 of the device-JWT cascade has no path to read - a LOCAL environment fault, and it says nothing about whether the credential exists)"
+elif [ -r "$STATIC_JWT_FILE" ]; then
+  FILEJWT="$(tr -d '[:space:]' < "$STATIC_JWT_FILE" 2>/dev/null)"
+  if jwt_shaped "$FILEJWT"; then
+    probe_door "L4" "device-jwt@$STATIC_JWT_FILE" "${COORD_URL}/mcp" "Authorization" "Bearer $FILEJWT" \
+      "DEVICE_JWT_UNAUTHORIZED (coord rejected the STATIC file token - device JWTs live ~4h so a stale file is the normal cause; NOT terminal, falling through to the runner mint)" \
+      && live_exit "https-device-jwt-file" "$PARTIAL_STATIC_JWT"
+  else
+    l4_fail "device-jwt@$STATIC_JWT_FILE" "DEVICE_JWT_FILE_MALFORMED (the file is readable but its contents are not JWT-shaped - a JWT is 3 dot-separated base64url parts (a whole JSON response left in the file fails here too, by design). NOT sent)"
+  fi
+else
+  l4_fail "device-jwt@$STATIC_JWT_FILE" "FILE_ABSENT (no readable ~/.qontinui/coord-device-jwt - source 2 of the fleet's three-source device-JWT cascade)"
+fi
+
+# ----- L4 source 3: the runner's IN-PROCESS nonce mint --------------------------
+# Preferred AHEAD of the UI-Bridge mint below, because it is the only one of the
+# two that can answer on a headless runner: POST /coord-mcp/provision-session
+# runs entirely inside the runner process, with no /ui-bridge/* hop. The whole
+# /ui-bridge/* family is a FRONTEND PROXY — it bounces the request through the
+# WebView to reach the Rust process that holds the credential — so with no
+# WebView it cannot answer, and re-wording the mint as an `invoke` does not help
+# (measured: 504 after a full 30.0s).
+#
+# The mint is bounded by the header's MINTING note: it is reachable only after
+# L1 and L2 have each probed a door and found it dead, it mints for $PWD, and
+# $COORD_REVIVE_NO_MINT=1 turns it off. The helper is shared with /gate rather
+# than inlined here — the six credential doors were byte-similar and all six
+# broke identically, which is exactly why this one lives in scripts/.
+#
+# Origins come from the configs already read (so a runner on a non-default port
+# is found without configuration), passed through to the helper.
+#
+# The documented default (127.0.0.1:9876) is passed EXPLICITLY rather than left
+# to the helper: `--origin` suppresses the helper's own default, so naming the
+# discovered origins without it would silently drop the fallback that finds a
+# runner no .mcp.json pointed at.
+#
+# $QONTINUI_RUNNER_URL genuinely OVERRIDES that default here, exactly as it does
+# in the UI-Bridge loop below and for the same reason. Until 2026-09-11 this
+# line appended the literal default unconditionally and the comment above it
+# claimed the variable "still wins inside the helper" - it did win the FIRST
+# slot there, and the default was still probed after it. So the in-process
+# mint (and the /health frontend-state read that rides on this same list, which
+# now stamps the floor claim's runner_build= and health_ms=) reached the REAL
+# runner on 9876 from every suite that had pinned the variable to a dead port
+# to be hermetic - the 2026-08-29 defect, one loop over. Found by
+# floor-claim-test.sh, whose runner_build= assertion read a live build id from
+# a sandbox whose only runner was a stub.
+MINT_ORIGIN_ARGS=""
+for o in $RUNNER_ORIGINS ${QONTINUI_RUNNER_URL:-http://127.0.0.1:9876}; do
+  case " $MINT_ORIGIN_ARGS " in *" $o "*) continue ;; esac
+  MINT_ORIGIN_ARGS="$MINT_ORIGIN_ARGS --origin $o"
+done
+
+__resolve_fleet_script "coord-provision-nonce.sh"; CPN="$__RFS_PATH"
+
+if [ -n "${COORD_REVIVE_NO_MINT:-}" ]; then
+  l4_fail "nonce-mint" "SKIPPED_BY_ENV (\$COORD_REVIVE_NO_MINT is set, so the in-process mint was not attempted. That is a CHOICE, not a fault, and it says nothing about whether the mint would have worked)"
+elif [ -z "$CPN" ]; then
+  l4_fail "nonce-mint" "HELPER_NOT_FOUND (coord-provision-nonce.sh: $(__fleet_script_searched "coord-provision-nonce.sh")). LOCAL fault - it says nothing about the runner"
+else
+  # The helper prints `url=` / `nonce=` on STDOUT and its named diagnosis on
+  # STDERR, which flows straight through to this script's probe log. The nonce
+  # never reaches argv: it is read into a variable and handed to probe_door,
+  # which stages it into a private header file.
+  NOUT="$(bash "$CPN" mint --cwd "$PWD" $MINT_ORIGIN_ARGS)"
+  NRC=$?
+  NURL="$(printf '%s\n' "$NOUT" | sed -n 's/^url=//p' | head -n 1 | tr -d '\r')"
+  NKEY="$(printf '%s\n' "$NOUT" | sed -n 's/^nonce=//p' | head -n 1 | tr -d '\r')"
+  if [ "$NRC" = "0" ] && [ -n "$NURL" ] && [ -n "$NKEY" ]; then
+    # $NURL VERBATIM: the nonce is paired to the runner's own bound port, and a
+    # scanned or assumed port 401s.
+    probe_door "L4" "nonce-mint@$NURL" "$NURL" "X-Coord-Mcp-Proxy-Key" "$NKEY" \
+      "PROXY_UNAUTHORIZED (the runner minted this nonce and then refused it - the registry was rotated or the slot re-provisioned between the two calls; re-run)" \
+      && live_exit "loopback-proxy-minted"
+  else
+    case "$NRC" in
+      2)   NV="NO_HANDSHAKE_KEY (no readable ~/.qontinui/runner-loopback-key. The runner writes that 0600 file at startup, so an absent one means this runner's build predates the same-user handshake, or it runs as another user. LOCAL fault - NOT 'no credential')" ;;
+      3)   NV="MINT_REFUSED (the runner answered with a TYPED refusal - see the coord-provision-nonce line above for which: the opt-in marker ~/.qontinui/allow-session-coord-identity is absent, or the handshake was missing/wrong. Each has a different fix, which is why they are three codes and not one)" ;;
+      5)   NV="MINT_ROUTE_ABSENT (the runner answered 404 - this build predates the in-process mint. Do NOT restart a running runner over this: served policy production-and-cost runner-lifecycle. The next runner start picks it up)" ;;
+      127) NV="HELPER_DEPS_MISSING (coord-provision-nonce.sh: curl missing, or no working JSON reader)" ;;
+      *)   NV="MINT_UNKNOWN (no runner answered, or the answer was unrecognised - see the coord-provision-nonce line above. UNKNOWN, not a refusal and not an absent credential)" ;;
+    esac
+    l4_fail "nonce-mint" "$NV"
+  fi
+fi
+
+# ----- L4 source 4: the runner's bearer mint - invoke first, eval fallback -----
+# TWO doors per origin. The IN-PROCESS invoke door
+# (POST /ui-bridge/invoke/get_access_token_for_websocket, body {}) answers on
+# a headless runner because it never touches the WebView; it is tried FIRST,
+# always. The WebView eval mint is KEPT rather than deleted - it is correct on
+# a runner build that predates the invoke entry and has a WebView - but it is
+# reached ONLY through that build's own answer: HTTP 400 "not in UI Bridge
+# allowlist" (or 404 for the route). Every other invoke answer is a verdict in
+# its own right (signed out, tier too low, refused) and the eval door, which
+# fronts the SAME Rust fn through a WebView hop, adds nothing to it. Plan
+# 2026-09-02-steering-layers-unreadable-without-a-credential, Phase 1f.
+#
+# Origins come from the configs already read, so a runner on a non-default port
+# is found without configuration; $QONTINUI_RUNNER_URL overrides, and 9876 is
+# the documented default (spelled as the IPv4 loopback deliberately).
+#
+# $QONTINUI_RUNNER_URL genuinely OVERRIDES the default, which is what SKILL.md
+# has always claimed and what this line did NOT do until 2026-08-29: the literal
+# `http://127.0.0.1:9876` sat outside the expansion, so setting the variable
+# PREPENDED an origin and the default was still probed afterwards. Pointing this
+# script at a dead port therefore did not stop it reaching the real runner --
+# it minted a live Cognito access token there and sent it to production coord,
+# on every run. Found by pre-PR review of the approval half, whose self-test
+# relied on the documented override to stay hermetic and silently did not: 13
+# real mints per suite run, invisible on a CI box with nothing on 9876. The
+# default now applies only when the variable is unset, so an override is one.
+MINT_BODY='{"expression":"window.__TAURI__ ? window.__TAURI__.core.invoke(\"get_access_token_for_websocket\") : invoke(\"get_access_token_for_websocket\")","await_promise":true}'
+
+# THE HEADLESS ARM, and what it keys on.
+#
+# A WebView timeout used to land in the same bucket as "the runner is signed
+# out", so a headless box was told to sign in a runner that was already holding
+# a valid token. The fix keys on /health.frontendReady — a fact the runner
+# STATES — and deliberately NOT on the timeout string: a desktop runner that is
+# merely slow to boot its WebView produces the same timeout, and keying on the
+# text would leave that ambiguity exactly where it was. A probe that FAILED
+# leaves this `unknown`, and `unknown` never suppresses the mint.
+FE_ORIGIN=""; FE_READY="unknown"; FE_STATE="unknown"
+if [ -n "$CPN" ]; then
+  FEOUT="$(bash "$CPN" frontend-state $MINT_ORIGIN_ARGS 2>/dev/null)"
+  FERC=$?
+  # healthMs= is read on BOTH exits: the helper prints `healthMs=timeout` on
+  # its no-answer path when an origin timed out, and that is a LOAD signal the
+  # floor claim must carry (a refused connect prints nothing and stays UNKNOWN).
+  FE_MS="$(printf '%s\n' "$FEOUT" | sed -n 's/^healthMs=//p' | head -n 1 | tr -d '\r')"
+  case "$FE_MS" in
+    timeout|[0-9]*) HEALTH_MS="$FE_MS" ;;
+  esac
+  if [ "$FERC" = "0" ]; then
+    FE_ORIGIN="$(printf '%s\n' "$FEOUT" | sed -n 's/^origin=//p' | head -n 1 | tr -d '\r')"
+    FE_READY="$(printf '%s\n' "$FEOUT" | sed -n 's/^frontendReady=//p' | head -n 1 | tr -d '\r')"
+    FE_STATE="$(printf '%s\n' "$FEOUT" | sed -n 's/^frontendState=//p' | head -n 1 | tr -d '\r')"
+    # The runner's own buildId from the SAME body: the floor claim's
+    # `runner_build=` binding. `unknown` from the helper (no string field on
+    # this build) keeps the `UNKNOWN — unrecorded` arm rather than a default.
+    FE_BUILD="$(printf '%s\n' "$FEOUT" | sed -n 's/^buildId=//p' | head -n 1 | tr -d '\r')"
+    case "$FE_BUILD" in
+      ""|unknown) ;;
+      *) RUNNER_BUILD_ID="$FE_BUILD" ;;
+    esac
+  fi
+fi
+
+L4_SEEN=""
+for origin in ${QONTINUI_RUNNER_URL:-http://127.0.0.1:9876} $RUNNER_ORIGINS; do
+  case " $L4_SEEN " in *" $origin "*) continue ;; esac
+  L4_SEEN="$L4_SEEN $origin"
+  # The mint is the single most expensive step in the cascade ($MINT_TIMEOUT is
+  # 60s on its own), so the sweep budget is sampled before it as well as before
+  # every probe. Skipped, never guessed at.
+  if budget_skip "L4" "mint@$origin"; then continue; fi
+  MEVAL_URL="$origin/ui-bridge/control/page/evaluate"
+  MINT_SOURCE="runner-invoke"
+  # TWO command names on the invoke door, tried in this order, because they are
+  # two spellings of ONE credential slot with different gates in front of them
+  # (`coord-gates-and-access.md`: "one slot, two names, both shipped"):
+  #
+  #   get_coord_device_token          - no require_tier_2(), unpaired is a plain
+  #                                     Ok(None), and its allowlist entry is
+  #                                     Dispatch::InProcess, so it answers on a
+  #                                     HEADLESS runner as well as a windowed
+  #                                     one. Added to UI_BRIDGE_COMMANDS by plan
+  #                                     2026-08-30-every-runner-credential-door-\
+  #                                     goes-through-one-csp-forbidden-eval.
+  #   get_access_token_for_websocket  - the historical name. Calls
+  #                                     require_tier_2() as its FIRST statement,
+  #                                     so a healthy Tier-0/1 runner refuses it
+  #                                     while holding a perfectly good token.
+  #                                     Kept, and tried second, for a runner
+  #                                     build that carries the older entry.
+  #
+  # Order matters for exactly one reason: the tier gate. Trying the gated name
+  # first turns a Tier-1 runner's live credential into RUNNER_TIER_TOO_LOW.
+  #
+  # This is NOT a claim that either name yields fleet authority - they read the
+  # same slot, so the swap removes a tier refusal and nothing more. The token is
+  # probed against coord below before this rung is called LIVE, which is also
+  # what covers `get_coord_device_token` not checking `exp`: an expired token
+  # comes back DEVICE_JWT_UNAUTHORIZED rather than being handed on as a
+  # credential. Probe the door; do not infer from the name.
+  MINT_INVOKE_COMMANDS="get_coord_device_token get_access_token_for_websocket"
+  # THE ONE ANSWER THAT OPENS THE FALLBACK: this build serves neither name.
+  MFALLBACK=""
+  for MCMD in $MINT_INVOKE_COMMANDS; do
+    MINVOKE_URL="$origin/ui-bridge/invoke/$MCMD"
+    MINT_URL="$MINVOKE_URL"
+    # `-w '\n%{http_code}'` appends the status to STDOUT rather than using `-o`/
+    # `-D` with a temp path: a POSIX temp path handed to the native curl.exe is
+    # the check-#9 MSYS trap, and the status is the only extra fact needed. curl's
+    # own stderr is kept (not /dev/null'd as it used to be) so every L4 verdict
+    # can carry its one-line explanation like every other verdict here.
+    : > "$TMPD/merr"
+    # -m "$MINT_TIMEOUT", NOT "$PROBE_TIMEOUT": a mint, not a probe. The two
+    # budgets were one number until 2026-08-31, and 15s on the eval call is what
+    # produced a DEAD verdict over a healthy credential; the in-process door is
+    # cheaper but shares the budget rather than inventing a fourth.
+    MRAW="$(curl -sS -w '\n%{http_code}' --connect-timeout "$PROBE_CONNECT_TIMEOUT" -m "$MINT_TIMEOUT" \
+      -X POST "$MINVOKE_URL" \
+      -H "Content-Type: application/json" -d '{}' 2>"$TMPD/merr")"
+    MCE=$?
+    MCURLERR="$(one_line 200 < "$TMPD/merr")"
+    MCODE="$(printf '%s' "$MRAW" | tail -n 1 | tr -d '[:space:]')"
+    MRESP="$(printf '%s\n' "$MRAW" | sed '$d')"
+
+    MFALLBACK=""
+    if [ "$MCE" = "0" ]; then
+      case "$MCODE" in
+        404) MFALLBACK="HTTP 404 - the invoke route is absent on this build" ;;
+        400) case "$(printf '%s' "$MRESP" | read_eval_error)" in
+               *"not in UI Bridge allowlist"*) MFALLBACK="HTTP 400 - $MCMD is not on this build's invoke allowlist" ;;
+             esac ;;
+      esac
+    fi
+    # Anything that is NOT "this build does not serve that name" is this
+    # command's own answer - a token, a refusal, a transport fault - and the
+    # arms below classify it. Stop here rather than asking the next name a
+    # question this one already answered.
+    [ -z "$MFALLBACK" ] && break
+    echo "L4: mint@$origin source=runner-invoke cmd=$MCMD -> INVOKE_MINT_ROUTE_ABSENT ($MFALLBACK. A runner start does NOT pick up an allowlist entry its BINARY does not carry, so this is a build fact, not a configuration one - never restart a running runner over it)" >&2
+  done
+  MINT_SOURCE="runner-invoke:$MCMD"
+  if [ -n "$MFALLBACK" ]; then
+    echo "L4: mint@$origin source=runner-invoke -> INVOKE_MINT_ROUTE_ABSENT (this build serves NONE of: $MINT_INVOKE_COMMANDS. Falling back to the WebView eval mint)" >&2
+    MINT_SOURCE="runner-eval"
+    MINT_URL="$MEVAL_URL"
+    # The distinct arm, scoped to the eval FALLBACK only - the invoke door
+    # above was already tried on this headless box. Not attempted, because it
+    # provably cannot answer — and named as a DEAD TRANSPORT so nobody reads it
+    # as a missing credential. Only fires for the origin the /health probe
+    # actually answered from, and only on an explicit `false`; `unknown` falls
+    # through to the mint below.
+    if [ -n "$FE_ORIGIN" ] && [ "$origin" = "$FE_ORIGIN" ] && [ "$FE_READY" = "false" ]; then
+      l4_fail "mint@$origin source=runner-eval" "RUNNER_HEADLESS (this build has no in-process mint, and /health reports frontendReady=false, frontendState=$FE_STATE, so POST $MEVAL_URL cannot answer either: every /ui-bridge/control/* route is a FRONTEND PROXY that bounces the request through the WebView. This is a DEAD TRANSPORT on this build, NOT a signed-out runner - a live device credential can be sitting in the runner store the whole time. The in-process door for this box is L4 source 3 above; read its verdict, not this one)"
+      continue
+    fi
+    : > "$TMPD/merr"
+    MRAW="$(curl -sS -w '\n%{http_code}' --connect-timeout "$PROBE_CONNECT_TIMEOUT" -m "$MINT_TIMEOUT" \
+      -X POST "$MEVAL_URL" \
+      -H "Content-Type: application/json" -d "$MINT_BODY" 2>"$TMPD/merr")"
+    MCE=$?
+    MCURLERR="$(one_line 200 < "$TMPD/merr")"
+    MCODE="$(printf '%s' "$MRAW" | tail -n 1 | tr -d '[:space:]')"
+    MRESP="$(printf '%s\n' "$MRAW" | sed '$d')"
+  fi
+  MSUFFIX=""
+  [ -n "$MCURLERR" ] && MSUFFIX=" [curl: $MCURLERR]"
+
+  # Every mint verdict goes through here so curl's own one-line explanation is
+  # attached UNIFORMLY. Appending $MSUFFIX per-arm let an arm silently drop it,
+  # and a partial transfer produces BOTH a parseable error string and curl
+  # stderr — precisely the case where losing the stderr costs the most. The
+  # door name carries which of the two mints answered.
+  mint_fail() { l4_fail "mint@$origin source=$MINT_SOURCE" "$1$MSUFFIX"; }
+
+  # curl's exit code, before anything else: a REFUSED connection and a HUNG one
+  # are different faults, and classify() already draws that line for L1/L2/L3.
+  # Collapsing them here would tell a saturated runner's operator that it is
+  # down — and on this fleet "restart it" is exactly the wrong move (served
+  # policy production-and-cost runner-lifecycle; /health has been sampled from
+  # 296ms to 10120ms on a loaded box, against this mint's own $MINT_TIMEOUT (60s),
+  # which was 15s until 2026-08-31 - the shortest in the fleet for this call,
+  # and enough to turn a slow-but-healthy runner into VERDICT: DEAD).
+  case "$MCE" in
+    7)
+      mint_fail "NO_RUNNER (nothing is listening at $origin - runner down, moved to another port, or never started)"
+      continue ;;
+    28)
+      mint_fail "RUNNER_TIMEOUT (the port answered but produced no response within ${MINT_TIMEOUT}s). Often SATURATION rather than a dead runner - do NOT restart it on this alone; re-run, or use another door"
+      continue ;;
+  esac
+
+  # No answer at all (or a transfer that never produced a status) is the runner
+  # not being there. Distinct from every "it answered" arm below.
+  if [ -z "$MRAW" ] || [ -z "$MCODE" ] || [ "$MCODE" = "000" ]; then
+    mint_fail "NO_RUNNER (UI Bridge did not answer - runner down, wedged, or on another port)"
+    continue
+  fi
+
+  # It ANSWERED. Everything below distinguishes HOW it answered, because a
+  # single "sign the runner in" for all of it is wrong advice in most of these
+  # arms — see the header note on the three-way conflation.
+  MJWT="$(printf '%s' "$MRESP" | read_minted_jwt | tr -d '\r\n')"
+  # Shape-check BEFORE trusting it. A signed-out runner can answer with a
+  # non-token value; sending that as a bearer draws a 401 that classify() would
+  # report as coord rejecting a token — a confident verdict about the remote for
+  # a fault that is entirely local. Same reason probe_door refuses to probe with
+  # an empty header file. The token itself is NEVER echoed, here or anywhere.
+  if [ -n "$MJWT" ] && jwt_shaped "$MJWT"; then
+    probe_door "L4" "device-jwt@$origin source=$MINT_SOURCE" "${COORD_URL}/mcp" "Authorization" "Bearer $MJWT" \
+      "DEVICE_JWT_UNAUTHORIZED (coord rejected the runner-minted token - expired, or bound to another tenant)" \
+      && live_exit "https-device-jwt" "$PARTIAL_RUNNER_MINT"
+    continue
+  fi
+
+  # No usable token. The response's own error string is the only thing that can
+  # NAME the cause, so read it — and read it BEFORE looking at the status code.
+  # Measured 2026-08-13: this runner returns HTTP 400 for a rejected invoke, so
+  # the tier errors arrive on a NON-2xx and a status-first structure would route
+  # every one of them into the generic arm and never reach these patterns.
+  # Match on the FULL string and truncate only for DISPLAY. Truncating first
+  # couples classification to a byte budget: a runner that ever prefixed the
+  # tier message with a stack trace would push "Tier 0/1" past the cut and land
+  # in the generic arm, silently. (The measured prefix is 21 chars today.)
+  MERRFULL="$(printf '%s' "$MRESP" | read_eval_error | one_line)"
+  MERR="$(printf '%s' "$MERRFULL" | one_line 200)"
+  MHTTP=""
+  case "$MCODE" in 2??) ;; *) MHTTP="HTTP $MCODE from $MINT_URL: " ;; esac
+  case "$MERRFULL" in
+    # Both tier strings come from qontinui-runner
+    # src-tauri/src/commands/auth.rs (require_tier_2 / require_tier_2_for),
+    # which get_access_token_for_websocket_impl calls as its FIRST statement,
+    # BEFORE any keychain read — so a healthy Tier-1 runner reaches here without
+    # its keychain ever being consulted. Matched on a stable ASCII substring
+    # (the real messages contain an em dash and an arrow); a future runner
+    # reword lands in the generic arm below, never back on RUNNER_SIGNED_OUT.
+    *"Tier 0/1"*)
+      mint_fail "RUNNER_TIER_TOO_LOW (${MHTTP}this runner is Tier 0/1 (Local / LocalProvider), where the Qontinui account commands do not exist at all. It is NOT signed out - signing in will not help; change the runner's tier in Settings, or use another door)" ;;
+    *"Runner tier could not be determined"*)
+      mint_fail "RUNNER_TIER_UNKNOWN (${MHTTP}the runner could not resolve its own tier - a corrupt or unreadable settings.json; its account state is unchanged. Repair settings.json. A sign-in CTA here is precisely the mistake the runner's own NO-DOWNGRADE (C4) comment records)" ;;
+    *"Not authenticated"*)
+      mint_fail "RUNNER_SIGNED_OUT (${MHTTP}the runner answered and says it holds no tokens: \"$MERR\"). Sign the runner in" ;;
+    # The WebView eval door refused to evaluate ANY string. Matched on the CSP
+    # error's stable substring rather than on the full sentence: the directive
+    # text moves (it grew three sha256- hashes between 2026-08-30 and
+    # 2026-09-01) and the "Refused to evaluate a string as JavaScript" /
+    # "unsafe-eval" pair is what every engine emits.
+    #
+    # This is a BROKEN DOOR, not a missing credential and not a transient. The
+    # bundled app ships `script-src 'self'` with no 'unsafe-eval'
+    # (qontinui-runner src-tauri/tauri.conf.json), the frontend evaluator runs
+    # the expression with `new Function`
+    # (src/hooks/ui-bridge-events/utils.ts), and CSP forbids exactly that - so
+    # the refusal is independent of the expression, of the command name, and of
+    # sign-in state. Measured 2026-09-01 on build 58414a05: even `1+1` was
+    # refused. Retrying, re-signing-in or changing the command cannot open it;
+    # the Rust-side window.eval fallback in page.rs cannot be reached either,
+    # because the refusal arrives over a HEALTHY IPC round-trip as
+    # Ok({success:false}) and that fallback fires only on an IPC transport
+    # error. Plan
+    # 2026-08-30-every-runner-credential-door-goes-through-one-csp-forbidden-eval.
+    *"unsafe-eval"*|*"Refused to evaluate a string as JavaScript"*)
+      mint_fail "RUNNER_EVAL_CSP_BLOCKED (${MHTTP}the runner's WebView Content-Security-Policy forbids evaluating a string as JavaScript, so POST $MEVAL_URL can NEVER mint on this build - for ANY expression, windowed or headless, signed in or not. This is a BROKEN DOOR, not a missing credential and NOT transient: do not retry it, do not read it as a sign-in problem, and do NOT restart the runner over it (served policy production-and-cost runner-lifecycle). The eval-free replacement is the invoke door tried above (POST $origin/ui-bridge/invoke/get_coord_device_token); a build whose allowlist lacks it cannot serve this rung at all - use L4 source 3 (the in-process nonce mint), the static device-JWT sources, or L5. Door said: \"$MERR\"" ;;
+    # A caller-side input problem with a documented remedy, NOT a door fault.
+    # The frontend applies a static blocklist (PAGE_EVALUATE_STRUCTURAL_PATTERNS)
+    # BEFORE evaluating, so `new Function(`, `eval(` and friends are rejected
+    # ahead of CSP. The runner already returns a `hint` for it; surfacing that
+    # here keeps it out of the RUNNER_EVAL_FAILED catch-all, which reads as a
+    # broken runner. It also names the trap the migration has to avoid: an
+    # expression that wraps its own eval to route around a CSP block is
+    # rejected for an unrelated reason and reports the wrong cause.
+    *"Expression rejected: contains prohibited pattern"*)
+      mint_fail "RUNNER_EVAL_STATIC_GUARD (${MHTTP}the runner's frontend static blocklist rejected the expression BEFORE evaluating it - this is about what was SENT, not about the runner's health or sign-in state. Send a plain expression, never one that wraps its own eval()/new Function(). Door said: \"$MERR\"" ;;
+    ?*)
+      mint_fail "RUNNER_EVAL_FAILED (${MHTTP}the $MINT_SOURCE mint returned no token, and said: \"$MERR\"). Read the quoted error - this is NOT necessarily a sign-in problem" ;;
+    *)
+      # No token AND no error string. Do not assert a cause not tested: a 4xx is
+      # consistent with a route that moved, a 5xx is the route being PRESENT and
+      # failing server-side, and sending a reader hunting a renamed route on a
+      # 500 is the habit cfg_shape()'s comment says this script exists to break.
+      if [ -n "$MJWT" ]; then
+        mint_fail "RUNNER_SIGNED_OUT (the UI Bridge returned a value, but it is not a JWT-shaped token - a JWT is 3 dot-separated base64url parts. NOT sent). Sign the runner in"
+      else
+        case "$MCODE" in
+          # A 2xx with no token and no error is NOT a shape change when the
+          # command that answered was get_coord_device_token: `Ok(None)` is its
+          # documented, deliberate answer for "this runner is unpaired", chosen
+          # over an error precisely because it is a credential PROBE. Reading it
+          # as "the UI-Bridge response shape has changed" would send the reader
+          # hunting a renamed route for a runner that answered correctly.
+          2??) case "$MINT_SOURCE" in
+                 *get_coord_device_token) mint_fail "RUNNER_SIGNED_OUT (${MHTTP}get_coord_device_token answered normally with null, which is its documented 'this device is unpaired' result - the runner is healthy, the credential slot is empty. Pair or sign this runner in; nothing here is broken)" ;;
+                 *) mint_fail "RUNNER_EVAL_FAILED (HTTP $MCODE but the body carried neither a .data.value / .data.result.value nor an error string - the UI-Bridge response shape has changed)" ;;
+               esac ;;
+          4??) mint_fail "RUNNER_EVAL_FAILED (HTTP $MCODE from $MINT_URL with no error string in the body - the route is absent/renamed, or something else answers on this port. NOT a sign-in problem)" ;;
+          5??) mint_fail "RUNNER_EVAL_FAILED (HTTP $MCODE from $MINT_URL with no error string in the body - the route is PRESENT and failed server-side. Says nothing about the route existing or about your sign-in state)" ;;
+          *)   mint_fail "RUNNER_EVAL_FAILED (HTTP $MCODE but the body carried neither a .data.value / .data.result.value nor an error string - the UI-Bridge response shape has changed)" ;;
+        esac
+      fi ;;
+  esac
+done
+
+# ----- L5: the BOOTSTRAP credential — the first rung that needs no runner ------
+# L1/L2 ARE the runner (it serves the loopback proxy). L4 sources 3 and 4 are
+# credentials the runner mints. L3 needs $COORD_AGENT_JWT, unset on this fleet.
+# So one wedged runner takes every rung above at once, and the two static
+# device-JWT sources that survive it hold a ~4h token — expired more often than
+# not. Measured 2026-08-28: an /unattended closeout walked all of it (MCP tools
+# absent, proxy HTTP 000 on 5 candidates, 401 on the device JWT, mint timed out
+# at 60s/0 bytes) and had to report its own work DROPPED. Plan
+# 2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline.
+#
+# L5's only input is a FILE ON DISK: a device_id, POSTed anonymously to coord's
+# dedicated credential route. Anonymous is not a re-opened hole — it is the
+# device-pairing carve-out shape (post_pair_start / post_pair_complete /
+# post_pair_cli in routes_phase3.rs, registered ungated at
+# /coord/devices/pair-start|pair-complete|pair-cli) sanctioned by the SHIPPED plan
+# 2026-08-14-runner-unauthenticated-coord-writers: a credential-minting route is
+# anonymous BECAUSE requiring a credential would be circular, and that plan's
+# coord_auth_pin.rs guard objects to an unauthenticated WRITE, not to using an
+# issued token. Everything after the mint here carries a bearer.
+#
+# It probes THAT ROUTE AND NOTHING ELSE - and that route IS DEPLOYED. Measured
+# against production coord 2026-09-04 from merytshost: the anonymous POST
+# answered HTTP 200 with {token, token_exp, token_jti}, the token an EdDSA JWT
+# claiming iss=qontinui-coord, sub=device:<device_id>, sub_type=agent, a
+# resolved tenant_id, NO agent_id claim, ALL scopes empty/false, ~4h TTL - and
+# the control read below answered 200 over it (401 without a bearer). The whole
+# cascade was run to exhaustion that day and L5 reported LIVE as the ONLY live
+# rung: the static ~/.qontinui/coord-device-jwt was 401, the invoke mint 400
+# (not on this build's allowlist) and the WebView eval mint 400 (CSP
+# unsafe-eval). Until 2026-09-04 this comment and every doc around it said the
+# route was NOT DEPLOYED and that L5 "always ends in BOOTSTRAP_ROUTE_ABSENT" -
+# a rung documented as permanently shut is a rung nobody tries, which removed
+# the one working door in exactly the state it exists for.
+#
+# The 404/405 arm below is KEPT: it is what another deployment, or a future
+# rollback, would answer, and reading a router artefact as a device refusal is
+# still the false verdict this script exists not to draw. It is no longer the
+# expected outcome HERE.
+#
+# It does NOT substitute POST /agents/allocate. Allocate mints the same class of
+# token today, and three shipped documents forbid carrying a coord rung on it
+# (/gate and /policy both carry it on their generic remote MCP rung, and
+# coord-gates-and-access.md restates it). Whether it may ever be used this
+# way is UNKNOWN - neither gated nor cleared. It was escalated as coord gate
+# ece99898-30c6-4f8c-be8e-1de5f09abebc (operator_approval, security-surface),
+# which reads WITHDRAWN - re-verify with coord_gate_inspect before citing it;
+# a withdrawn gate reads identically to an open one in prose. Its successor
+# 3c9b18ca-3300-4dbe-a2f4-1d6db5e5a6d5 is withdrawn too (read 2026-09-11:
+# 'DECIDED, not escalated: do NOT clamp') and names allocate's anonymity as
+# the residual for the narrower MintCaller route. UNKNOWN is not permission:
+# the honest outcome of an exhausted cascade is the UNKNOWN or DEAD verdict
+# the axis table licenses, plus a DURABLY RECORDED BLOCKER - never a token
+# from that door.
+if budget_skip "L5" "bootstrap-credential"; then
+  : # already recorded by budget_skip; L5 is not attempted on an exhausted budget
+elif [ -n "${COORD_REVIVE_NO_BOOTSTRAP:-}" ]; then
+  echo "L5: bootstrap-credential -> SKIPPED_BY_ENV (\$COORD_REVIVE_NO_BOOTSTRAP is set, so the runner-independent credential was not attempted. That is a CHOICE, not a fault, and it says nothing about whether it would have worked)" >&2
+  FAILS+=("L5 bootstrap-credential: SKIPPED_BY_ENV (\$COORD_REVIVE_NO_BOOTSTRAP is set)")
+else
+  # THE COUNTER (plan Phase 4). Reaching L5 means the ordinary doors already
+  # failed, so a counter that had to reach coord would be missing in exactly the
+  # outage it exists to measure. This is the LOCAL breadcrumb the guard
+  # component already ships — scripts/lib/guard-decision-log.sh, whose `tag`
+  # field its own header calls "the field you grep and count", rotated at
+  # SessionStart by scripts/session-id-stamp.sh. Sourcing is best-effort: a
+  # missing library must never cost a recovery its door.
+  l5_count() { :; }
+  __resolve_fleet_script "lib/guard-decision-log.sh"; __gdl="$__RFS_PATH"
+  # shellcheck source=/dev/null
+  if [ -n "$__gdl" ] && . "$__gdl" 2>/dev/null && command -v guard_decide >/dev/null 2>&1; then
+    l5_count() { guard_decide "$DOOR_SCRIPT_NAME" "$1" "$2"; }
+  elif [ -n "$__gdl" ]; then
+    # FOUND but unusable. The two-candidate loop this replaced would silently
+    # try the other fixed path; one resolved path cannot, so SAY SO instead --
+    # a counter that stops counting for a nameable reason is worth more than one
+    # that fails over without telling anyone. Never fatal: the breadcrumb is
+    # best-effort by construction and must not cost a recovery its door.
+    echo "L5: guard-decision-log.sh at $__gdl did not define guard_decide (unreadable, truncated or not the library) - the L5 breadcrumb counter is DISABLED for this run. Local only; it changes no verdict below." >&2
+  fi
+  unset __gdl
+  l5_count warn l5-reached
+
+  # l5_fail <verdict> — log + record, one place, same contract as l4_fail.
+  l5_fail() {
+    echo "L5: bootstrap-credential -> $1" >&2
+    FAILS+=("L5 bootstrap-credential: $1")
+  }
+
+  # --- device_id: env first, then the static local file -----------------------
+  # $QONTINUI_MACHINE_ID then ~/.qontinui/machine.json "device_id", falling back
+  # to the legacy "machine_id" spelling. This is the fleet's established
+  # resolution order (/vet-plan, /vet-imp, /preflight, /manual-test-coord all
+  # spell it), reused rather than reinvented.
+  DEV_ID="${QONTINUI_MACHINE_ID:-}"
+  MACHINE_FILE="$HOME_DIR/.qontinui/machine.json"
+  MACHINE_READABLE=""
+  # The SOURCE NAME, never the value — a device UUID is not a secret but it is
+  # the only bar on the mint route, so it stays out of every printed line the
+  # same way a key does.
+  DEV_ID_SRC="\$QONTINUI_MACHINE_ID"
+  [ -n "$DEV_ID" ] || DEV_ID_SRC="$MACHINE_FILE"
+  if [ -z "$DEV_ID" ] && [ -n "$HOME_DIR" ] && [ -r "$MACHINE_FILE" ]; then
+    MACHINE_READABLE=1
+    if [ "$JSON_READER" = jq ]; then
+      DEV_ID="$(jq -r '((.device_id // .machine_id) // "") | tostring' < "$MACHINE_FILE" 2>/dev/null | tr -d '[:space:]')"
+    else
+      DEV_ID="$("$JSON_READER" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print(); sys.exit(0)
+v=d.get("device_id") or d.get("machine_id") or ""
+print(v if isinstance(v,str) else "")' < "$MACHINE_FILE" 2>/dev/null | tr -d '[:space:]')"
+    fi
+    [ "$DEV_ID" = "null" ] && DEV_ID=""
+  fi
+
+  if [ -z "$DEV_ID" ]; then
+    # Two different LOCAL faults with two different fixes. Collapsing them would
+    # send a reader to repair a file that is not there, or to pair a machine
+    # whose file exists and merely says nothing — the named-cause invariant.
+    if [ -n "$MACHINE_READABLE" ]; then
+      l5_fail "BOOTSTRAP_MACHINE_FILE_MALFORMED ($MACHINE_FILE is readable but carries neither a \"device_id\" nor the legacy \"machine_id\" (or is not JSON). LOCAL fault - nothing was sent, and it says nothing about coord)"
+      l5_count unknown l5-no-device-id
+    else
+      l5_fail "BOOTSTRAP_NO_DEVICE_ID (\$QONTINUI_MACHINE_ID is unset AND $MACHINE_FILE is absent or unreadable. LOCAL fault - a statement of ABSENCE, not a coord verdict. Nothing was sent: an empty device_id would draw a 4xx this script would then blame on coord)"
+      l5_count unknown l5-no-device-id
+    fi
+  else
+    # --- mint: anonymous POST, no Authorization header of any kind ------------
+    # The dedicated credential-only route, and the ONLY route this rung probes.
+    # NOT /agents/allocate - see the block
+    # comment above and SKILL.md's L5 section for why that one is hand-run.
+    BOOT_URL="${COORD_URL}/agents/credential"
+    BOOT_BODY="$TMPD/bootbody"
+    BOOT_ERR="$TMPD/booterr"
+    : > "$BOOT_BODY"; : > "$BOOT_ERR"
+    # device_id is a UUID from a local file, not key material, so a -d payload is
+    # fine here; the TOKEN that comes back never goes near argv.
+    BOOT_CODE=$(curl -sS -o "$(curl_path "$BOOT_BODY")" -w '%{http_code}' \
+      --connect-timeout "$PROBE_CONNECT_TIMEOUT" -m "$PROBE_TIMEOUT" \
+      -X POST "$BOOT_URL" -H "Content-Type: application/json" \
+      -d "{\"device_id\":\"$DEV_ID\"}" 2>"$BOOT_ERR")
+    BOOT_CE=$?
+    BOOT_CURLERR="$(one_line 200 < "$BOOT_ERR")"
+    BOOT_RESP="$(cat "$BOOT_BODY" 2>/dev/null)"
+    BOOT_MSG="$(printf '%s' "$BOOT_RESP" | read_eval_error | one_line 200)"
+
+    if [ "$BOOT_CE" != "0" ] || [ -z "$BOOT_CODE" ] || [ "$BOOT_CODE" = "000" ]; then
+      l5_fail "BOOTSTRAP_UNREACHABLE (the mint POST to $BOOT_URL never completed - connect refused, DNS, TLS or a timeout (${PROBE_CONNECT_TIMEOUT}s connect / ${PROBE_TIMEOUT}s total). This is the ONE L5 verdict that is about coord or this box's network)${BOOT_CURLERR:+ [curl: $BOOT_CURLERR]}"
+      l5_count unknown l5-unreachable
+    elif [ "$BOOT_CODE" = "404" ] || [ "$BOOT_CODE" = "405" ]; then
+      # 405, not only 404. Measured against production coord 2026-09-02: an
+      # unregistered POST anywhere under /agents/ answers 405 with an EMPTY body
+      # - `POST /agents/definitely-not-a-route` returns the identical 405
+      # (re-confirmed 2026-09-04) - so on this deployment "the route has not
+      # landed" is spelled 405. Reading that as a refusal would be a confidently
+      # wrong verdict about the DEVICE for a fact about the ROUTER, which is the
+      # one thing this script exists not to do. This arm is NOT what
+      # /agents/credential answers here any more - it answered 200 on
+      # 2026-09-04 - so reaching it is a REGRESSION or a different deployment,
+      # not the norm. (`GET /agents/credential` answered 403 tenant_not_resolved
+      # on 2026-09-02 and 405 on 2026-09-04; either is a router artefact and not
+      # a device verdict - but this rung only ever POSTs.)
+      l5_fail "BOOTSTRAP_ROUTE_ABSENT (HTTP $BOOT_CODE from $BOOT_URL - the dedicated credential route is not answering on THIS coord; a 405 can mean exactly that here, since coord answers 405 for ANY unregistered POST under /agents/, verified 2026-09-02 and 2026-09-04). This is NOT the expected outcome: the same anonymous POST answered 200 with a device-subject agent JWT against production coord on 2026-09-04, so this arm now means a REGRESSION, a rollback, or a different deployment - report it as such rather than as a known-absent rung. It still does NOT license substituting POST /agents/allocate: three shipped documents forbid carrying a coord rung on that door, and whether it may ever be used this way is UNKNOWN: the gate that carried it, ece99898-30c6-4f8c-be8e-1de5f09abebc, reads withdrawn (re-verify with coord_gate_inspect) and so does its successor 3c9b18ca-3300-4dbe-a2f4-1d6db5e5a6d5; UNKNOWN is not permission. With this arm hit and no other door, the honest outcome is the verdict the axis table licenses PLUS a durably recorded blocker: write the gate or finding SPEC verbatim so a peer with a working transport can carry it"
+      l5_count unknown l5-route-absent
+    else
+      case "$BOOT_CODE" in
+        2??)
+          # The token field. `token` is the spelling coord's sibling
+          # AllocateResponse uses (agent_worktrees.rs), and MEASURED 2026-09-04
+          # it is also what the dedicated route returns - alongside token_exp
+          # and token_jti. The alternates stay as defensive reads rather than
+          # asserted. Read on STDIN - no path crosses to a native binary.
+          if [ "$JSON_READER" = jq ]; then
+            BOOT_TOKEN="$(jq -r '((.token // .agent_jwt // .jwt // .access_token) // "") | tostring' < "$BOOT_BODY" 2>/dev/null | tr -d '[:space:]')"
+          else
+            BOOT_TOKEN="$("$JSON_READER" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print(); sys.exit(0)
+for k in ("token","agent_jwt","jwt","access_token"):
+    v=d.get(k)
+    if isinstance(v,str) and v:
+        print(v); sys.exit(0)
+print()' < "$BOOT_BODY" 2>/dev/null | tr -d '[:space:]')"
+          fi
+          [ "$BOOT_TOKEN" = "null" ] && BOOT_TOKEN=""
+          if ! jwt_shaped "$BOOT_TOKEN"; then
+            l5_fail "BOOTSTRAP_NO_TOKEN_IN_RESPONSE (HTTP $BOOT_CODE from $BOOT_URL but the body carried no JWT-shaped token - a JWT is 3 dot-separated base64url parts. The route's response shape changed, or something else answers on this host. NOT sent onward: an unshaped bearer would draw a 401 this script would then report against coord)"
+            l5_count unknown l5-token-unverified
+          else
+            # --- VERIFY BEFORE DECLARING LIVE ---------------------------------
+            # A minted token that does not authenticate is a FALSE GREEN, and a
+            # false green is what cost the 2026-08-28 closeout its output. The
+            # control read is cheap, read-only, and proves the exact property
+            # this rung asserts: GET /coord/agent-findings answers 200 to a good
+            # bearer and 401 to none (coord routes.rs, agent_findings_authed,
+            # behind require_jwt). Header staged OFF argv, same rule as
+            # probe_door - the process list is world-readable on this box.
+            CTRL_HDR="$TMPD/boothdr"
+            CTRL_BODY="$TMPD/ctrlbody"
+            CTRL_ERR="$TMPD/ctrlerr"
+            { printf 'Authorization: Bearer %s\n' "$BOOT_TOKEN" > "$CTRL_HDR"; } 2>/dev/null
+            if [ ! -s "$CTRL_HDR" ]; then
+              l5_fail "AUTH_HEADER_STAGING_FAILED (could not write the bearer header under $TMPD - LOCAL fault, says nothing about coord or about the token, which WAS minted). Re-run; if it repeats, check \$TMPDIR"
+              l5_count unknown l5-token-unverified
+            else
+              : > "$CTRL_BODY"; : > "$CTRL_ERR"
+              CTRL_URL="${COORD_URL}/coord/agent-findings?limit=1"
+              CTRL_CODE=$(curl -sS -o "$(curl_path "$CTRL_BODY")" -w '%{http_code}' \
+                --connect-timeout "$PROBE_CONNECT_TIMEOUT" -m "$PROBE_TIMEOUT" \
+                -H "@$(curl_path "$CTRL_HDR")" "$CTRL_URL" 2>"$CTRL_ERR")
+              CTRL_CE=$?
+              CTRL_CURLERR="$(one_line 200 < "$CTRL_ERR")"
+              rm -f "$CTRL_HDR"
+              if [ "$CTRL_CE" = "0" ] && [ "$CTRL_CODE" = "200" ]; then
+                echo "L5: bootstrap-credential -> LIVE (minted at $BOOT_URL, verified by $CTRL_URL -> 200)" >&2
+                l5_count allow l5-live
+                LIVE_FILE="bootstrap-credential (device_id from $DEV_ID_SRC)"
+                LIVE_URL="$BOOT_URL"
+                live_exit "https-bootstrap-agent-jwt" "$PARTIAL_BOOTSTRAP"
+              else
+                l5_fail "BOOTSTRAP_TOKEN_UNVERIFIED (the mint SUCCEEDED - HTTP $BOOT_CODE from $BOOT_URL returned a JWT-shaped token - and the control read $CTRL_URL answered HTTP ${CTRL_CODE:-<none>} instead of 200. A mint is not an authentication: report BOTH facts, and do NOT call this door LIVE)${CTRL_CURLERR:+ [curl: $CTRL_CURLERR]}"
+                l5_count unknown l5-token-unverified
+              fi
+            fi
+          fi ;;
+        *)
+          # Every other status is the route REFUSING THIS DEVICE - an unknown or
+          # unregistered device_id, a malformed UUID, or (on the hand-run
+          # allocate fallback) a 409 about a repo. A verdict about the device,
+          # not about coord's health, which is why it is not UNREACHABLE.
+          l5_fail "BOOTSTRAP_DEVICE_REJECTED (HTTP $BOOT_CODE from $BOOT_URL - the route answered and refused this device_id. Check that the id resolved from $DEV_ID_SRC is the one coord knows)${BOOT_MSG:+ coord said: \"$BOOT_MSG\"}${BOOT_CURLERR:+ [curl: $BOOT_CURLERR]}"
+          l5_count unknown l5-device-rejected ;;
+      esac
+    fi
+  fi
+fi
+
+# ----- L6: the WEB host -- api.qontinui.io, a different program on a different host
+# Every rung above probes ONE remote host. The web backend (qontinui-web,
+# ${WEB_URL}/api/v1/...) is a different program: plan-library and memory live
+# there, and its routes resolve the caller through get_audit_actor_user
+# (qontinui-web backend/app/api/deps.py), which answers `401 Device token
+# missing user_id claim.` to any bearer without a user_id -- an agent JWT minted
+# by /agents/credential or /agents/allocate has none; the pairing-minted
+# ~/.qontinui/coord-device-jwt has one. Measured 2026-09-06 from this box:
+# anonymous GET /api/v1/plan-library -> 401 (SERVED, refused); with the device
+# JWT -> 200; POST /api/v1/memory/query -> 401 anonymous, 422 with the JWT (the
+# door is OPEN - 422 is the schema, proof the handler ran); GET on that same
+# path -> 405, a METHOD verdict that reads exactly like a credential one. So
+# this rung emits TYPED faults on the credential axis and never a host-level
+# verdict for a credential fact (plan Design decision 4):
+#   WEB_HOST_UNREACHABLE      -- the ONE verdict about the host: connect/DNS/TLS/timeout
+#   WEB_HOST_NO_USER_JWT      -- no user_id-bearing credential resolved, or the host
+#                                refused the one sent for LACKING the claim. The host
+#                                is UP (it answered); the CREDENTIAL axis is what failed
+#   WEB_HOST_JWT_UNAUTHORIZED -- the host refused the bearer for another reason (a 401
+#                                without the user_id text: expired is the normal one)
+#   WEB_HOST_HTTP_<code>      -- served, answered something else (a 403, a 5xx)
+# and LIVE (PARTIAL) when the credentialed read answers 200.
+#
+# The credential comes from the same two STATIC sources as L4 sources 1 and 2,
+# in that order ($COORD_DEVICE_JWT, then ~/.qontinui/coord-device-jwt). Neither
+# mint is spent here: on the builds measured the runner mint is the OPERATOR's
+# Cognito token (PARTIAL_RUNNER_MINT), and the bootstrap credential carries no
+# user_id by construction. Each source is SHAPE-tested and sent, and the host's
+# 401 is the freshness gate -- exactly the mechanism L4 uses, and for the reason
+# the file header gives: no local `exp` decode, because the server's answer is
+# the only one that counts. The bearer is staged OFF argv, same rule as every
+# other rung. Plan Phase 3; the plan's "gated on exp validity" wording was
+# corrected to this at implementation.
+PARTIAL_WEB_HOST="PARTIAL: this door is the WEB host (api.qontinui.io - the qontinui-web backend), NOT coord. It carries /api/v1/plan-library and /api/v1/memory; it does NOT carry coord MCP tools, /coord/agent-* routes, gates, claims or work units, so it cannot re-issue a lost COORD write. What it proves: the host axis is live and the credential carries a user_id claim.
+PARTIAL: every coord.qontinui.io row in the AXES table below reads as recorded - a LIVE here does not revise them. A lost coord write stays presumed LOST until verified by read over a coord door or the session's native coord_* tools."
+if budget_skip "L6" "web-host@$WEB_URL"; then
+  : # recorded by budget_skip; the axis table prints this rung as SKIPPED
+elif [ -n "${COORD_REVIVE_NO_WEB_HOST:-}" ]; then
+  echo "L6: web-host@$WEB_URL -> SKIPPED_BY_ENV (\$COORD_REVIVE_NO_WEB_HOST is set, so the web host was not asked. A CHOICE, not a fault - and an UNPROBED axis, so no DEAD can be printed below)" >&2
+  FAILS+=("L6 web-host@$WEB_URL: SKIPPED_BY_ENV (\$COORD_REVIVE_NO_WEB_HOST is set)")
+else
+  l6_fail() {
+    echo "L6: web-host@$WEB_URL -> $1" >&2
+    FAILS+=("L6 web-host@$WEB_URL: $1")
+  }
+  WEB_PROBE_URL="${WEB_URL}/api/v1/plan-library?kind=plan&limit=1"
+  WEB_BODY="$TMPD/webbody"; WEB_ERR="$TMPD/weberr"; WEB_HDR="$TMPD/webhdr"
+  # --- 1. the HOST, anonymously: is a program answering at all? ---------------
+  # Registered for the DISTINCT count, as probe_door does for every other rung:
+  # without it the terminal line would count L6's probes in $DOORS_PROBED and
+  # not its door in $DISTINCT_DOORS -- the two-populations mismatch the
+  # probe_door comment records.
+  seen_endpoint "$WEB_PROBE_URL" "" "" || :
+  : > "$WEB_BODY"; : > "$WEB_ERR"
+  DOORS_PROBED=$((DOORS_PROBED + 1))
+  WEB_ANON_CODE=$(curl -sS -o "$(curl_path "$WEB_BODY")" -w '%{http_code}' \
+    --connect-timeout "$PROBE_CONNECT_TIMEOUT" -m "$PROBE_TIMEOUT" "$WEB_PROBE_URL" 2>"$WEB_ERR")
+  WEB_CE=$?
+  WEB_CURLERR="$(one_line 200 < "$WEB_ERR")"
+  if [ "$WEB_CE" != "0" ] || [ -z "$WEB_ANON_CODE" ] || [ "$WEB_ANON_CODE" = "000" ]; then
+    l6_fail "WEB_HOST_UNREACHABLE (the anonymous GET $WEB_PROBE_URL never completed - connect refused, DNS, TLS or a timeout (${PROBE_CONNECT_TIMEOUT}s connect / ${PROBE_TIMEOUT}s total). This is the ONE L6 verdict about the host itself; nothing was learned about any credential)${WEB_CURLERR:+ [curl: $WEB_CURLERR]}"
+  else
+    # The host ANSWERED. 401 is the served-and-refused shape and the expected
+    # anonymous answer; anything else is still an answer. The credential axis
+    # is probed separately below, so the host fact is never folded into it.
+    echo "L6: web-host@$WEB_URL -> host ANSWERED (anonymous GET -> HTTP $WEB_ANON_CODE; 401 is the served-and-refused shape). Now the credential axis" >&2
+    # --- 2. the CREDENTIAL: a user_id-bearing device JWT, static sources only --
+    WEBJWT=""; WEBJWT_SRC=""
+    if [ -n "${COORD_DEVICE_JWT:-}" ] && jwt_shaped "$(printf '%s' "$COORD_DEVICE_JWT" | tr -d '[:space:]')"; then
+      WEBJWT="$(printf '%s' "$COORD_DEVICE_JWT" | tr -d '[:space:]')"; WEBJWT_SRC='$COORD_DEVICE_JWT'
+    elif [ -n "$HOME_DIR" ] && [ -r "$STATIC_JWT_FILE" ] && jwt_shaped "$(tr -d '[:space:]' < "$STATIC_JWT_FILE" 2>/dev/null)"; then
+      WEBJWT="$(tr -d '[:space:]' < "$STATIC_JWT_FILE")"; WEBJWT_SRC="$STATIC_JWT_FILE"
+    fi
+    if [ -z "$WEBJWT" ]; then
+      WEB_HOME_NOTE=""; [ -z "$HOME_DIR" ] && WEB_HOME_NOTE=" (HOME_UNRESOLVED: neither \$HOME nor \$USERPROFILE is set, so source 2 had no path to read - the same LOCAL fault L4 names)"
+      l6_fail "WEB_HOST_NO_USER_JWT (the host is UP - anonymous GET answered HTTP $WEB_ANON_CODE - and NO user_id-bearing credential resolved: \$COORD_DEVICE_JWT and ~/.qontinui/coord-device-jwt are both unset, unreadable or not JWT-shaped$WEB_HOME_NOTE. A CREDENTIAL fact about this box, never a host verdict; the runner-minted and bootstrap tokens are not spent here because neither carries a user_id claim. Pair this device (a fresh ~/.qontinui/coord-device-jwt) to open this axis)"
+    else
+      { printf 'Authorization: Bearer %s\n' "$WEBJWT" > "$WEB_HDR"; } 2>/dev/null
+      if [ ! -s "$WEB_HDR" ]; then
+        l6_fail "AUTH_HEADER_STAGING_FAILED (could not write the bearer header under $TMPD - LOCAL fault, says nothing about the host or the credential)"
+      else
+        : > "$WEB_BODY"; : > "$WEB_ERR"
+        DOORS_PROBED=$((DOORS_PROBED + 1))
+        WEB_CODE=$(curl -sS -o "$(curl_path "$WEB_BODY")" -w '%{http_code}' \
+          --connect-timeout "$PROBE_CONNECT_TIMEOUT" -m "$PROBE_TIMEOUT" \
+          -H "@$(curl_path "$WEB_HDR")" "$WEB_PROBE_URL" 2>"$WEB_ERR")
+        WEB_CE=$?
+        WEB_CURLERR="$(one_line 200 < "$WEB_ERR")"
+        WEB_MSG="$(one_line 160 < "$WEB_BODY")"
+        rm -f "$WEB_HDR"
+        if [ "$WEB_CE" != "0" ] || [ -z "$WEB_CODE" ] || [ "$WEB_CODE" = "000" ]; then
+          l6_fail "WEB_HOST_UNREACHABLE (the host answered the anonymous probe, then the credentialed GET $WEB_PROBE_URL did not complete${WEB_CURLERR:+ [curl: $WEB_CURLERR]} - transient; re-run)"
+        else
+          case "$WEB_CODE" in
+            200)
+              echo "L6: web-host@$WEB_URL -> LIVE (GET $WEB_PROBE_URL -> 200 with the device JWT from $WEBJWT_SRC)" >&2
+              LIVE_FILE="web-host (device JWT from $WEBJWT_SRC)"
+              LIVE_URL="$WEB_PROBE_URL"
+              live_exit "https-web-device-jwt" "$PARTIAL_WEB_HOST" ;;
+            401)
+              case "$WEB_MSG" in
+                *user_id*) l6_fail "WEB_HOST_NO_USER_JWT (the host is UP and refused the bearer from $WEBJWT_SRC for LACKING a user_id claim: \"$WEB_MSG\". A CREDENTIAL fact - this token is not a pairing-minted device JWT. Never a host verdict)" ;;
+                *) l6_fail "WEB_HOST_JWT_UNAUTHORIZED (the host is UP and refused the bearer from $WEBJWT_SRC - HTTP 401${WEB_MSG:+: \"$WEB_MSG\"}. Expired is the normal cause: device JWTs live ~4h, and this is the same shape-test-then-401 freshness gate L4 applies. A CREDENTIAL fact, never a host verdict)" ;;
+              esac ;;
+            *)
+              l6_fail "WEB_HOST_HTTP_${WEB_CODE} (the host is UP and answered HTTP $WEB_CODE to the credentialed GET $WEB_PROBE_URL${WEB_MSG:+: \"$WEB_MSG\"} - served, and neither LIVE nor a credential refusal. Read the code: a 403 is an authorization fact, a 5xx is the host's)" ;;
+          esac
+        fi
+      fi
+    fi
+  fi
+fi
+
+# ----- Honest failure: name the exhausted cascade ------------------------------
+# BUDGET_EXCEEDED IS NOT DEAD, and the distinction is the whole reason it exists.
+# DEAD asserts that every door was probed and none answered; a run that ran out
+# of wall clock probed SOME doors and skipped the rest, so calling it DEAD would
+# be a confident verdict about doors this process never touched - the same
+# false-DEAD class every other guard in this file is written against, reached by
+# a stopwatch instead of a bug. The exhausted list still prints underneath either
+# way: the skipped doors are IN it, named SKIPPED_*, so nothing is hidden.
+# THE TABLE FIRST, then the breadcrumb, then the verdict read off the table.
+axes_block
+# The runner's own spawn-time reason belongs IN the verdict block, not only in
+# the stderr log above it: an agent that pastes this verdict as its
+# blocked-evidence would otherwise drop the one line that names WHY there was no
+# door to find. Context only - it never changed the verdict, and it is a fact
+# about spawn time, not about now (see the reader near L1).
+if [ "$FLOOR_CLAIM" = "1" ]; then
+  # One pasteable block: the breadcrumb without its prose (the AXES table above
+  # and the FLOOR-CLAIM door table below already name every rung and verdict).
+  [ -n "$CRUMB" ] && echo "BREADCRUMB ($CRUMB_QUAL): $CRUMB$CRUMB_NOTE"
+elif [ -n "$CRUMB" ]; then
+  echo "BREADCRUMB ($CRUMB_QUAL): the runner recorded a DEGRADED coord-mcp provision for this workdir: $CRUMB$CRUMB_NOTE"
+  echo "  (spawn-time evidence from $CRUMB_FILE. The AGE above is part of the evidence - quote it whenever you paste this block, because an unaged breadcrumb travels furthest and reads as present tense. Whether anything re-evaluated it after provisioning is a property of the runner build, so it can be stale, and it never describes coord's state now. A 'NOT written' reason means THAT pass wrote no .mcp.json; a stale one from an earlier pass can still be sitting there.)"
+else
+  echo "BREADCRUMB: none in this cwd ($CRUMB_FILE: absent, unreadable or empty). That is UNKNOWN, not evidence of a healthy provision - the runner writes nothing on the healthy path AND nothing at all for a workdir it never provisioned. It also stays SILENT on purpose when it declines to overwrite a workdir that already DECLARES a coord-mcp (a foreign agent-JWT config, or a secondary runner leaving alone a primary shared-root config that declares one) - and declaring is only a /mcpServers/coord-mcp key test, never proof the door answers. So an absent breadcrumb beside an .mcp.json that L1 could not revive is a DIAGNOSED shape, not an unexplained one: a dead declared entry is precisely what buys that silence. This reader looks only in the cwd; the runner writes into the workdir IT provisioned, which on a linked worktree may be the primary checkout."
+fi
+# DEAD IS STRUCTURALLY UNPRINTABLE WHILE AN AXIS IS UNPROBED. An axis this run
+# did not ask - the sweep budget, an env opt-out - leaves that capability
+# UNMEASURED, and a DEAD printed over it would be the exact generalisation the
+# table exists to stop. The native-tools row is the one standing exclusion
+# (SCOPE below) and does not by itself withhold DEAD; every other unprobed row
+# does. The `axes:` roster line under the failure list is what a reader (and
+# check #58) reads the verdict against.
+if [ -n "$BUDGET_TRIPPED" ]; then
+  echo "VERDICT: BUDGET_EXCEEDED - the ${PROBE_TOTAL_BUDGET}s sweep budget ran out after $DOORS_PROBED probe(s) across $DISTINCT_DOORS distinct door(s), with $DOORS_SKIPPED door(s) SKIPPED UNPROBED. This is UNKNOWN, NOT dead: no door answered among the ones reached, and the ones below marked SKIPPED_BUDGET_EXCEEDED were never asked (the AXES table above names them; axes: unprobed= carries them). Raise \$COORD_REVIVE_TOTAL_BUDGET (default 60) to finish the sweep, or read the skipped list and probe one by hand:"
+  floor_claim_block BUDGET
+elif [ "$AXES_UNPROBED" != "native-coord-mcp-tools" ]; then
+  echo "VERDICT: UNKNOWN - no door answered among the axes this run asked, and at least one axis was NOT asked: unprobed=$AXES_UNPROBED. Not DEAD: a verdict is only as wide as the axes it was computed from, and this one was computed over fewer than all of them. Probe the unprobed axis (drop the opt-out, or probe it by hand) before writing 'coord is unreachable' anywhere. What WAS asked - $DOORS_PROBED probe(s) across $DISTINCT_DOORS distinct door(s):"
+  # An unprobed axis is not a floor: the claim reads UNKNOWN with the axis named.
+  floor_claim_block UNPROBED
+else
+  echo "VERDICT: DEAD - no OUT-OF-BAND door on ANY probed axis, $DOORS_PROBED probe(s) across $DISTINCT_DOORS distinct door(s): L1 (own $OWN), L2 (sibling sweep under $ROOT), L3 (acting-bearer), L4 (\$COORD_DEVICE_JWT, ~/.qontinui/coord-device-jwt, the in-process nonce mint, then the UI-Bridge mint), L5 (the runner-independent bootstrap credential), L6 (the web host $WEB_URL). Every row in the AXES table above is PROBED; the one axis not asked is your native coord_* tools (SCOPE below):"
+  # The stamped claim, and the ONE verdict about the floor: FLOOR only when
+  # the box was not under its own load, else UNKNOWN with the reason and exit 5.
+  floor_claim_block DEAD
+fi
+if [ "$FLOOR_CLAIM" = "1" ]; then
+  # The per-door parentheticals, the SCOPE prose and the recovery advice are
+  # the default run's; the roster line rides under this terminal line too
+  # (check #58), so the pasted block is exactly as wide as its axes, and the
+  # one SCOPE sentence the DEAD line points at travels with the block.
+  echo "axes: hosts=127.0.0.1,coord.qontinui.io,api.qontinui.io prefixes=/coord-mcp,/mcp,/agents/credential,/coord/agent-,/api/v1 credentials=proxy-nonce,acting-bearer,device-jwt,bootstrap-agent-jwt,user-device-jwt unprobed=$AXES_UNPROBED"
+  echo "SCOPE: the verdict above is exactly as wide as the AXES table (unprobed=$AXES_UNPROBED); the one standing exclusion is your native coord_* MCP tools, a separate transport this script cannot probe - issue one cheap native coord read before applying the lost-write doctrine."
+  wedge_block
+  approval_verdict_block
+  exit "$FLOOR_EXIT"
+fi
+for f in "${FAILS[@]}"; do
+  echo "  - $f"
+done
+# SCOPE is not a footnote. L4 closed the missing-DOOR route to a false DEAD; this
+# closes the remaining INFERENCE route to one. Every rung above probes a loopback
+# proxy or an HTTPS bearer — none touches the session's own coord_* MCP tools,
+# which are a different transport. On a stdio-configured session the entire
+# .mcp.json proxy family can be dead while the native tools answer normally,
+# because they never went through it. Observed 2026-08-08: VERDICT DEAD and a
+# successful coord_gate_inspect in the same minute. Without this line the verdict
+# reads as "coord is down", which is exactly what the lost-write doctrine keys
+# off — so an agent would presume landed writes lost.
+wedge_block
+approval_verdict_block
+echo "axes: hosts=127.0.0.1,coord.qontinui.io,api.qontinui.io prefixes=/coord-mcp,/mcp,/agents/credential,/coord/agent-,/api/v1 credentials=proxy-nonce,acting-bearer,device-jwt,bootstrap-agent-jwt,user-device-jwt unprobed=$AXES_UNPROBED"
+echo "SCOPE: the verdict above is exactly as wide as the AXES table - hosts 127.0.0.1, coord.qontinui.io and api.qontinui.io, the rows marked PROBED, and nothing else (unprobed=$AXES_UNPROBED). The one standing exclusion is your native coord_* MCP tools - a separate transport this script cannot probe, which can be fully LIVE while every door here is dead (observed 2026-08-08: DEAD alongside a successful coord_gate_inspect in the same minute)."
+echo "So BEFORE applying the lost-write doctrine, issue one cheap native coord read (coord_gate_inspect on any known gate_id). If it answers, coord is REACHABLE: re-issue over the native tools and verify by read - do not presume the write lost on this verdict alone."
+# THE RE-PROVISION ADVICE IS WEDGE-GATED. The ordinary Next line points at the
+# provisioning route to explain why re-running it by hand is pointless - but on a
+# wedged port the reader's takeaway from a mixed set is "the key is stale, mint a
+# new one", and naming the route at all is what they act on. During a wedge a
+# re-provision evicts a live peer's binding to fix a key that was never broken,
+# so the route is not mentioned on this path at all.
+if [ -n "$WEDGED_ENDPOINTS" ]; then
+  echo "Next: the RUNNER_WEDGED verdict above governs. Do NOT re-provision, rotate a key, or restart the runner; probe /livez on the wedged endpoint, treat in-flight coord writes as LOST and verify by read, and re-run this cascade in a few minutes - observed wedges have cleared on their own. ('coord doctor' is still safe to run: it is a read-only self-check.)"
+elif [ -n "$RUNNER_CREDENTIAL_POSTURE" ]; then
+  # READ BEFORE the ordinary advice, and the re-provision route is not named at
+  # all on this path - the same suppression a wedge gets, for a related reason.
+  # The ordinary line points at /coord-mcp/provision-session to explain why
+  # re-running it by hand is pointless; a reader who has just been told their
+  # 401 was a credential fault acts on the route rather than on the explanation,
+  # and here a re-provision mints a perfectly good new nonce for a credential
+  # that is still dead - while evicting whatever holds this workdir's slot.
+  echo "Next: the nonce is fine; the runner's credential is $RUNNER_CREDENTIAL_POSTURE; the L4/L5 doors will work and a re-provision will NOT."
+  echo "  A door above answered RUNNER_CREDENTIAL_$(printf '%s' "$RUNNER_CREDENTIAL_POSTURE" | tr '[:lower:]' '[:upper:]'): the runner refused the call ITSELF rather than forwarding it, because its own coord device JWT is $RUNNER_CREDENTIAL_POSTURE. That is a statement about THE RUNNER, not about your key and not about coord - coord may be perfectly healthy behind it. Re-issue over the L4 or L5 rung above (\$COORD_DEVICE_JWT, ~/.qontinui/coord-device-jwt, the runner mint, or the bootstrap credential): those carry their OWN credentials and never traverse this forwarder."
+  echo "  Do NOT rotate the proxy key, do NOT re-provision, and do NOT start a new session hoping for a fresh nonce - every session on this box shares the one runner that is refusing, so all three cost work and change nothing. Do NOT restart or kill the runner either (served policy production-and-cost runner-lifecycle): the credential heals through the runner's own refresh rungs or a re-pair, not through a restart. Treat any coord write already in flight through this forwarder as LOST and verify it by read. ('coord doctor' is safe: it is a read-only self-check.)"
+else
+  echo "Next: run 'coord doctor' (runner self-check) to name the failing credential-chain link. L4 source 3 ALREADY attempted /coord-mcp/provision-session for this cwd (bounded: only after L1+L2 proved this workdir's key dead, so there was no live slot here to evict) - re-running it by hand will not find a door this did not, and calling it for ANOTHER workdir would evict that workdir's live key."
+fi
+# 1 for DEAD/FLOOR, BUDGET_EXCEEDED and UNKNOWN-unprobed (unchanged); 5 when the
+# FLOOR-CLAIM line above reads UNKNOWN because the sample was taken under this
+# box's own load.
+exit "$FLOOR_EXIT"

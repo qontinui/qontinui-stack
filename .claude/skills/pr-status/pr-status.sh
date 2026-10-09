@@ -1,0 +1,1117 @@
+#!/usr/bin/env bash
+# pr-status — HTTP fallback for the coord_pr_status MCP read.
+#
+# The PRIMARY path is the native MCP tool `coord_pr_status` (call it directly
+# from the session; it is in the read-only allow-set and needs no device JWT).
+# This script is the fallback for when that tool reads as unknown/method-not-
+# found in a session (per-agent allow-set masking) — it mirrors the `/gate`
+# transport cascade: runner loopback proxy first, then a direct coord MCP call
+# with an acting-bearer token.
+#
+# Usage:
+#   pr-status.sh --mine
+#   pr-status.sh --repo qontinui/qontinui-runner --number 676
+#
+# Emits the raw PrStatusCard JSON (one object, or an array for --mine) to
+# stdout; the caller renders it. Never fabricate a status — if every transport
+# fails, print the error and stop.
+#
+# Worst-case wall-clock: every door gets max 2 attempts (the second only on a
+# retry-safe verdict — 503/CREDENTIAL_REFRESHING, TIMEOUT since 2026-09-02, or
+# PROXY_LIVE_UPSTREAM_DEAD (a 502 from a live proxy whose coord hop failed)
+# since 2026-09-05 — after a 3s sleep). A stalling door NOW RETRIES, so the old "pure-stall bound
+# stays 11 doors × -m 20 ≈ 4 minutes" no longer holds: a pure-stall sweep is the
+# ceiling case, (10 loopback + 1 acting-bearer) × 2 × 20s + 11 × 3s ≈ 8 minutes.
+# That is the same ceiling as before — stalls simply moved from the floor to it —
+# so callers wrapping this script in their own timeout must budget the ceiling,
+# not the floor.
+
+set -euo pipefail
+
+MINE="false"
+REPO=""
+NUMBER=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --mine)   MINE="true"; shift ;;
+    --repo)   REPO="${2:-}";   shift 2 ;;
+    --number) NUMBER="${2:-}"; shift 2 ;;
+    -h|--help)
+      grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "error: unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+# ----- build the MCP tools/call arguments -------------------------------------
+if [[ "$MINE" == "true" ]]; then
+  ARGS='{"mine":true}'
+elif [[ -n "$REPO" && -n "$NUMBER" ]]; then
+  # json_string is deferred until after the shared block defines $JSON_READER,
+  # so build ARGS below rather than here.
+  ARGS=""
+else
+  echo "error: pass --mine, or both --repo and --number" >&2
+  exit 2
+fi
+
+RPC="$(printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"coord_pr_status","arguments":%s}}' "$ARGS")"
+
+COORD_URL="${COORD_HTTP_URL:-https://coord.qontinui.io}"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+
+#
+# How this skill finds coord-acting-bearer.sh -- the one sibling file it needs
+# from the config repo's `scripts/` directory, for door 2 below.
+#
+# Kept deliberately in step with coord-revive.sh's copy of these four functions:
+# the two scripts are the same door cascade over the same helpers, and this
+# lookup rule drifting between them is what left this file on the broken version
+# after coord-revive.sh's own envelope.sh lookup had been fixed. That file uses
+# the resolver four times (lib/envelope.sh, coord-acting-bearer.sh,
+# coord-provision-nonce.sh, lib/guard-decision-log.sh); this one uses it once,
+# at the BEARER_SH lookup. The bodies below are identical on purpose; only this
+# header differs, because the two files are compared against their own twins in
+# the runner bundle rather than against each other.
+#
+# The rule the two fixed rungs get wrong: they assume $HERE sits THREE levels
+# below a directory that ALSO contains `scripts/` -- i.e. that this `.claude/`
+# is the config repo's own, or a symlink into it. True for
+# <workspace-root>/.claude and for qontinui-claude-config itself; FALSE for
+# every other checkout, because each carries its OWN REAL `.claude/` copy of
+# the skills bundle. `pwd -P` then has no symlink to resolve and lands back on
+# the first rung's non-existent path, leaving only $QONTINUI_ROOT -- routinely
+# unset. So walk UP instead of assuming a depth, testing each ancestor for
+# `scripts/<rel>` (the config repo at whatever depth) and for
+# `qontinui-claude-config/scripts/<rel>` (the workspace root, reached from a
+# sibling checkout). The fixed rungs are kept FIRST, so every layout that
+# resolved before still resolves on the first test.
+#
+# WHY IT IS WRITTEN THIS WAY rather than the obvious way: on Windows/MSYS a
+# FORK is the expensive operation, and the obvious spelling forks per ancestor.
+# Measured on the operator box, same process, same $HERE, $QONTINUI_ROOT unset:
+# the walk as first written took 32907 ms for ONE resolution, this one 4908 ms
+# cold and 157 ms for three further lookups. A fork measured 1098 ms against
+# ~22 ms for a `[ -f ]`, so the forks were ~50x the cost of the stat work they
+# surrounded. A diagnostic whose own door probes are budgeted at 15-20 s cannot
+# spend 33 s deciding where its library lives.
+#
+# So, in descending order of what it bought: this ASSIGNS to $__RFS_PATH instead
+# of printing, so no call site needs the `X="$(...)"` fork; `${var%/*}` replaces
+# `dirname`; first-hit return replaces materializing a candidate list (no
+# command substitution, no heredoc); and the only two facts that genuinely need
+# a subprocess -- the physical $HERE and the --git-common-dir workspace root --
+# are resolved ONCE into globals by __fleet_script_init rather than per lookup.
+# Steady state is zero forks per lookup and two for the whole script run.
+__FLEET_SCRIPT_INIT=""
+__FLEET_HERE_PHYS=""
+__FLEET_GIT_ROOT=""
+__RFS_PATH=""
+
+__fleet_script_init() {
+  [ -n "$__FLEET_SCRIPT_INIT" ] && return 0
+  __FLEET_SCRIPT_INIT=1
+  # The PHYSICAL $HERE, kept only when it actually differs -- <workspace-root>/
+  # .claude is a symlink into the config repo, and that is the layout this rung
+  # exists for. Equal to $HERE (every real checkout) it would only re-test paths
+  # the logical walk already covers.
+  #
+  # The `|| __FLEET_HERE_PHYS=""` is LOAD-BEARING, not defensive habit. Under
+  # `set -e` an assignment inherits the exit status of its command substitution,
+  # and `cd "$HERE" && pwd -P` exits non-zero whenever $HERE is no longer
+  # enterable -- a pruned worktree, a broken Windows junction, an ancestor that
+  # lost search permission. Without it the script DIES HERE, silently (the
+  # `2>/dev/null` hides the message but not the status) and with the same exit
+  # code it uses for "every door refused": a purely local path fault rendered as
+  # a door verdict, which is the exact class this whole resolver exists to stop.
+  __FLEET_HERE_PHYS="$(cd "$HERE" 2>/dev/null && pwd -P)" || __FLEET_HERE_PHYS=""
+  [ "$__FLEET_HERE_PHYS" = "$HERE" ] && __FLEET_HERE_PHYS=""
+  # The workspace root, derived the way this file's own root resolution and
+  # /policy Step 2 both derive it:
+  # `--git-common-dir`, NEVER `--show-toplevel`, which inside a LINKED WORKTREE
+  # returns the worktree path -- so the walk would climb the worktree container
+  # (`agent-worktrees/<uuid>`) instead of the workspace root. Sessions run under
+  # QONTINUI_AGENT_WORKTREE_MODE=1, so that is the common path, not the corner.
+  #
+  # TWO spellings, because `--path-format=absolute` needs git >= 2.31 (Mar 2021)
+  # and this fleet has Linux boxes on distro git -- Ubuntu 20.04 ships 2.25.
+  # There, the option is REJECTED and this rung would silently vanish. So fall
+  # back to the older `--git-common-dir` plus `cd && pwd`, which is what the
+  # code being replaced used and works on any git; it costs one extra fork, and
+  # only on the machines that need it.
+  __fleet_gc="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || __fleet_gc=""
+  case "$__fleet_gc" in
+    /*|[A-Za-z]:[/\\]*) ;;
+    *) __fleet_gc="$(git rev-parse --git-common-dir 2>/dev/null)" || __fleet_gc=""
+       [ -n "$__fleet_gc" ] && { __fleet_gc="$(cd "$__fleet_gc" 2>/dev/null && pwd)" || __fleet_gc=""; }
+       ;;
+  esac
+  if [ -n "$__fleet_gc" ]; then
+    __fleet_gc="${__fleet_gc%/}"      # <checkout>/.git
+    __fleet_gc="${__fleet_gc%/*}"     # <checkout>
+    __FLEET_GIT_ROOT="${__fleet_gc%/*}"
+  fi
+  unset __fleet_gc
+  return 0
+}
+
+# __rfs_try <path> -- record it in $__RFS_PATH iff it is a READABLE REGULAR file
+# and nothing has been found yet. `-f` AND `-r`, never `-x`: every target is
+# either `.`-sourced or run as `bash <path>`, both of which need it readable and
+# neither of which needs the exec bit -- routinely dropped on Windows/MSYS
+# checkouts, where testing for it would skip an available helper in silence.
+# Always exits 0: the callers run under `set -e`.
+__rfs_try() {
+  [ -n "$__RFS_PATH" ] && return 0
+  [ -f "$1" ] && [ -r "$1" ] && __RFS_PATH="$1"
+  return 0
+}
+
+# __resolve_fleet_script <rel> -- set $__RFS_PATH to the resolved path for
+# `scripts/<rel>`, or to the EMPTY STRING when there is none.
+#
+# It ASSIGNS rather than PRINTS, and every call site reads the variable on the
+# SAME LINE rather than spelling `X="$(__resolve_fleet_script ...)"`. Two
+# reasons, both of which bite here: a command substitution is a FORK, measured
+# at 1098 ms on the operator box, which is more than twice the ~440 ms of actual
+# stat work a lookup does -- so the idiom would cost more than the search; and a
+# `$( )` whose command exits non-zero aborts a `set -e` script before it can
+# reach its own HELPER_NOT_FOUND branch, which is the branch that exists to
+# explain the failure. This function is therefore never non-zero either.
+__resolve_fleet_script() {
+  __rfs_rel="$1"
+  __RFS_PATH=""
+  __fleet_script_init
+  # Rungs 1 and 2: the original fixed depth, logical then physical.
+  __rfs_try "$HERE/../../../scripts/$__rfs_rel"
+  [ -n "$__FLEET_HERE_PHYS" ] && __rfs_try "$__FLEET_HERE_PHYS/../../../scripts/$__rfs_rel"
+  # Rung 3: only when the variable is actually set. Unset, it degenerates to an
+  # absolute path off the filesystem root -- a candidate that could never exist,
+  # which would make the "searched" list in the refusal message a lie.
+  [ -n "${QONTINUI_ROOT:-}" ] && __rfs_try "${QONTINUI_ROOT}/qontinui-claude-config/scripts/$__rfs_rel"
+  # The walk: every ancestor of $HERE, logical and physical.
+  for __rfs_base in "$HERE" "$__FLEET_HERE_PHYS"; do
+    [ -n "$__RFS_PATH" ] && break
+    [ -n "$__rfs_base" ] || continue
+    __rfs_d="$__rfs_base"
+    while [ -n "$__rfs_d" ] && [ -z "$__RFS_PATH" ]; do
+      __rfs_try "$__rfs_d/scripts/$__rfs_rel"
+      __rfs_try "$__rfs_d/qontinui-claude-config/scripts/$__rfs_rel"
+      # `${var%/*}` is `dirname` without the fork. `*/?*` stops the walk at the
+      # filesystem root rather than testing `/scripts/<rel>`: on MSYS `/` is the
+      # Git installation, whose `scripts/` is not ours.
+      case "$__rfs_d" in */?*) __rfs_d="${__rfs_d%/*}" ;; *) __rfs_d="" ;; esac
+    done
+  done
+  [ -z "$__RFS_PATH" ] && [ -n "$__FLEET_GIT_ROOT" ] \
+    && __rfs_try "$__FLEET_GIT_ROOT/qontinui-claude-config/scripts/$__rfs_rel"
+  return 0
+}
+
+# __fleet_script_searched <rel> -- that same search as ONE line, for a refusal
+# message. A "not found" that does not say what it looked for cannot be told
+# apart from a "did not look", and this script's whole contract is that its
+# verdicts name their cause rather than leaving the reader to guess one. This
+# one DOES print, and its `$( )` fork is deliberate: it runs only on the failure
+# path, where one fork buys the entire diagnosis.
+#
+# Every rung it names is one that actually emitted a candidate. Two of them are
+# CONDITIONAL -- $QONTINUI_ROOT and the git root -- and a message that claimed
+# them unconditionally would be the very defect this function exists against,
+# worse for the git rung because a reader cannot check that one by hand.
+__fleet_script_searched() {
+  __fss_rel="$1"
+  __fleet_script_init
+  if [ -n "${QONTINUI_ROOT:-}" ]; then
+    # The CONCRETE path, not the literal "$QONTINUI_ROOT" -- the git rung below
+    # names its resolved root, and a message that names one rung by variable and
+    # the other by value makes the reader expand the first one by hand. This
+    # message exists to say what was actually looked at.
+    __fss_qr="${QONTINUI_ROOT}/qontinui-claude-config/scripts/$__fss_rel"
+  else
+    __fss_qr="(the \$QONTINUI_ROOT rung emitted no candidate: it is UNSET)"
+  fi
+  if [ -n "$__FLEET_GIT_ROOT" ]; then
+    __fss_gr="and $__FLEET_GIT_ROOT/qontinui-claude-config/scripts/$__fss_rel, the --git-common-dir workspace root"
+  else
+    __fss_gr="and NOT the --git-common-dir workspace root, which emitted no candidate: git did not resolve one from this cwd"
+  fi
+  printf '%s' "searched \$HERE/../../../scripts/$__fss_rel, the same path with \$HERE resolved physically, $__fss_qr, every ancestor of HERE=$HERE both logical and physical for scripts/$__fss_rel and qontinui-claude-config/scripts/$__fss_rel, $__fss_gr"
+}
+
+# Dependency floor + typed door classification. Until 2026-08-31 this script
+# hard-required `jq curl python` — all three, no fallback — which exits 127 on
+# the Windows operator box, where jq is ABSENT. The shared block below carries
+# coord-revive.sh's reader selection instead (jq, else a smoke-tested python),
+# so /pr-status now works wherever /coord-revive does.
+# Caller contract for the block:
+PROBE_TIMEOUT=20                 # matches this script's own `curl -m 20`
+DOOR_SCRIPT_NAME="pr-status.sh"
+
+# ============================ SHARED COORD-DOOR CLASSIFIER v1 ============================
+# BYTE-IDENTICAL COPY. Lives in BOTH .claude/skills/coord-revive/coord-revive.sh and
+# .claude/skills/pr-status/pr-status.sh, pinned equal by CI check #35
+# (scripts/lint-shared-door-classifier.py). Edit ONE and CI reds until you edit BOTH.
+#
+# WHY A COPY AND NOT A SOURCED LIBRARY
+# (plan 2026-07-31-extract-shared-coord-door-classify-helper):
+#   qontinui-runner bundles fleet command files into its BINARY via `include_str!`
+#   (src-tauri/src/fleet_commands.rs). `include_str!` embeds the text of ONE file at
+#   compile time, so a bundled copy has no sibling files and no filesystem to resolve
+#   them against — a `source` line in a bundled script is not fragile, it is
+#   STRUCTURALLY IMPOSSIBLE. The bundle already carries gate.md and policy.md, i.e. it
+#   is growing along exactly this coord-door axis. scripts/lib/ is good precedent for
+#   code that always has a filesystem; these two scripts are about to stop having one.
+#
+# CALLER CONTRACT — set these BEFORE this block:
+#   PROBE_TIMEOUT     seconds; interpolated into the TIMEOUT verdict string.
+#   DOOR_SCRIPT_NAME  this script's name, for LOCAL-fault preflight errors.
+#
+# VERDICT STRINGS ARE AN INTERFACE. coord-revive.sh's probe_door() branches on
+# `CREDENTIAL_REFRESHING*` as a PREFIX match to decide whether to retry (it appends a
+# "[curl: …]" suffix to every non-LIVE verdict, which is why the match is a prefix).
+# A one-character change silently removes that retry, with no error anywhere.
+#
+# THREE MORE PREFIXES ARE LOAD-BEARING, added by plan
+# 2026-08-06-coord-mcp-post-remediation-plan Phase 1:
+#   TIMEOUT*                     both carriers retry it once. `TIMEOUT_UPSTREAM` is
+#                                DELIBERATELY spelled to share that prefix, so a
+#                                proxy-reported upstream stall inherits the retry.
+#                                It is separately classified as an HTTP-PLANE answer
+#                                by coord-revive.sh's wedge detector, which reads
+#                                TIMEOUT_UPSTREAM* BEFORE TIMEOUT*; swap that order
+#                                and every 504 starts corroborating a runner wedge
+#                                that is not happening.
+#   LIVE_APP_ERROR*              TRANSPORT-LIVE. The door carried the call and the
+#                                TOOL complained. Any caller comparing `verdict` to
+#                                the literal "LIVE" drops it on the floor and reports
+#                                a dead door over a demonstrably live one.
+#   PROXY_LIVE_UPSTREAM_DEAD*    the proxy is LIVE and its coord hop is not. Both
+#                                carriers re-probe it once; a second one is final.
+#                                It is NOT a live-class verdict: no call can be
+#                                carried over it.
+# ========================================================================================
+: "${PROBE_TIMEOUT:?must be set before the shared coord-door classifier}"
+: "${DOOR_SCRIPT_NAME:?must be set before the shared coord-door classifier}"
+
+if ! command -v curl >/dev/null 2>&1; then
+  echo "$DOOR_SCRIPT_NAME: ERROR: curl is required (LOCAL fault, not a coord verdict)." >&2
+  exit 127
+fi
+
+# jq is NOT guaranteed to exist — it is ABSENT on the Windows operator box
+# (verified 2026-08-06 by the /policy + /gate fix, and again 2026-08-07 when THIS
+# script hard-exited 127 during a real dead-transport recovery). Requiring it
+# outright is worse here than anywhere else in the fleet: this script is the
+# documented recovery path for "Command failed with no output", so an agent hits
+# it precisely when coord is already unreachable — and got a bare
+# "jq is required" with no door probed and no typed verdict. The recovery tool
+# must not be the thing that fails.
+#
+# Pick a reader up front and fail LOUD naming it a LOCAL fault, so a missing
+# binary can never read as a coord verdict (same rule as AUTH_HEADER_* below).
+# Inherited from the /policy and /gate fix rather than diverging from it.
+# `command -v python` proves a NAME resolves, not that it WORKS. Windows ships
+# App Execution Alias stubs at %LOCALAPPDATA%/Microsoft/WindowsApps/python{,3}.exe
+# which resolve, print nothing and exit non-zero — and both names are the same
+# stub, so a python3 fallback cannot rescue it. Accepting one would make every
+# read_cfg return empty, every candidate be rejected as "no proxy-shaped
+# coord-mcp entry" (a message that blames the CONFIG), and the cascade print
+# VERDICT: DEAD over live doors. That is the missing-binary-reads-as-empty-field
+# bug this fix exists to kill, reintroduced one layer up. Smoke-test instead.
+# unstamped-floor-ok: a counterfactual about a missing JSON reader, not a measured floor 2026-09-11
+JSON_READER=""
+if command -v jq >/dev/null 2>&1; then
+  JSON_READER=jq
+else
+  for c in python python3; do
+    # Check the OUTPUT, not just the exit code. A python that prints at
+    # interpreter start (sitecustomize/usercustomize, a printing .pth, a conda
+    # or venv shim) exits 0 and would pass an exit-code-only probe -- then
+    # shifts read_cfg's positional two-line pair by one, emptying every value
+    # and printing DEAD over live doors. That is the same
+    # missing-binary-reads-as-empty class this selection exists to close,
+    # entering through stdout instead of the status. tr strips the CR a native
+    # Windows python appends.
+    if command -v "$c" >/dev/null 2>&1 \
+       && [ "$("$c" -c 'import json;print(1)' </dev/null 2>/dev/null | tr -d '\r\n')" = "1" ]; then
+      JSON_READER="$c"; break
+    fi
+  done
+fi
+if [ -z "$JSON_READER" ]; then
+  echo "$DOOR_SCRIPT_NAME: ERROR: neither jq nor a working python can read JSON — cannot probe any door (LOCAL fault, not a coord verdict)." >&2
+  exit 127
+fi
+
+# rpc_has_result — reads a JSON-RPC body on STDIN; 0 iff it carries a real
+# `result` and no `error`. A JSON-RPC surface answers HTTP 200 even for in-band
+# errors, so LIVE requires the result object itself, or the caller re-issues its
+# lost write into a broken door.
+rpc_has_result() {
+  if [ "$JSON_READER" = jq ]; then
+    jq -e '(.error == null) and (.result != null)' >/dev/null 2>&1  # envelope-ok: a two-key PRESENCE predicate (exit status only, no value leaves it); rpc_print_result is the typed reader
+  else
+    "$JSON_READER" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(1)
+sys.exit(0 if (d.get("error") is None and d.get("result") is not None) else 1)' >/dev/null 2>&1  # envelope-ok: same presence predicate, python arm
+  fi
+}
+
+# rpc_error_code — reads a JSON body on STDIN; prints the typed ERROR CODE the
+# envelope carries (`.error.code`, else a top-level `.code`), or nothing.
+#
+# READ THE CODE, NEVER THE MESSAGE. The runner's proxy error text is due to grow
+# a source chain, so a classifier keyed on message text would stop matching on
+# the day it does — a live 502 silently re-reading as an unclassified `HTTP_502`,
+# i.e. the undifferentiated mask this whole block exists to replace, restored by
+# a wording change nobody would think to check. The code token is the contract;
+# the message is prose.
+#
+# Anything that is not a STRING comes back empty, so a numeric JSON-RPC `code`
+# (the -32601 family) cannot collide with the proxy's symbolic ones.
+rpc_error_code() {
+  if [ "$JSON_READER" = jq ]; then
+    jq -r 'if type == "object" then (((.error? | objects | .code?) // .code?) // "") else "" end
+           | if type == "string" then . else "" end' 2>/dev/null  # envelope-ok: reads ONLY the typed code token, never the message text, and a non-string is "" rather than a value
+  else
+    "$JSON_READER" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print(); sys.exit(0)
+e=d.get("error") if isinstance(d,dict) else None
+c=e.get("code") if isinstance(e,dict) else None
+if not isinstance(c,str):
+    c=d.get("code") if isinstance(d,dict) else None
+print(c if isinstance(c,str) else "")' 2>/dev/null  # envelope-ok: same typed code token, python arm
+  fi
+}
+
+# rpc_is_app_error — reads a JSON-RPC body on STDIN; 0 iff `.result` is a
+# WELL-FORMED MCP TOOL ENVELOPE reporting a TOOL-level error: an object carrying
+# `content` whose `isError` is true.
+#
+# READ THIS BEFORE TOUCHING IT — THE TRAP IS THE WHOLE POINT. `isError` is a
+# property of the TOOL's answer, never of the transport: the door carried the
+# call, coord ran the tool, and the tool complained. The obvious edit — folding
+# an `isError` test into `rpc_has_result` above so a "failed" response stops
+# counting as a result — turns that into a DEAD verdict over a door that just
+# demonstrated it works end to end. That is the worst output this family of
+# scripts can produce (coord-revive's SKILL.md sells its DEAD line as honest
+# blocked-evidence), so the caller maps this to LIVE_APP_ERROR, which is a
+# LIVE-CLASS verdict, and NEVER to a dead one.
+#
+# `content` is required alongside `isError` on purpose: without it, any tool
+# whose own DATA happens to carry a field named `isError` would be read as an
+# envelope. Requiring both keeps the predicate about the MCP envelope shape.
+rpc_is_app_error() {
+  if [ "$JSON_READER" = jq ]; then
+    jq -e '((.result | objects | (has("content") and (.isError == true))) // false)' >/dev/null 2>&1  # envelope-ok: a two-key PRESENCE predicate over the tool envelope (exit status only, no value leaves it)
+  else
+    "$JSON_READER" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(1)
+r=d.get("result") if isinstance(d,dict) else None  # envelope-ok: a PRESENCE test, not a read - the value never leaves this function, only the exit status does
+sys.exit(0 if (isinstance(r,dict) and "content" in r and r.get("isError") is True) else 1)' >/dev/null 2>&1  # envelope-ok: same presence predicate, python arm
+  fi
+}
+
+# rpc_result_rows — reads a JSON-RPC body on STDIN; prints the ROW COUNT the
+# `result` carries under the FIRST PRESENT key of a closed list, or `-1` when
+# no listed key is present. Not a verdict by itself (plan
+# 2026-09-03-capability-floor-claims-carry-their-probe, D3): a 2xx whose list
+# is empty under a key the caller GUESSED is indistinguishable from an empty
+# corpus at the call site, and it fails toward a false negative about a
+# capability — occurrence 10 read `.records`/`.results` off a body whose key
+# was `.hits` and reported 0 hits four times, including for a bare `DOSSIER`.
+# So the rule is: zero rows under every known key is UNKNOWN(envelope) until a
+# control read against a known-present record confirms the key.
+#
+# An MCP tool result arrives boxed — `result.content[0].text` holding the
+# tool's JSON as a string — so that box is opened first when it is present; a
+# bare `result` object (tools/list's `tools`) is read directly. The closed
+# list, in order: hits, records, results, items, findings, documents,
+# work_units, gates, tools, alerts (the agent alert queue's rows key, plan
+# 2026-09-18-notifications-are-agent-actions-and-alerts-are-agent-work). Anything
+# that is not an array under the matched key is `-1`, never a count.
+rpc_result_rows() {
+  if [ "$JSON_READER" = jq ]; then
+    jq -r '
+      def rows: . as $r
+        | (["hits","records","results","items","findings","documents","work_units","gates","tools","alerts"]
+           | map(select(. as $k | $r | has($k)))) as $present
+        | if ($present | length) == 0 then -1
+          else ($r[$present[0]] | if type == "array" then length else -1 end) end;
+      (.result? // null) as $res
+      | if ($res | type) != "object" then -1
+        elif (($res.content? | type) == "array") and (($res.content[0]?.text? | type) == "string")
+          then (($res.content[0].text | try fromjson catch null) as $inner
+                | if ($inner | type) == "object" then ($inner | rows) else -1 end)
+        else ($res | rows) end' 2>/dev/null  # envelope-ok: a COUNT under the first present key of a closed list, -1 when none is present; no row value leaves it
+  else
+    "$JSON_READER" -c 'import json,sys
+KEYS=("hits","records","results","items","findings","documents","work_units","gates","tools","alerts")
+def rows(r):
+    for k in KEYS:
+        if k in r:
+            v=r[k]
+            return len(v) if isinstance(v,list) else -1
+    return -1
+try: d=json.load(sys.stdin)
+except Exception: print(-1); sys.exit(0)
+res=d.get("result") if isinstance(d,dict) else None  # envelope-ok: the PRESENCE/shape walk that picks a list to count; the count is the only value that leaves
+if not isinstance(res,dict): print(-1); sys.exit(0)
+c=res.get("content")
+if isinstance(c,list) and c and isinstance(c[0],dict) and isinstance(c[0].get("text"),str):
+    try: inner=json.loads(c[0]["text"])
+    except Exception: print(-1); sys.exit(0)
+    print(rows(inner) if isinstance(inner,dict) else -1); sys.exit(0)
+print(rows(res))' 2>/dev/null  # envelope-ok: same closed-list count, python arm
+  fi
+}
+
+# runner_credential_field <body> <field> -> the TOP-LEVEL field's string value,
+# or "" when it is absent, non-string, or the body will not parse.
+#
+# The runner's OWN 401 (plan 2026-09-12-runner-loads-with-an-expired-coord-credential-and-tells-nobody,
+# DD4) carries {"code":"runner_credential_<posture>","since":…,"remedy":…} at the
+# TOP LEVEL, and DD4 also has coord's `credential_free_doors` catalogue riding
+# along in the same object — an array of door records whose keys this script does
+# not get to constrain, because they are copied from coord's last answer.
+#
+# A TEXTUAL read cannot be made safe against that, and the first cut of this
+# function proved it. `grep -o … | head -1` was chosen over a greedy `sed` so a
+# first-match beats a last-match, which is right — but it only helps for a key
+# that sorts BEFORE the catalogue. serde_json here is a BTreeMap (1.0.149, no
+# `indexmap`, so `preserve_order` is off), so the refusal body serializes SORTED:
+# cause, code, credential_free_doors, error, layer, next_door, posture,
+# posture_cause, probed_at, remedy, retryable, since, since_unix, success.
+# `code` sorts before the catalogue; `since`, `remedy`, `posture` and `next_door`
+# all sort AFTER it. Measured against a decoy catalogue, the textual reader
+# returned coord's catalogue entry for every one of those four.
+#
+# So the read is a real top-level parse, exactly as the METHOD_NOT_ALLOWED arm
+# below reads `error.data.cause`. `$JSON_READER` is guaranteed non-empty — this
+# script exits 127 at startup when neither jq nor a working python is present —
+# so there is no rung here that can silently degrade to the textual guess.
+runner_credential_field() {
+  if [ "$JSON_READER" = jq ]; then
+    printf '%s' "$1" | jq -r --arg k "$2" '((.[$k]?) // "") | if type == "string" then . else "" end' 2>/dev/null | tr -d '\r\n'  # envelope-ok: one TOP-LEVEL key of the runner's own 401 body; a nested catalogue entry is unreachable from `.[$k]`, which is the whole point
+  else
+    printf '%s' "$1" | "$JSON_READER" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print(); sys.exit(0)
+v=d.get(sys.argv[1]) if isinstance(d,dict) else None  # envelope-ok: same TOP-LEVEL read, python arm; a non-object body reads as absent, never as a value
+print(v if isinstance(v,str) else "")' "$2" 2>/dev/null | tr -d '\r\n'
+  fi
+}
+
+# runner_credential_code_textual <body> -> the `code` value, read without a parser.
+#
+# The ONE fallback, and only for `code`, because only `code` has a bound that
+# makes a textual read exact: it sorts before `credential_free_doors`, so
+# everything up to the catalogue is a region the catalogue cannot contaminate.
+# It exists so a body that will not PARSE — truncated mid-transfer, or an
+# envelope shape this script has not seen — still yields the posture rather than
+# collapsing the class verdict to `unstated`. `since` and `remedy` get no such
+# fallback: there is no safe textual read for a key that sorts after the
+# catalogue, and inventing one is how the defect above happened.
+runner_credential_code_textual() {
+  local head
+  head="${1%%\"credential_free_doors\"*}"
+  printf '%s' "$head" | tr -d '\n\r' \
+    | grep -o '"code"[[:space:]]*:[[:space:]]*"[^"]*"' \
+    | head -1 \
+    | sed 's/.*"\([^"]*\)"$/\1/'
+}
+
+# classify <curl_exit> <http_code> <body> [unauth-wording] -> typed verdict.
+# 401 wording is parameterized because on a loopback proxy it means "stale
+# proxy key" while on the direct bearer door it means "rejected bearer".
+#
+# INVARIANT: every path returns a NAMED cause. A verdict that names nothing is
+classify() {
+  local ce="$1" code="$2" body="$3" unauth="${4:-COORD_MCP_PROXY_UNAUTHORIZED (stale/evicted proxy key)}"
+  # curl can fail BEFORE the transfer starts (unopenable `--header @file`, bad
+  # URL). It then never writes its `-w` output, so $code arrives EMPTY — not
+  # "000", which is what curl reports for a failure during the transfer. An
+  # empty code fell through every branch below into the "HTTP_$code
+  # (unclassified: …)" tail and printed a bare `HTTP_ (unclassified: )`:
+  # exactly the undifferentiated mask this script exists to replace. Normalize
+  # first so the pre-transfer failures reach the same named causes.
+  [ -n "$code" ] || code="000"
+  if [ "$ce" = "7" ]; then echo "CONNECT_REFUSED (dead port - no listener)"; return; fi
+  # THE PROXY DID NOT ANSWER. Nothing came back inside the budget, so whether the
+  # proxy ever answered is UNKNOWN — this box abandoned the request. Deliberately
+  # NOT the same statement as TIMEOUT_UPSTREAM below, which is the proxy ANSWERING
+  # that its own upstream hung. Collapsing the two loses the one bit that decides
+  # what to do next: a door that never answered may still be alive and loaded,
+  # while a door that answered 504 is provably alive and its coord hop is not.
+  if [ "$ce" = "28" ]; then echo "TIMEOUT (no response reached this box within ${PROBE_TIMEOUT}s - the request was abandoned client-side, so whether the proxy answered at all is UNKNOWN; this is NOT the proxy reporting a stalled upstream, which is TIMEOUT_UPSTREAM). Often SATURATION rather than a dead door - do NOT restart the runner on this alone; re-run, or use another door"; return; fi
+  # 26 = "couldn't open/read the local data file", i.e. the auth-header file.
+  # This is a LOCAL fault and must never read as a coord verdict — the same
+  # rule coord-acting-bearer.sh states for its mint ("a 'Failed to open' here
+  # must not masquerade as 'coord down'").
+  if [ "$ce" = "26" ]; then
+    echo "AUTH_HEADER_UNREADABLE (curl could not open the staged header file - LOCAL fault, says nothing about coord)"; return
+  fi
+  # Also "the proxy did not answer", by a different route: the transfer failed
+  # before any status line arrived (DNS, TLS, a reset). `000` is curl's own
+  # no-status marker, so it is a statement about THIS BOX's reach, never about
+  # the upstream behind the proxy.
+  if [ "$ce" != "0" ] && [ "$code" = "000" ]; then echo "UNREACHABLE (curl exit $ce - the transfer never completed and NO HTTP status came back, so nothing here observed the proxy answering)"; return; fi
+  # Non-2xx guard on the body-marker match (asymmetry 2). Without it a healthy
+  # 200 whose payload merely CONTAINS the marker — a tool description or a PR
+  # body discussing this very verdict — classifies as CREDENTIAL_REFRESHING
+  # instead of LIVE: a confidently wrong DEAD verdict about a live door.
+  # Adopted from pr-status.sh's `[[ "$code" != 2* ]]`, which guarded it first.
+  # Latent, not live, when written: a real tools/list against the live loopback
+  # door returned 200 / 101499 bytes with 0 occurrences of either marker
+  # (measured 2026-07-31). The guard closes it before it becomes live.
+  case "$code" in
+    2*) ;;
+    *)
+      case "$body" in
+        *COORD_MCP_PROXY_CREDENTIAL_REFRESHING*|*CREDENTIAL_REFRESHING*)
+          echo "CREDENTIAL_REFRESHING (retry-safe - proxy up, withholding while its device JWT refreshes)"; return ;;
+        *runner_credential_*)
+          # READ BEFORE the nonce arm, and that order is the whole point. This
+          # 401 is the runner refusing the call out of its OWN credential state
+          # while the nonce it was handed is perfectly good; classified as
+          # COORD_MCP_PROXY_UNAUTHORIZED it would send the reader to rotate a
+          # key that is fine, and — worse — to re-provision, which evicts the
+          # live slot and still leaves the runner's dead device JWT dead. The
+          # runner's own breadcrumb spells the same fact RUNNER_CREDENTIAL_<POSTURE>;
+          # the verdict word is shared with it on purpose.
+          local rc_posture rc_since rc_remedy
+          rc_posture="$(runner_credential_field "$body" code)"
+          # Parser first, text only when the body would not parse at all.
+          [ -n "$rc_posture" ] || rc_posture="$(runner_credential_code_textual "$body")"
+          rc_posture="${rc_posture#runner_credential_}"
+          rc_since="$(runner_credential_field "$body" since)"
+          rc_remedy="$(runner_credential_field "$body" remedy)"
+          # An UNPARSEABLE posture is still this class — the marker matched —
+          # so it gets the class verdict with the posture named UNSTATED rather
+          # than silently falling through to the nonce arm.
+          [ -n "$rc_posture" ] || rc_posture="unstated"
+          echo "RUNNER_CREDENTIAL_$(printf '%s' "$rc_posture" | tr '[:lower:]' '[:upper:]') (HTTP 401 from the RUNNER, not from coord and NOT about your nonce: the forwarder refused to carry this call because its own coord credential is $rc_posture since ${rc_since:-unstated}. The key in this .mcp.json is FINE - do NOT rotate it and do NOT re-provision, which mints a new nonce for a credential that stays dead and evicts whatever holds this workdir's slot. L4/L5 carry their own credentials and DO answer. remedy=${rc_remedy:-unstated})"; return ;;
+        *COORD_MCP_PROXY_UNAUTHORIZED*)
+          echo "$unauth"; return ;;
+        *COORD_MCP_PROXY_METHOD_NOT_ALLOWED*)
+          # A `-32601` from the proxy has three causes -- stale binary, drift,
+          # deliberate -- and since plan 2026-09-03-coord-mcp-403-names-its-own-cause
+          # the refusal NAMES which one in `data.cause` (`stale_binary` | `drift`
+          # | `deliberate` | `unknown`; `method_not_allowed` for a refused
+          # METHOD) with a one-sentence `data.remedy`. Print exactly what the
+          # body carries: the `-32601` posture discloses nothing about coord's
+          # upstream grant, and neither does this verdict. A runner built before
+          # that plan emits only `data.code`; then the cause is UNSTATED -- not
+          # "drift", not "boundary" -- and the reader runs the by-hand lookups
+          # (GET /coord-mcp/tool-policy, /health buildDrift) instead.
+          local mna_cause mna_remedy
+          if [ "$JSON_READER" = jq ]; then
+            mna_cause=$(printf '%s' "$body" | jq -r '((.error? | objects | .data? | objects | .cause?) // "") | if type == "string" then . else "" end' 2>/dev/null | tr -d '\r')  # envelope-ok: reads the typed `cause` token the refusal body carries; an absent field is "" and prints as UNSTATED, never as a default cause
+            mna_remedy=$(printf '%s' "$body" | jq -r '((.error? | objects | .data? | objects | .remedy?) // "") | if type == "string" then . else "" end' 2>/dev/null | tr -d '\r\n')  # envelope-ok: same typed read for the one-sentence `remedy`
+          else
+            mna_cause=$(printf '%s' "$body" | "$JSON_READER" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print(); sys.exit(0)
+e=d.get("error") if isinstance(d,dict) else None
+x=e.get("data") if isinstance(e,dict) else None  # envelope-ok: the JSON-RPC error data object; a non-object reads as absent, never as a value
+v=x.get(sys.argv[1]) if isinstance(x,dict) else None
+print(v if isinstance(v,str) else "")' cause 2>/dev/null | tr -d '\r')
+            mna_remedy=$(printf '%s' "$body" | "$JSON_READER" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print(); sys.exit(0)
+e=d.get("error") if isinstance(d,dict) else None
+x=e.get("data") if isinstance(e,dict) else None  # envelope-ok: same typed read for the one-sentence `remedy`, python arm
+v=x.get(sys.argv[1]) if isinstance(x,dict) else None
+print(v if isinstance(v,str) else "")' remedy 2>/dev/null | tr -d '\r\n')
+          fi
+          if [ -n "$mna_cause" ]; then
+            echo "METHOD_NOT_ALLOWED (cause=$mna_cause remedy=${mna_remedy:-unstated})"
+          else
+            echo "METHOD_NOT_ALLOWED (cause=unstated (runner build predates the discriminator - read GET /coord-mcp/tool-policy and buildDrift))"
+          fi
+          return ;;
+      esac ;;
+  esac
+  case "$code" in
+    200)
+      # A JSON-RPC surface answers 200 even for in-band errors — LIVE requires
+      # an actual result object, or the caller re-issues into a broken door.
+      if printf '%s' "$body" | rpc_has_result; then
+        # …and a result that IS a tool envelope reporting isError:true is still a
+        # result: the transport is PROVEN end to end and the TOOL declined. See
+        # rpc_is_app_error's header for why this must never become a dead verdict.
+        if printf '%s' "$body" | rpc_is_app_error; then
+          echo "LIVE_APP_ERROR (transport PROVEN end to end - the door carried the call, coord ran the tool, and the TOOL answered isError:true. That is the tool's verdict, not the door's: treat this as LIVE)"
+        else
+          echo "LIVE"
+        fi
+      else
+        echo "HTTP_200_NOT_MCP (200 without a JSON-RPC result - treat as dead)"
+      fi
+      return ;;
+    401) echo "$unauth"; return ;;
+    408|504)
+      # THE PROXY ANSWERED, and what it answered is that its own upstream did
+      # not. Spelled to share the TIMEOUT* prefix so both carriers' retry picks
+      # it up; classified on the HTTP plane, not the transport one, because a
+      # status line came back.
+      echo "TIMEOUT_UPSTREAM (HTTP $code - the proxy ANSWERED and reported that ITS upstream did not: a live local door in front of a hop that hung. Distinct from TIMEOUT, where nothing answered at all and this box abandoned the request. Retry-safe)"; return ;;
+    502)
+      # The F2 class: proxy LIVE, coord /mcp hop DEAD. Matched on the envelope's
+      # typed `code`, deliberately NOT on its message — see rpc_error_code.
+      # An unrecognised 502 deliberately FALLS THROUGH to the unclassified tail
+      # below rather than borrowing this verdict: this script names causes it has
+      # tested, and a 502 from something that is not the coord-mcp proxy has not
+      # been.
+      case "$(printf '%s' "$body" | rpc_error_code | tr -d '\r')" in
+        COORD_MCP_PROXY_UPSTREAM_UNREACHABLE|COORD_MCP_PROXY_UPSTREAM_READ_FAILED|COORD_MCP_PROXY_UPSTREAM_NON_JSON_ERROR)
+          echo "PROXY_LIVE_UPSTREAM_DEAD (proxy answered, the coord /mcp hop failed - the F2 class; re-probe once, then treat as retryable-unknown)"; return ;;
+      esac ;;
+    503) echo "CREDENTIAL_REFRESHING (retry-safe - HTTP 503)"; return ;;
+  esac
+  local snippet
+  snippet=$(printf '%s' "$body" | tr -d '\n' | head -c 120)
+  echo "HTTP_$code (unclassified: ${snippet:-<empty body>})"
+}
+
+# ========================== END SHARED COORD-DOOR CLASSIFIER v1 ==========================
+
+# json_string — read STDIN, print it as ONE JSON string literal (quotes included).
+# Reader-agnostic on purpose. This used to be a bare `python -c json.dumps`, and
+# it sat INSIDE a command substitution whose OUTER printf still exits 0 — so on a
+# python-less box `set -e` never fired, ARGS became `{"repo":,"number":1}`, and
+# coord's parse error got reported as a TRANSPORT failure. The old `for bin in jq
+# curl python` preflight was the only thing catching that, and the shared block
+# above replaced it; without this function the removal would be a regression.
+json_string() {
+  if [ "$JSON_READER" = jq ]; then
+    jq -Rs .
+  else
+    "$JSON_READER" -c 'import json,sys;print(json.dumps(sys.stdin.read()))'
+  fi
+}
+
+# Deferred from the argument parse above: needs $JSON_READER.
+if [[ "$MINE" != "true" ]]; then
+  REPO_JSON="$(printf '%s' "$REPO" | json_string | tr -d '\r')"
+  # A reader that produced nothing would yield `{"repo":,...}` — malformed JSON
+  # that coord answers with a parse error this script would blame on the
+  # transport. Fail LOUD and locally instead.
+  [[ -n "$REPO_JSON" ]] || {
+    echo "$DOOR_SCRIPT_NAME: ERROR: could not JSON-encode --repo with $JSON_READER (LOCAL fault, not a coord verdict)." >&2
+    exit 127
+  }
+  ARGS="$(printf '{"repo":%s,"number":%s}' "$REPO_JSON" "$NUMBER")"
+  # REBUILD $RPC. It was assembled far above, from an $ARGS that is the EMPTY
+  # STRING on this branch — the deferral is deliberate (json_string needs
+  # $JSON_READER, which the shared block chooses) and the rebuild was simply
+  # missing. Measured against the live loopback door 2026-09-05: every
+  # `--repo/--number` call sent `"arguments":}`, coord answered HTTP 403
+  # "request body is not valid JSON-RPC: expected value at line 1 column 94",
+  # and this script reported it as `coord_pr_status refused the call (transport
+  # OK)` — a confident verdict about COORD for a defect that never left this
+  # file. `--mine` was unaffected: its $ARGS is set before line 58.
+  RPC="$(printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"coord_pr_status","arguments":%s}}' "$ARGS")"
+fi
+
+
+# ----- credential staging -----------------------------------------------------
+# Both doors below authenticate with key material (a proxy nonce, then a minted
+# acting-user bearer). Neither may travel on curl's argv: process cmdlines are
+# world-readable on this multi-session machine, so a credential on argv leaks to
+# every peer session. Stage it in a private tempfile and pass `curl -H @file`
+# (same rule and shape as scripts/coord-acting-bearer.sh).
+HDRFILE="$(mktemp)" || { echo "error: mktemp failed — cannot stage a credential off argv" >&2; exit 3; }
+CURLERR="$(mktemp)" || { echo "error: mktemp failed" >&2; exit 3; }
+RESPFILE="$(mktemp)" || { echo "error: mktemp failed" >&2; exit 3; }
+trap 'rm -f "$HDRFILE" "$CURLERR" "$RESPFILE"' EXIT
+# curl's -o needs a spelling the NATIVE curl.exe can open. Under an inherited
+# MSYS_NO_PATHCONV=1 (exported by the SSM runbooks this fleet follows) the
+# POSIX /tmp path is NOT converted, Windows resolves it against the drive
+# root, and the body lands in a different file than the one bash later reads
+# — every 200 then reads as a broken door. Same rule as stage_header; the
+# 2>"$CURLERR" redirections are opened by bash itself and never need this.
+if command -v cygpath >/dev/null 2>&1; then
+  RESPPATH="$(cygpath -w "$RESPFILE")" || { echo "error: cygpath failed for the response tempfile" >&2; exit 3; }
+else
+  RESPPATH="$RESPFILE"
+fi
+
+# stage_header <name> <value> -> echoes the path spelling curl can open.
+# Git Bash's mktemp yields a POSIX path a native curl.exe cannot open when MSYS
+# pathconv is off, so hand curl the Windows spelling when cygpath exists.
+#
+# Returns non-zero if the header could not be staged. That check is load-bearing
+# twice over: `curl -H @<empty file>` does NOT error, it sends the request with
+# NO credential — so a silent staging failure would produce an unauthenticated
+# POST, a 401, and a "coord unreachable" verdict about a door that is fine. And
+# because one file is reused across doors, a failed *open* would otherwise leave
+# the PREVIOUS door's nonce in place and send it to the next URL. Truncate
+# first, then verify.
+# Braces so 2>/dev/null covers the redirection failure itself: redirections are
+# applied left to right, so a bare `printf > file 2>/dev/null` still lets the
+# shell's "cannot create" reach the console before the suppression takes effect.
+stage_header() {
+  { : > "$HDRFILE"; } 2>/dev/null || return 1
+  { printf '%s: %s\n' "$1" "$2" > "$HDRFILE"; } 2>/dev/null || return 1
+  [[ -s "$HDRFILE" ]] || return 1
+  if command -v cygpath >/dev/null 2>&1; then cygpath -w "$HDRFILE"; else printf '%s' "$HDRFILE"; fi
+}
+
+# last_curl_error -> curl's own one-line explanation from the previous call.
+# Kept OUT of the console for expected failures but folded into the final error,
+# so a local fault (unopenable header file, TLS, DNS) never masquerades as
+# "coord unreachable" — the rule coord-revive.sh enforces with typed verdicts.
+last_curl_error() { tr -d '\r' < "$CURLERR" 2>/dev/null | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//'; }
+FAILNOTE=""
+# Dedup: ten stale doors produce ten copies of the same curl message, which
+# buries the one distinct note that explains the failure.
+note_fail() {
+  [[ -n "$1" ]] || return 0
+  case ";$FAILNOTE;" in *";$1;"*) return 0 ;; esac
+  FAILNOTE="${FAILNOTE}${FAILNOTE:+; }$1"
+  return 0
+}
+
+emit() { # print the tool result payload from an MCP JSON-RPC response on stdin
+  # Goes through $JSON_READER, not bare `python`. A python-only emit would have
+  # silently re-imposed the very dependency the shared block above removes:
+  # the floor would say "jq is enough" while this function still needed python.
+  # MCP content is a list of {type,text}; some mounts return the value directly.
+  if [ "$JSON_READER" = jq ]; then
+    jq -er '.result as $r
+            | if $r == null then empty
+              else ((($r.content? // []) | map(select(.type == "text")) | .[0].text?) as $t
+                    | if $t != null then $t
+                      elif ($r | length) > 0 then ($r | tojson)
+                      else empty end)
+              end'
+  else
+    "$JSON_READER" -c 'import json,sys
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    sys.exit(3)
+r=d.get("result") or {}
+for c in (r.get("content") or []):
+    if c.get("type")=="text":
+        print(c["text"]); sys.exit(0)
+if r: print(json.dumps(r)); sys.exit(0)
+sys.exit(3)'
+  fi
+}
+
+# rpc_error_message — prints a JSON-RPC error.message from STDIN; non-zero if
+# there is none. Reader-agnostic for the same reason as emit(). Not part of the
+# shared block: coord-revive.sh folds this case into HTTP_200_NOT_MCP and has
+# no caller for it.
+rpc_error_message() {
+  if [ "$JSON_READER" = jq ]; then
+    jq -er '.error.message // empty'
+  else
+    "$JSON_READER" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(1)
+e=d.get("error") or {}
+m=e.get("message")
+if not m: sys.exit(1)
+print(m)'
+  fi
+}
+
+# call_door <url> — POST $RPC to one door, credential header staged at $HDRPATH.
+# Replaces the old `curl -fsS` shape on both doors: `-f` threw the body away on
+# any non-2xx, which made the "transport OK, coord refused" branch unreachable
+# for a JSON-RPC error carried on a 4xx/5xx, and left HTTP 503 /
+# CREDENTIAL_REFRESHING — the ONE verdict coord-revive.sh classifies as
+# retry-safe (the proxy is up, deliberately withholding while its device JWT
+# refreshes) — indistinguishable from a dead door. Mirrors coord-revive.sh's
+# probe: `-sS -o <body> -w '%{http_code}'`, max 2 attempts per door, attempt 2
+# ONLY on that one verdict after `sleep 3`, no loops — coord has no auth-path
+# rate limiting, so the bound lives here in the client.
+# On a usable result: prints the payload and exits 0 (the script is done).
+# On a JSON-RPC error from an answering door (ANY status): reports "coord
+# refused, transport OK" and exits 1 — never blames the transport for it.
+# Otherwise: records a note_fail and returns 1 (the caller walks on).
+call_door() {
+  local url="$1" unauth="${2:-}" attempt ce code resp errmsg verdict
+  for attempt in 1 2; do
+    : > "$CURLERR"
+    : > "$RESPFILE"
+    ce=0
+    code="$(curl -sS --connect-timeout 5 -m 20 -X POST "$url" \
+          -H "Content-Type: application/json" \
+          -H @"$HDRPATH" \
+          -o "$RESPPATH" -w '%{http_code}' \
+          -d "$RPC" 2>"$CURLERR")" || ce=$?
+    resp="$(cat "$RESPFILE" 2>/dev/null)"
+    # One typed verdict from the SHARED classifier, replacing this function's
+    # own partial copy. What /pr-status gains (asymmetry 1 of the plan): a
+    # named 401 cause and named curl-exit causes (7 / 26 / 28), which the
+    # inline version folded into an undifferentiated "HTTP $code without a
+    # JSON-RPC error body" or a raw curl string — this script reproducing the
+    # very client mask it exists to replace. The unauth wording is passed per
+    # door, exactly as coord-revive.sh parameterises it.
+    verdict="$(classify "$ce" "$code" "$resp" ${unauth:+"$unauth"})"
+
+    # Retry ONLY a retry-safe verdict, and only once. The prefix match (not
+    # equality) is required: coord-revive.sh appends a "[curl: …]" suffix to
+    # non-LIVE verdicts, and both copies must branch the same way.
+    #
+    # TIMEOUT joined the set 2026-09-02, in lockstep with coord-revive.sh. It has
+    # to: the classifier block above is pinned byte-identical across both carriers
+    # by CI check #35, so this script now PRINTS "Often SATURATION rather than a
+    # dead door … re-run, or use another door" on a curl exit 28. Leaving the
+    # retry out here would have made that verdict a promise this carrier does not
+    # keep, and /pr-status sweeps up to 11 doors on the same loaded boxes that
+    # produced the false-DEAD in the first place.
+    #
+    # PROXY_LIVE_UPSTREAM_DEAD joined the set with the same lockstep argument:
+    # the shared block above now classifies an HTTP 502 carrying the runner's
+    # typed upstream codes, and its own verdict string promises "re-probe once".
+    # A promise this carrier does not keep is exactly what the TIMEOUT paragraph
+    # above is about.
+    if [[ "$attempt" -eq 1 && ( "$verdict" == CREDENTIAL_REFRESHING* || "$verdict" == TIMEOUT* || "$verdict" == PROXY_LIVE_UPSTREAM_DEAD* ) ]]; then
+      sleep 3
+      continue
+    fi
+
+    if [[ "$verdict" == "LIVE" ]]; then
+      if OUT="$(printf '%s' "$resp" | emit)"; then printf '%s\n' "$OUT"; exit 0; fi
+    fi
+    # LIVE_APP_ERROR is TRANSPORT-LIVE: the door carried the call and coord_pr_status
+    # itself answered isError:true. Handle it exactly as the JSON-RPC refusal below
+    # is handled — report the transport as healthy and STOP, rather than walking the
+    # remaining doors and blaming a transport that just proved it works.
+    #
+    # This arm is also a correctness FIX, not only a new label. Before the shared
+    # classifier learned the isError envelope, that response satisfied
+    # `rpc_has_result`, classified LIVE, and went straight to `emit` — which prints
+    # `.result.content[0].text`, i.e. the TOOL'S ERROR MESSAGE, on stdout where the
+    # caller renders PR status cards. A status surface must never render an error
+    # string as if it were a card; that is the fabricated-status failure this
+    # script's header forbids in so many words.
+    if [[ "$verdict" == LIVE_APP_ERROR* ]]; then
+      local apperr=""
+      apperr="$(printf '%s' "$resp" | emit 2>/dev/null || true)"
+      echo "error: coord_pr_status answered with a TOOL error (transport OK via $url, HTTP $code): ${apperr:-<the isError envelope carried no text>}" >&2
+      exit 1
+    fi
+    # A withholding proxy is a transient, never a coord refusal — classify
+    # BEFORE the refusal parse, whatever shape its body takes.
+    if [[ "$verdict" == CREDENTIAL_REFRESHING* ]]; then
+      note_fail "$verdict persisted after one 3s retry (HTTP $code)"
+      return 1
+    fi
+    # A parseable JSON-RPC *error* from a door that answered means the
+    # transport is HEALTHY and coord declined the call — report that instead
+    # of walking the remaining doors and blaming the transport. Reachable for
+    # refusals on ANY status code now that the body survives a non-2xx.
+    if errmsg="$(printf '%s' "$resp" | rpc_error_message 2>/dev/null)"; then
+      echo "error: coord_pr_status refused the call (transport OK via $url, HTTP $code): $errmsg" >&2
+      exit 1
+    fi
+    # Every remaining path is already a NAMED cause from classify() — the
+    # invariant the shared block states. Appending curl's own stderr mirrors
+    # coord-revive.sh's probe_door(), which does the same for non-LIVE verdicts.
+    if [[ "$ce" -ne 0 ]]; then
+      local curlerr; curlerr="$(last_curl_error)"
+      note_fail "${verdict}${curlerr:+ [curl: $curlerr]}"
+    else
+      note_fail "$verdict"
+    fi
+    return 1
+  done
+}
+
+# ----- 1) runner loopback proxy (injects a live device JWT) -------------------
+# Discover the proxy door the way the rest of the fleet does: sweep the
+# runner-written `.mcp.json` candidates (own cwd → workspace root → sibling
+# repos) and use the first whose coord-mcp entry is proxy-shaped and answers.
+# This previously read `$HOME/.qontinui/coord-mcp-proxy-key`, a file NOTHING in
+# any repo writes (grep-verified: this reader was its only mention fleet-wide),
+# so door 1 was dead by construction and every /pr-status fallback fell through
+# to the acting-bearer door — which needs $COORD_AGENT_JWT and is normally unset
+# too. Same candidate ORDER as `/gate` Step 2 and coord-revive.sh; the dedup key
+# differs deliberately — see the (url, key) note at the loop below.
+# Workspace root via `--git-common-dir`, NOT `--show-toplevel`: inside a LINKED
+# GIT WORKTREE the latter returns the worktree's own path, whose parent is the
+# worktree container (`agent-worktrees/<uuid>`, `.claude/worktrees`) — a
+# directory holding no repo `.mcp.json`, so the sweep would probe ZERO doors and
+# report "unreachable" while a live door sits at the real root. Sessions run
+# under QONTINUI_AGENT_WORKTREE_MODE=1, so that is the common path. Same
+# resolution as `/gate` Step 2 and coord-revive.sh (fixed there in PR #161).
+ROOT="${QONTINUI_ROOT:-}"
+if [[ -z "$ROOT" ]]; then
+  for anchor in "$PWD" "$HERE"; do
+    GC="$(cd "$anchor" 2>/dev/null && git rev-parse --git-common-dir 2>/dev/null)" || continue
+    [[ -n "$GC" ]] || continue
+    GC="$(cd "$anchor" 2>/dev/null && cd "$GC" 2>/dev/null && pwd)" || continue
+    [[ -n "$GC" ]] || continue
+    ROOT="$(dirname "$(dirname "$GC")")"
+    break
+  done
+fi
+if [[ -z "$ROOT" || "$ROOT" == "." ]]; then ROOT="$PWD"; fi
+
+MAX_DOORS=10
+SEEN=""
+DOORS=0
+CANDIDATES=0
+for CFG in "$PWD/.mcp.json" "$ROOT/.mcp.json" "$ROOT"/*/.mcp.json; do
+  [[ -r "$CFG" ]] || continue
+  # Feed jq via stdin — bash opens the file, so no path ever crosses to the
+  # NATIVE jq. Passing "$CFG" as an argument dies under an inherited
+  # MSYS_NO_PATHCONV=1 (POSIX-spelled path, unconverted, unopenable), and the
+  # failed command substitution then kills the WHOLE script under `set -e`,
+  # exit 2, before a single door is probed. `|| true` keeps a malformed
+  # .mcp.json from doing the same — a bad candidate is skipped, not fatal.
+  # Reader-agnostic, mirroring coord-revive.sh's read_cfg(). A bare `jq` here
+  # was the same silent-empty bug one directory over: with jq absent, `|| true`
+  # made URL and KEY empty, EVERY candidate was skipped as "no proxy-shaped
+  # coord-mcp entry", and the script reported "probed 0 doors" — a confident
+  # nothing-found over doors that were live. It reads as a CONFIG problem.
+  #
+  # BOTH header shapes. Plan 2026-08-20-coord-mcp-reconnect-dcr-and-restart-orphaning
+  # Phase 2 moves the proxy nonce from the custom `X-Coord-Mcp-Proxy-Key` header
+  # into `Authorization: Bearer <nonce>` (a custom header makes the MCP client
+  # attach an OAuth provider, so a stale-key 401 escalates into discovery + DCR,
+  # which the runner 404s). The server keeps accepting the legacy header, so both
+  # shapes coexist on disk indefinitely — configs are rewritten only on session
+  # spawn. `Authorization` wins when both are present, mirroring the runner's own
+  # precedence; the value is kept VERBATIM (`Bearer ` prefix included) so the
+  # replay is byte-identical to what the client sends.
+  KEYHDR="X-Coord-Mcp-Proxy-Key"
+  if [ "$JSON_READER" = jq ]; then
+    URL="$(jq -r '.mcpServers["coord-mcp"].url // ""' < "$CFG" 2>/dev/null || true)"
+    KEY="$(jq -r '(.mcpServers["coord-mcp"].headers // {}) as $h
+      | if (($h.Authorization // "") | tostring) != "" then $h.Authorization
+        else ($h["X-Coord-Mcp-Proxy-Key"] // "") end' < "$CFG" 2>/dev/null || true)"
+    if jq -e '((.mcpServers["coord-mcp"].headers.Authorization // "") | tostring) != ""' < "$CFG" >/dev/null 2>&1; then
+      KEYHDR="Authorization"
+    fi
+  else
+    _triple="$("$JSON_READER" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print(); print(); print(); sys.exit(0)
+c=((d.get("mcpServers",{}) or {}).get("coord-mcp",{}) or {})
+h=(c.get("headers",{}) or {})
+authz=h.get("Authorization","") or ""
+legacy=h.get("X-Coord-Mcp-Proxy-Key","") or ""
+print(c.get("url","") or "")
+print(authz or legacy)
+print("Authorization" if authz else "X-Coord-Mcp-Proxy-Key")' < "$CFG" 2>/dev/null || true)"
+    # `tr -d '\r'` is NOT redundant: a NATIVE Windows python emits CRLF, so a CR
+    # surviving into $URL makes curl exit 3 with http_code 000, which classify()
+    # reports as UNREACHABLE — VERDICT DEAD over a live door.
+    URL="$(printf '%s\n' "$_triple" | sed -n '1p' | tr -d '\r')"
+    KEY="$(printf '%s\n' "$_triple" | sed -n '2p' | tr -d '\r')"
+    KEYHDR="$(printf '%s\n' "$_triple" | sed -n '3p' | tr -d '\r')"
+    [[ -n "$KEYHDR" ]] || KEYHDR="X-Coord-Mcp-Proxy-Key"
+  fi
+  case "$URL" in *"/coord-mcp"*) ;; *) continue ;; esac
+  [[ -n "$KEY" ]] || continue
+  # LOOPBACK ONLY. Before this sweep, door 1 was a hard-coded 127.0.0.1 URL;
+  # honouring an arbitrary `url` from any .mcp.json under the workspace would
+  # let a config that merely contains "/coord-mcp" answer with PR state — and
+  # `--mine` resolves author identity server-side from whatever device JWT the
+  # answering proxy injects, so a non-local door could render someone else's
+  # PRs as yours. The skill's contract is "never claim a status you did not
+  # read from the twin"; keep the door local, as it always was.
+  # The brackets in the IPv6 literal MUST be escaped: unescaped, `[::1]` is a
+  # case-pattern bracket EXPRESSION, which never matches the URL it is meant to
+  # allow and does match nonsense like `http://1:9876`.
+  case "$URL" in
+    http://127.0.0.1:*|http://localhost:*|'http://[::1]:'*) ;;
+    *) continue ;;
+  esac
+  # Dedup on (url, key), not on the config path: the fleet routinely has a dozen
+  # configs naming the SAME loopback port with DIFFERENT nonces (one-slot-
+  # per-workdir rotation), and exactly one of those keys is live — deduping by
+  # URL alone would try one key and give up. Path dedup, by contrast, prevented
+  # nothing: the duplicates are distinct files.
+  DOORKEY="$URL|$KEY"
+  case "$SEEN" in *"|$DOORKEY|"*) continue ;; esac
+  SEEN="${SEEN}|$DOORKEY|"
+  CANDIDATES=$((CANDIDATES + 1))
+  if (( DOORS >= MAX_DOORS )); then
+    note_fail "stopped after $MAX_DOORS doors (more candidates exist under $ROOT)"
+    break
+  fi
+  DOORS=$((DOORS + 1))
+  HDRPATH="$(stage_header "$KEYHDR" "$KEY")" || {
+    note_fail "could not stage the proxy-key header under ${TMPDIR:-/tmp} (LOCAL fault)"
+    break
+  }
+  # --connect-timeout (inside call_door) bounds a firewalled/hung port:
+  # without it, ten doors at -m 20 each can outlast the caller's own timeout
+  # and look like a hang.
+  call_door "$URL" || true
+done
+
+# "Every door refused" and "there were no doors" are different failures with
+# different fixes, and only the first is about coord. Without this note the
+# final line carries the acting-bearer note alone and reads as though the
+# loopback half of the cascade was tried and lost, when it never ran at all.
+# coord-revive.sh reports the same fact as its DOORS_PROBED count.
+if (( CANDIDATES == 0 )); then
+  note_fail "no proxy-shaped coord-mcp door found under $ROOT (loopback sweep probed 0 doors — set \$QONTINUI_ROOT, or no runner has written an .mcp.json here)"
+fi
+
+# ----- 2) direct coord MCP with an acting-bearer token ------------------------
+# Resolved by __resolve_fleet_script above rather than by the two fixed rungs
+# this loop used to spell inline — see that function's header for why those two
+# refuse from inside an ordinary repo checkout, which is where this skill runs.
+#
+# The helper's EXIT CODE is the diagnosis and must not be discarded: it is a
+# typed contract (0 ok; 2 no agent JWT; 3 coord mint failed; 127 missing
+# jq/curl), and coord-revive.sh — the sibling this script mirrors — maps all
+# four to named causes. Collapsing them into one "$COORD_AGENT_JWT unset"
+# message is the confidently-wrong-verdict failure mode the rest of this
+# cascade was built to eliminate: a MISSING HELPER, a coord-side mint refusal
+# and a missing `jq` each got reported as an unset env var, sending the reader
+# to set a variable that was never the problem. HELPER_NOT_FOUND now names its
+# whole search for that same reason: it is a LOCAL path fault, and the reader
+# has to be able to see that it says nothing about coord.
+__resolve_fleet_script "coord-acting-bearer.sh"; BEARER_SH="$__RFS_PATH"
+
+TOKEN=""
+if [[ -z "$BEARER_SH" ]]; then
+  note_fail "HELPER_NOT_FOUND (coord-acting-bearer.sh: $(__fleet_script_searched "coord-acting-bearer.sh")) — a LOCAL path fault, not a door verdict"
+else
+  # `|| RC=$?` keeps `set -e` from aborting on the helper's typed non-zero exits.
+  RC=0
+  TOKEN="$(bash "$BEARER_SH" 2>/dev/null | tr -d '\r\n')" || RC=$?
+  if (( RC != 0 )) || [[ -z "$TOKEN" ]]; then
+    TOKEN=""
+    case "$RC" in
+      0)   note_fail "MINT_EMPTY (coord-acting-bearer.sh exited 0 but printed no token)" ;;
+      2)   note_fail "NO_TOKEN (\$COORD_AGENT_JWT unset/empty — it is the helper's only credential source)" ;;
+      3)   note_fail "MINT_FAILED (coord rejected or never answered the acting-user mint — device unknown / no bound user / coord down)" ;;
+      127) note_fail "HELPER_DEPS_MISSING (coord-acting-bearer.sh: curl missing, or no working JSON reader)" ;;
+      *)   note_fail "HELPER_FAILED (coord-acting-bearer.sh exit $RC)" ;;
+    esac
+  fi
+fi
+
+if [[ -n "$TOKEN" ]]; then
+  if HDRPATH="$(stage_header "Authorization" "Bearer ${TOKEN}")"; then
+    # Bearer door: a 401 here means a REJECTED BEARER, not a stale proxy key.
+    # Same parameterisation coord-revive.sh uses, so the two agree on cause.
+    call_door "${COORD_URL}/mcp" "BEARER_UNAUTHORIZED (coord rejected the bearer)" || true
+  else
+    note_fail "could not stage the bearer header under ${TMPDIR:-/tmp} (LOCAL fault)"
+  fi
+fi
+
+# Name WHY, never just "unreachable": the collected notes distinguish a local
+# fault of this script's own plumbing from coord actually being unreachable.
+# And STAMP it: this line is a capability-floor claim, and a pasted one with
+# no probe time reads as present tense forever (check #60, plan
+# 2026-09-03-capability-floor-claims-carry-their-probe).
+echo "error: coord_pr_status unreachable via loopback proxy or acting-bearer (probed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)) — call the native MCP tool from the session instead${FAILNOTE:+ [$FAILNOTE]}" >&2
+exit 1
