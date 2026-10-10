@@ -741,6 +741,12 @@ services:
       # independent of any production tenant membership. Matches the
       # convention Start-LocalCoord already uses for the VerifyWeb coord.
       COORD_SSO_DEFAULT_TENANT: ${COORD_SSO_DEFAULT_TENANT:-default}
+      # Deployment profile (plan 2026-10-10-spec-front-end-phase-9-generic-boundary
+      # C7). `hosted` (default): the six egress_* fleet-policy domains — the
+      # outbound data flows a runner sends off its machine — default ON.
+      # `self_hosted`: they default OFF until a tenant admin turns one on. Any
+      # other value refuses coord startup.
+      COORD_DEPLOYMENT_PROFILE: ${COORD_DEPLOYMENT_PROFILE:-hosted}
       # JWT signing key persistence — found 2026-08-24 alongside the OIDC gap
       # above: coord's default key path is under $HOME
       # (~/.qontinui/coord-jwt-ed25519.pkcs8, jwt.rs::key_path), which is
