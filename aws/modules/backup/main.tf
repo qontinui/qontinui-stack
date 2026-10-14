@@ -44,8 +44,10 @@
 #   - On this single-AZ instance each snapshot starts with a brief I/O
 #     suspension, "a few seconds to a few minutes" (RDS, "Creating a DB
 #     snapshot"). It then completes in the background. The automated backups
-#     measured 27-40 min end to end (RDS events, 2026-10-08 to 10-14), well
-#     inside completion_window, which counts from the scheduled time.
+#     measured 28-40 min end to end (RDS events, 2026-10-08 to 10-14), well
+#     inside completion_window. That window counts from when the job STARTS,
+#     not from the scheduled time ("after a backup job is successfully
+#     started", AWS Backup API, CompletionWindowMinutes).
 #
 # The alarms are keyed to the schedule's cadence. CloudWatch caps an alarm's
 # evaluation window at 7 days, so no "nothing completed for N hours" alarm can

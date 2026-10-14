@@ -75,7 +75,7 @@ output "rds_endpoint" {
 }
 
 output "rds_backup" {
-  description = "Off-instance RDS backups (modules/backup): the vault in this region, the copy vault and its region, the AWS Backup role a restore job passes, the schedule's cadence (which picks the alarm set) and whether the plan is on. Read by restores and drills (qontinui-coord docs/dr-runbook.md)."
+  description = "Off-instance RDS backups (modules/backup): the vault in this region, the copy vault and its region, the AWS Backup role a restore job passes, the schedule's cadence (which picks the alarm set) and whether the plan is on. Read by restores and drills (aws/README.md, \"Restoring\"; qontinui-coord docs/dr-runbook.md is pending its Phase 5 rewrite)."
   value = {
     vault        = module.backup.vault_name
     dr_vault     = module.backup.dr_vault_name

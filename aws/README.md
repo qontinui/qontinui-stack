@@ -140,7 +140,7 @@ snapshotted, so on the daily cadence a pause past 07:00 UTC
 ## Backups and DR
 
 The database (`qontinui_db` on RDS `qontinui-<env>`) has three backup tiers.
-Restores are in qontinui-coord `docs/dr-runbook.md`.
+How to restore from them is under **Restoring** below.
 
 | Tier | Where | Kept | Survives deleting the instance? |
 |------|-------|------|---------------------------------|
@@ -151,6 +151,30 @@ Restores are in qontinui-coord `docs/dr-runbook.md`.
 A `terraform destroy` also takes a final snapshot, `qontinui-<env>-final`
 (`skip_final_snapshot = false`). The CLI takes one only when given
 `--final-db-snapshot-identifier`.
+
+**Restoring.** qontinui-coord `docs/dr-runbook.md` is pending its rewrite
+(Phase 5 of plan `2026-10-14-coord-database-is-one-command-from-total-loss`).
+Until then, do not follow it for this database. It names
+`qontinui-coord-staging-pg` and `qontinui_coord`, which do not exist, and it
+has no AWS Backup restore procedure. To restore a vault recovery point into a
+NEW instance:
+
+1. Pick a recovery point:
+   `aws backup list-recovery-points-by-backup-vault --backup-vault-name qontinui-<env>-rds`.
+2. Read its restore metadata:
+   `aws backup get-recovery-point-restore-metadata --backup-vault-name qontinui-<env>-rds --recovery-point-arn <arn>`.
+3. Start the restore:
+   `aws backup start-restore-job --resource-type RDS --recovery-point-arn <arn> --iam-role-arn <role> --metadata file://<metadata.json>`.
+   The metadata is step 2's output with a new `DBInstanceIdentifier` and
+   three values set:
+   - `DBParameterGroupName` = `qontinui-<env>-pg16`;
+   - `DBSubnetGroupName` = `qontinui-<env>-pg`;
+   - `VpcSecurityGroupIds` = the id of the `qontinui-<env>-data-plane`
+     security group.
+
+The `rds_backup` output gives the vault names, the DR region and `role_arn`.
+A restore from the DR vault runs in that region, where none of those three
+objects exists (2026-10-14).
 
 **Deletion protection** is on (`modules/postgres` `deletion_protection`,
 default true). It is the only barrier that holds for every caller: RDS refuses
@@ -166,7 +190,7 @@ To tear an environment down on purpose:
 **What a snapshot costs the instance.** The instance is single-AZ, so each
 snapshot starts with a brief I/O suspension, "a few seconds to a few
 minutes" (RDS, "Creating a DB snapshot"). The snapshot then completes in the
-background; the automated backups measure 27-40 min end to end. The AWS
+background; the automated backups measure 28-40 min end to end. The AWS
 Backup job at 07:00 UTC adds one such suspension a day, clear of the
 03:00-04:00 backup window and the Sunday 04:30-05:30 maintenance window.
 

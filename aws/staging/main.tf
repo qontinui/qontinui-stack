@@ -105,8 +105,8 @@ module "postgres" {
 # recurring cost and the off-switch are on
 # var.postgres_offinstance_backup_enabled. A providers map turns off implicit
 # inheritance of the default provider, so BOTH mappings are passed. Plan
-# 2026-10-14-coord-database-is-one-command-from-total-loss; restores:
-# qontinui-coord docs/dr-runbook.md.
+# 2026-10-14-coord-database-is-one-command-from-total-loss. Restores: aws/README.md,
+# "Restoring" (qontinui-coord docs/dr-runbook.md is pending its Phase 5 rewrite).
 
 module "backup" {
   source = "../modules/backup"
