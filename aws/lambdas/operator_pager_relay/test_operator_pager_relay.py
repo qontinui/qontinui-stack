@@ -363,7 +363,8 @@ def test_function_timeout_exceeds_the_worst_case_delivery():
 
     tf = (Path(__file__).resolve().parents[2] / "modules/operator-pager/main.tf").read_text()
     timeout = int(re.search(r"(?m)^\s*timeout\s*=\s*(\d+)", tf).group(1))
-    assert relay.WORST_CASE_DELIVERY_SECONDS == 3 * (5 + 8) + 5
+    # One alarm-history read (Phase 2), the primary twice, the fallback once, one retry wait.
+    assert relay.WORST_CASE_DELIVERY_SECONDS == 4 * (5 + 8) + 5
     assert timeout > relay.WORST_CASE_DELIVERY_SECONDS
 
 
@@ -481,3 +482,291 @@ def test_dropped_message_emits_a_dropped_metric_and_no_delivery():
     assert rec["outcome"] == "dropped" and primary.calls == 0
     metric = [e for e in emitted if "_aws" in e][0]
     assert metric["Dropped"] == 1 and metric["Reason"] == "condition_not_in_five"
+
+
+# --- Phase 2: composite drills, EventBridge documents --------------------------------------------------
+
+COMPOSITE = "qontinui-staging-pager-coord-crash-loop"
+DRILL_CHILD = COMPOSITE + "-drill"
+REAL_CHILD = "qontinui-staging-pager-coord-abnormal-exits"
+COMPOSITE_MAP = {
+    COMPOSITE: {
+        "condition": "leader_crash_loop",
+        "title": "coord tasks are crash-looping",
+        "remediation": "ECS restarts tasks",
+        "drill_child": DRILL_CHILD,
+    }
+}
+
+
+def composite_msg(children=None, reason="", new="ALARM", old="OK"):
+    """The composite notification shape the relay parses. Phase 2's post-apply drill captures a real
+    one and pins this fixture to it (plan D16); until then it follows the documented fields."""
+    msg = {
+        "AlarmName": COMPOSITE,
+        "AlarmRule": f'ALARM("{REAL_CHILD}") OR ALARM("{DRILL_CHILD}")',
+        "NewStateValue": new,
+        "OldStateValue": old,
+        "NewStateReason": reason,
+        "StateChangeTime": "2026-10-14T12:00:00.000+0000",
+    }
+    if children is not None:
+        msg["TriggeringChildren"] = [
+            {"Arn": f"arn:aws:cloudwatch:us-east-1:047719635665:alarm:{c}", "State": {"Value": "ALARM"}} for c in children
+        ]
+    return json.dumps(msg)
+
+
+def test_composite_triggered_only_by_its_drill_child_is_a_drill_with_the_id_from_history():
+    out = relay.parse_message(composite_msg(children=[DRILL_CHILD]), COMPOSITE_MAP, history=lambda n: "drill-77" if n == DRILL_CHILD else None)
+    assert (out.kind, out.drill_id, out.drill_lookup) == ("drill", "drill-77", "notification")
+
+
+def test_composite_with_a_real_child_triggering_is_a_real_page_even_during_a_drill():
+    out = relay.parse_message(composite_msg(children=[DRILL_CHILD, REAL_CHILD]), COMPOSITE_MAP, history=lambda n: "drill-77")
+    assert (out.kind, out.drill_id) == ("page", None)
+
+
+def test_composite_drill_child_named_in_the_reason_is_a_drill():
+    reason = f"arn:aws:cloudwatch:us-east-1:047719635665:alarm:{DRILL_CHILD} transitioned to ALARM at 12:00"
+    out = relay.parse_message(composite_msg(reason=reason), COMPOSITE_MAP, history=lambda n: None)
+    assert (out.kind, out.drill_id) == ("drill", "unknown")
+
+
+def test_composite_naming_no_child_asks_the_drill_childs_history():
+    seen = []
+
+    def history(name):
+        seen.append(name)
+        return "drill-88"
+
+    out = relay.parse_message(composite_msg(), COMPOSITE_MAP, history=history)
+    assert seen == [DRILL_CHILD]
+    assert (out.kind, out.drill_id, out.drill_lookup) == ("drill", "drill-88", "history")
+    out = relay.parse_message(composite_msg(), COMPOSITE_MAP, history=lambda n: None)
+    assert (out.kind, out.drill_lookup) == ("page", "history")
+
+
+def test_composite_with_unreadable_history_pages_as_real_and_says_so():
+    def history(name):
+        raise RuntimeError("AccessDenied")
+
+    out = relay.parse_message(composite_msg(), COMPOSITE_MAP, history=history)
+    assert (out.kind, out.drill_lookup) == ("page", "failed")
+    assert "could not be read" in out.what
+
+
+def test_composite_ok_after_alarm_is_resolved_without_a_history_read():
+    calls = []
+    out = relay.parse_message(composite_msg(new="OK", old="ALARM"), COMPOSITE_MAP, history=lambda n: calls.append(n))
+    assert out.kind == "resolved" and calls == []
+
+
+class _HistoryClient:
+    def __init__(self, items):
+        self.items = items
+        self.kwargs = None
+
+    def describe_alarm_history(self, **kw):
+        self.kwargs = kw
+        return {"AlarmHistoryItems": self.items}
+
+
+def _item(new_value, reason):
+    return {"HistoryData": json.dumps({"oldState": {"stateValue": "OK"}, "newState": {"stateValue": new_value, "stateReason": reason}})}
+
+
+def test_drill_id_from_history_reads_the_newest_drill_alarm_transition():
+    client = _HistoryClient([_item("OK", "Threshold Crossed: no datapoints"), _item("ALARM", "DRILL drill-99"), _item("ALARM", "DRILL drill-old")])
+    assert relay.drill_id_from_history(DRILL_CHILD, client_factory=lambda: client, now=lambda: 1_760_000_000.0) == "drill-99"
+    assert client.kwargs["AlarmName"] == DRILL_CHILD and client.kwargs["HistoryItemType"] == "StateUpdate"
+
+
+def test_drill_id_from_history_without_a_drill_transition_is_none():
+    client = _HistoryClient([_item("ALARM", "Threshold Crossed: 3 datapoints"), _item("OK", "back")])
+    assert relay.drill_id_from_history(DRILL_CHILD, client_factory=lambda: client, now=lambda: 1_760_000_000.0) is None
+
+
+def test_latest_alarm_only_reads_the_newest_alarm_transition_alone():
+    client = _HistoryClient([_item("ALARM", "Threshold Crossed: 3 datapoints"), _item("ALARM", "DRILL drill-old")])
+    assert relay.drill_id_from_history(ALARM, client_factory=lambda: client, now=lambda: 1.0, latest_alarm_only=True) is None
+    assert relay.drill_id_from_history(ALARM, client_factory=lambda: client, now=lambda: 1.0) == "drill-old"
+    client = _HistoryClient([_item("OK", "back"), _item("ALARM", "DRILL drill-5")])
+    assert relay.drill_id_from_history(ALARM, client_factory=lambda: client, now=lambda: 1.0, latest_alarm_only=True) == "drill-5"
+
+
+def test_a_drilled_metric_alarm_returning_to_ok_is_ignored_not_sent():
+    out = relay.parse_message(alarm_msg(new="OK", old="ALARM", reason="Threshold Crossed: back"), ALARM_MAP, last_alarm_drill=lambda n: "drill-5" if n == ALARM else None)
+    assert isinstance(out, relay.Dropped) and out.reason == "drill_returned_to_ok" and out.benign
+
+
+def test_a_metric_alarm_returning_from_a_real_alarm_or_an_unreadable_history_is_resolved():
+    real = relay.parse_message(alarm_msg(new="OK", old="ALARM"), ALARM_MAP, last_alarm_drill=lambda n: None)
+    assert isinstance(real, relay.Page) and real.kind == "resolved"
+
+    def unreadable(name):
+        raise RuntimeError("AccessDenied")
+
+    out = relay.parse_message(alarm_msg(new="OK", old="ALARM"), ALARM_MAP, last_alarm_drill=unreadable)
+    assert isinstance(out, relay.Page) and out.kind == "resolved"
+
+
+def test_a_composite_returning_to_ok_does_not_read_the_metric_history():
+    calls = []
+    out = relay.parse_message(composite_msg(new="OK", old="ALARM"), COMPOSITE_MAP, history=lambda n: None, last_alarm_drill=lambda n: calls.append(n) or "drill-1")
+    assert isinstance(out, relay.Page) and out.kind == "resolved" and calls == []
+
+
+def test_process_record_checks_a_metric_return_against_the_newest_alarm_transition(monkeypatch):
+    seen = []
+
+    def fake_history(name, latest_alarm_only=False, **kw):
+        seen.append((name, latest_alarm_only))
+        return "drill-5"
+
+    monkeypatch.setattr(relay, "drill_id_from_history", fake_history)
+    primary = FakeAdapter("sns_forward", [])
+    rec = relay.process_record(
+        {"Sns": {"MessageId": "m-r", "Message": alarm_msg(new="OK", old="ALARM")}},
+        {"PAGER_ALARM_MAP": json.dumps(ALARM_MAP)},
+        primary,
+        primary,
+        now=lambda: 1.0,
+        emit=lambda e: None,
+    )
+    assert (rec["outcome"], rec["reason"]) == ("ignored", "drill_returned_to_ok")
+    assert seen == [(ALARM, True)] and primary.calls == 0
+
+
+def test_cloudwatch_client_makes_one_attempt_with_bounded_timeouts(monkeypatch):
+    import types
+
+    made = {}
+
+    class Config:
+        def __init__(self, **kw):
+            self.kw = kw
+
+    class Client:
+        def describe_alarm_history(self, **kw):
+            return {"AlarmHistoryItems": []}
+
+    def client(service, **kw):
+        made["service"], made["config"] = service, kw.get("config")
+        return Client()
+
+    botocore = types.ModuleType("botocore")
+    botocore_config = types.ModuleType("botocore.config")
+    botocore_config.Config = Config
+    boto3 = types.ModuleType("boto3")
+    boto3.client = client
+    monkeypatch.setitem(sys.modules, "boto3", boto3)
+    monkeypatch.setitem(sys.modules, "botocore", botocore)
+    monkeypatch.setitem(sys.modules, "botocore.config", botocore_config)
+
+    assert relay.drill_id_from_history(DRILL_CHILD, now=lambda: 1.0) is None
+    assert made["service"] == "cloudwatch" and isinstance(made["config"], Config)
+    assert made["config"].kw == {"retries": {"max_attempts": 1, "mode": "standard"}, "connect_timeout": 5, "read_timeout": 8}
+
+
+def test_drill_id_from_history_ignores_a_marker_on_a_non_alarm_transition():
+    client = _HistoryClient([_item("OK", "DRILL drill-on-ok")])
+    assert relay.drill_id_from_history(DRILL_CHILD, client_factory=lambda: client, now=lambda: 1_760_000_000.0) is None
+
+
+def deploy_doc(event_source="aws.ecs", reason="ECS deployment circuit breaker: tasks failed to start."):
+    return json.dumps(
+        {
+            "page_version": 1,
+            "kind": "page",
+            "condition": "deploy_failed",
+            "source": "eventbridge",
+            "event_source": event_source,
+            "event_id": "evt-1",
+            "event_time": "2026-10-14T12:00:00Z",
+            "aws": {
+                "service": "arn:aws:ecs:us-east-1:047719635665:service/qontinui-staging/coord",
+                "deployment": "ecs-svc/123",
+                "event": "SERVICE_DEPLOYMENT_FAILED",
+                "reason": reason,
+            },
+            "title": "ECS deployment failed",
+            "remediation": {"name": "ECS deployment circuit breaker", "state": "rolls back to the last good task set"},
+        }
+    )
+
+
+def test_ecs_deployment_failure_renders_what_happened_from_structured_fields():
+    out = relay.parse_message(deploy_doc(), {})
+    assert out.kind == "page" and out.condition == "deploy_failed"
+    assert "SERVICE_DEPLOYMENT_FAILED for service coord (deployment ecs-svc/123)" in out.what
+    assert "circuit breaker" in relay.render(out).body
+
+
+def test_ecs_deployment_drill_takes_its_id_from_the_drill_reason():
+    out = relay.parse_message(deploy_doc(event_source="qontinui.drill", reason="DRILL drill-55"), {})
+    assert (out.kind, out.drill_id) == ("drill", "drill-55")
+
+
+def rds_doc(event_id="RDS-EVENT-0225", event_source="aws.rds", message="Allocated storage size 160 GB is approaching the maximum storage threshold 200 GB. Increase the maximum storage threshold."):
+    return json.dumps(
+        {
+            "page_version": 1,
+            "kind": "page",
+            "condition": "storage_or_iops",
+            "source": "eventbridge",
+            "event_source": event_source,
+            "event_id": "evt-2",
+            "event_time": "2026-10-14T12:00:00Z",
+            "aws": {"rds_event_id": event_id, "instance": "qontinui-staging", "message": message},
+            "title": "RDS storage event",
+        }
+    )
+
+
+def test_rds_storage_event_renders_the_relays_neutral_words_not_awss_imperative():
+    out = relay.parse_message(rds_doc(), {})
+    r = relay.render(out)
+    assert "approaching the storage autoscaling maximum" in r.body
+    assert "Increase" not in r.body
+    assert r.asks is False
+
+
+@pytest.mark.parametrize("event_id", ["RDS-EVENT-0225", "RDS-EVENT-0224", "RDS-EVENT-0223", "RDS-EVENT-0007", "RDS-EVENT-0089", "RDS-EVENT-0222", "RDS-EVENT-0221"])
+def test_every_admitted_rds_event_has_a_description(event_id):
+    assert event_id in relay.RDS_STORAGE_EVENTS
+    out = relay.parse_message(rds_doc(event_id=event_id), {})
+    assert "an RDS storage event the pager does not describe" not in out.what
+
+
+def test_rds_drill_takes_its_id_from_the_message():
+    out = relay.parse_message(rds_doc(event_source="qontinui.drill", message="DRILL drill-66"), {})
+    assert (out.kind, out.drill_id) == ("drill", "drill-66")
+
+
+def test_an_alarm_record_keeps_the_notification_fields_for_the_composite_capture():
+    emitted = []
+    primary = FakeAdapter("sns_forward", [accepted("mid-c")])
+    raw = json.loads(composite_msg(children=[DRILL_CHILD]))
+    raw["AlarmDescription"] = "not kept"
+    raw["AWSAccountId"] = "047719635665"
+    rec = relay.process_record(
+        {"Sns": {"MessageId": "m-c", "Message": json.dumps(raw)}},
+        {"PAGER_ALARM_MAP": json.dumps(COMPOSITE_MAP)},
+        primary,
+        primary,
+        now=lambda: 1_760_000_000.0,
+        emit=emitted.append,
+        history=lambda n: "drill-c",
+    )
+    assert rec["notification"]["TriggeringChildren"][0]["Arn"].endswith(DRILL_CHILD)
+    assert set(rec["notification"]) <= set(relay.NOTIFICATION_KEYS)
+    assert "AlarmDescription" not in rec["notification"]
+    assert (rec["kind"], rec["drill_id"]) == ("drill", "drill-c")
+
+
+def test_a_document_record_carries_no_notification():
+    emitted = []
+    primary = FakeAdapter("sns_forward", [accepted()])
+    rec = relay.process_record({"Sns": {"MessageId": "m-d", "Message": doc()}}, {}, primary, primary, now=lambda: 1.0, emit=emitted.append)
+    assert "notification" not in rec

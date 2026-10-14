@@ -348,6 +348,14 @@ module "operator_pager" {
   coord_task_role_arn = module.coord.task_role_arn
   enabled             = var.operator_pager_enabled
   adapter             = var.operator_pager_adapter
+
+  # Phase 2: the AWS-side detectors (crash loop, deploy failed, database storage and IOPS).
+  alb_arn_suffix               = module.tunnel.alb_arn_suffix
+  coord_tg_arn_suffix          = module.coord.target_group_arn_suffix
+  coord_cluster_name           = module.coord.cluster_name
+  coord_service_name           = module.coord.service_name
+  web_service_name             = module.web.service_name
+  postgres_instance_identifier = module.postgres.identifier
 }
 
 # ─── Observability (CloudWatch alarms for coord) ────────────────────────

@@ -49,3 +49,36 @@ variable "relay_log_retention_days" {
   type        = number
   default     = 90
 }
+
+# ─── Phase 2: the AWS-side detectors ────────────────────────────────────
+
+variable "alb_arn_suffix" {
+  description = "The ALB's arn_suffix, for coord's HealthyHostCount and TargetResponseTime."
+  type        = string
+}
+
+variable "coord_tg_arn_suffix" {
+  description = "coord's target group arn_suffix."
+  type        = string
+}
+
+variable "coord_cluster_name" {
+  description = "The ECS cluster coord and web run in."
+  type        = string
+}
+
+variable "coord_service_name" {
+  description = "coord's ECS service name (the ECS task group is service:<name>)."
+  type        = string
+}
+
+variable "web_service_name" {
+  description = "web's ECS service name. A failed web deployment pages deploy_failed too."
+  type        = string
+}
+
+variable "postgres_instance_identifier" {
+  description = "The RDS instance whose storage, IOPS and storage events page."
+  type        = string
+}
+

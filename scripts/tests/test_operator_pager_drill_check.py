@@ -73,3 +73,13 @@ def test_main_exit_codes(monkeypatch, capsys):
     assert check.main(["--drill-id", "d-1", "--conditions", "deploy_failed"]) == 1
     monkeypatch.setattr(sys, "stdin", io.StringIO("not json"))
     assert check.main(["--drill-id", "d-1", "--conditions", "deploy_failed"]) == 2
+
+
+def test_alarm_drill_is_judged_per_alarm_because_two_alarms_share_a_condition():
+    alarms = ["qontinui-staging-pager-rds-free-storage", "qontinui-staging-pager-rds-saturation"]
+    doc = events(
+        {"record": "operator_pager_relay", "condition": "storage_or_iops", "alarm": alarms[0], "outcome": "accepted", "drill_id": "d-1"},
+    )
+    ok, best = check.verdict(check.relay_records(doc), "d-1", alarms, key="alarm")
+    assert ok is False
+    assert best == {alarms[0]: "accepted", alarms[1]: "missing"}

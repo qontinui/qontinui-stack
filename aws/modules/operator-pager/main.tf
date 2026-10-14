@@ -2,8 +2,8 @@
 #
 # Plan 2026-10-14-coord-pages-the-operator-for-five-conditions-and-names-the-agent-fixing-each.
 # Phase 1 (this file): the SNS topic every pager source publishes to, and the relay Lambda that is
-# its only subscriber (decisions D2 and D4). Phase 2 adds the AWS-side detectors and coord's grants
-# in sibling files of this module. Phase 6 switches the relay's adapter to the operator's vendor.
+# its only subscriber (decisions D2 and D4). Phase 2: the AWS-side detectors (alarms.tf, events.tf)
+# and coord's grants (iam_coord.tf). Phase 6 switches the relay's adapter to the operator's vendor.
 #
 # What pages: at most five conditions (train stalled, coord crash loop, deploy failed, database
 # storage or IOPS, GitHub API budget exhausted). The cap is enforced in three places: coord's operator
@@ -32,9 +32,9 @@ locals {
 
   coord_deploy_role_arn = "arn:${local.partition}:iam::${local.account}:role/${var.coord_deploy_role_name}"
 
-  # Alarm name -> { condition, title, remediation }. The relay looks every CloudWatch notification up
-  # here; an alarm missing from the map is dropped. Phase 2 fills it with this module's own alarms.
-  pager_alarm_map = {}
+  # Alarm name -> { condition, title, remediation, drill_child }. The relay looks every CloudWatch
+  # notification up here; an alarm missing from the map is dropped. Entries: alarms.tf.
+  pager_alarm_map = local.pager_alarm_entries
 }
 
 # ─── The topic ──────────────────────────────────────────────────────────
@@ -150,7 +150,10 @@ resource "aws_iam_role_policy_attachment" "relay_logs" {
 #   - read the operator-staged vendor key, and nothing else in Parameter Store. First used in Phase 6.
 #     With the Console's default key (alias/aws/ssm) no kms:Decrypt grant is needed: that AWS-managed
 #     key's policy admits account principals through SSM (plan D4);
-#   - send a failed invocation to the dead-letter queue (the async on-failure destination).
+#   - send a failed invocation to the dead-letter queue (the async on-failure destination);
+#   - read the alarm HISTORY of the pager's own alarms (Phase 2): a composite page is a drill when its
+#     `-drill` child triggered it, and the drill id lives in that child's history. Its current state
+#     cannot be used, because a metric alarm set by SetAlarmState returns to OK within seconds.
 data "aws_iam_policy_document" "relay" {
   statement {
     sid       = "ForwardPagesToTheEmailTopic"
@@ -166,6 +169,11 @@ data "aws_iam_policy_document" "relay" {
     sid       = "DeadLetterFailedInvocations"
     actions   = ["sqs:SendMessage"]
     resources = [aws_sqs_queue.relay_dlq.arn]
+  }
+  statement {
+    sid       = "ReadPagerAlarmHistoryForDrills"
+    actions   = ["cloudwatch:DescribeAlarmHistory"]
+    resources = ["arn:${local.partition}:cloudwatch:${local.region}:${local.account}:alarm:${local.pager_prefix}*"]
   }
 }
 
@@ -192,10 +200,11 @@ resource "aws_lambda_function" "relay" {
   role          = aws_iam_role.relay.arn
   runtime       = "python3.12"
   handler       = "relay.handler"
-  # Worst case: the primary twice and the fallback once, each bounded at 13 s by the SNS client's
-  # timeouts, plus one 5 s retry wait = 44 s (relay.WORST_CASE_DELIVERY_SECONDS; a test checks this
-  # value exceeds it). A timeout would leave no outcome record and invite a duplicate async retry.
-  timeout     = 60
+  # Worst case: one alarm-history read, then the primary twice and the fallback once, each call
+  # bounded at 13 s by the AWS clients' timeouts, plus one 5 s retry wait = 57 s
+  # (relay.WORST_CASE_DELIVERY_SECONDS; a test checks this value exceeds it). A timeout would leave
+  # no outcome record and invite a duplicate async retry.
+  timeout     = 90
   memory_size = 128
 
   filename         = data.archive_file.relay.output_path

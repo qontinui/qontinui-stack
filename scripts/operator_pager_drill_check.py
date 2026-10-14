@@ -43,21 +43,30 @@ def relay_records(doc: Any) -> Iterator[dict[str, Any]]:
             yield rec
 
 
-def verdict(records: Iterable[dict[str, Any]], drill_id: str, conditions: list[str], allow_fallback: bool = False) -> tuple[bool, dict[str, str]]:
-    """Per condition: the best outcome seen for this drill id. ``missing`` when none was seen."""
+def verdict(
+    records: Iterable[dict[str, Any]],
+    drill_id: str,
+    conditions: list[str],
+    allow_fallback: bool = False,
+    key: str = "condition",
+) -> tuple[bool, dict[str, str]]:
+    """Per key: the best outcome seen for this drill id. ``missing`` when none was seen.
+
+    ``key`` is the record field the drill is judged by: ``condition`` (the relay and rule drills), or
+    ``alarm`` (the alarm drill, where two pager alarms page the same condition)."""
     passing = PASSING + (("fallback",) if allow_fallback else ())
     rank = {"accepted": 3, "fallback": 2, "rejected": 1, "dropped": 0}
     best: dict[str, str] = {c: "missing" for c in conditions}
     for rec in records:
         if rec.get("drill_id") != drill_id:
             continue
-        cond = rec.get("condition")
-        key = cond if cond is not None else "summary"
-        if key not in best:
+        value = rec.get(key)
+        slot = value if value is not None else "summary"
+        if slot not in best:
             continue
         outcome = str(rec.get("outcome"))
-        if rank.get(outcome, -1) > rank.get(best[key], -1):
-            best[key] = outcome
+        if rank.get(outcome, -1) > rank.get(best[slot], -1):
+            best[slot] = outcome
     ok = all(v in passing for v in best.values())
     return ok, best
 
@@ -67,6 +76,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--drill-id", required=True)
     ap.add_argument("--conditions", required=True, help="comma-separated; 'summary' names the drill summary")
     ap.add_argument("--allow-fallback", action="store_true")
+    ap.add_argument("--key", choices=("condition", "alarm"), default="condition")
     args = ap.parse_args(argv)
     conditions = [c for c in (s.strip() for s in args.conditions.split(",")) if c]
     if not conditions:
@@ -77,7 +87,7 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(f"operator_pager_drill_check: stdin is not JSON ({exc})", file=sys.stderr)
         return 2
-    ok, best = verdict(relay_records(doc), args.drill_id, conditions, args.allow_fallback)
+    ok, best = verdict(relay_records(doc), args.drill_id, conditions, args.allow_fallback, args.key)
     for cond in conditions:
         print(f"{cond:26s} {best[cond]}")
     print(f"drill {args.drill_id}: {'PASS' if ok else 'NOT ACCEPTED'}")

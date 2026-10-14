@@ -1,7 +1,7 @@
 """Operator pager relay — the one subscriber of ``qontinui-<env>-operator-pager``.
 
 Plan ``2026-10-14-coord-pages-the-operator-for-five-conditions-and-names-the-agent-fixing-each``,
-Phase 1 (decisions D2, D4, D7 and D16).
+Phases 1 and 2 (decisions D2, D4, D7, D10 and D16).
 
 What it does
 ------------
@@ -18,8 +18,10 @@ subscriber. For each message it:
 
 2. drops it unless its condition is one of the FIVE (D7). This is the cap's second layer: coord
    enforces it first, and the topic policy admits only ``qontinui-<env>-pager-*`` alarms and rules;
-3. decides whether it is a drill (D16): ``DRILL <id>`` in a metric alarm's state reason, or a
-   ``qontinui.drill`` event source, or a document that says ``kind: drill``;
+3. decides whether it is a drill (D16): ``DRILL <id>`` in a metric alarm's state reason; for a
+   composite alarm, its ``-drill`` child being the only child that triggered it (read from the
+   notification, else from that child's alarm history); a ``qontinui.drill`` event source; or a
+   document that says ``kind: drill``;
 4. renders one page (title <= 250 characters, body <= 1,024) that always ends with "No action needed
    from you." A page informs; it never asks (``decision_record/operational-work-is-autonomous``);
 5. delivers through the configured adapter, retrying a transient failure once after at least five
@@ -125,9 +127,44 @@ SNS_CLIENT_CONFIG: dict[str, Any] = {
     "connect_timeout": 5,
     "read_timeout": 8,
 }
-#: The longest ``deliver`` can take: the primary twice, the fallback once, one retry wait. The
-#: function timeout in ``aws/modules/operator-pager/main.tf`` must exceed it (a test reads both).
-WORST_CASE_DELIVERY_SECONDS = 3 * (SNS_CLIENT_CONFIG["connect_timeout"] + SNS_CLIENT_CONFIG["read_timeout"]) + MIN_RETRY_DELAY_SECONDS
+#: The CloudWatch alarm-history read (Phase 2's drill lookup) is bounded the same way.
+CLOUDWATCH_CLIENT_CONFIG: dict[str, Any] = SNS_CLIENT_CONFIG
+#: The longest one message can take: at most one alarm-history read, then ``deliver``'s primary
+#: twice and fallback once, plus one retry wait. The function timeout in
+#: ``aws/modules/operator-pager/main.tf`` must exceed it (a test reads both).
+WORST_CASE_DELIVERY_SECONDS = 4 * (SNS_CLIENT_CONFIG["connect_timeout"] + SNS_CLIENT_CONFIG["read_timeout"]) + MIN_RETRY_DELAY_SECONDS
+
+#: Alarm names inside a composite alarm's state reason (``...:alarm:<name> transitioned to ALARM``).
+ALARM_ARN_NAME_RE = re.compile(r"alarm:(?P<name>[A-Za-z0-9_.\-]+)")
+
+#: The CloudWatch notification fields a record keeps (plan D16: Phase 2 captures one real composite
+#: notification and pins the drill parser to it). Alarm names, states, reasons and child ARNs: no
+#: secret, and nothing else from the message.
+NOTIFICATION_KEYS: tuple[str, ...] = (
+    "AlarmName",
+    "AlarmRule",
+    "NewStateValue",
+    "OldStateValue",
+    "NewStateReason",
+    "StateChangeTime",
+    "TriggeringChildren",
+)
+
+#: How far back the relay reads a drill child's history for the ``DRILL <id>`` transition.
+DRILL_HISTORY_WINDOW_SECONDS = 900
+
+#: RDS storage events the pager rule admits (plan D10), in the relay's own words. AWS's message text
+#: is imperative ("Increase the maximum storage threshold.") and a page never asks, so the page
+#: carries these descriptions, never AWS's text.
+RDS_STORAGE_EVENTS: dict[str, str] = {
+    "RDS-EVENT-0225": "allocated storage is approaching the storage autoscaling maximum (raised at 80% of the maximum)",
+    "RDS-EVENT-0224": "storage autoscaling started a scale-up that will reach or exceed the maximum storage threshold",
+    "RDS-EVENT-0223": "storage autoscaling could not scale the storage",
+    "RDS-EVENT-0007": "allocated storage is exhausted",
+    "RDS-EVENT-0089": "free storage is below 10% of the provisioned storage",
+    "RDS-EVENT-0222": "free storage is low, and RDS shuts the database down to prevent corruption below its storage-full threshold",
+    "RDS-EVENT-0221": "the database reached the storage-full threshold and RDS shut it down",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +189,9 @@ class Page:
     dedup_key: Optional[str] = None
     alert_ids: list[Any] = field(default_factory=list)
     alarm: Optional[str] = None
+    #: For a composite alarm page: how its drill status was decided (``notification``, ``history``,
+    #: or ``failed`` when the drill child's history could not be read, in which case it pages as real).
+    drill_lookup: Optional[str] = None
 
 
 @dataclass
@@ -222,8 +262,43 @@ def drill_id_from_reason(reason: Any) -> Optional[str]:
     return m.group("id") if m else None
 
 
-def parse_alarm(msg: dict[str, Any], alarm_map: dict[str, Any]) -> Page | Dropped:
-    """A CloudWatch alarm notification. Only an alarm named in ``alarm_map`` may page."""
+def _triggering_children(msg: dict[str, Any]) -> set[str]:
+    """Child alarm names a composite notification names: its ``TriggeringChildren`` ARNs when it
+    carries them, and any ``alarm:<name>`` inside its state reason."""
+    names: set[str] = set()
+    children = msg.get("TriggeringChildren")
+    if isinstance(children, list):
+        for child in children:
+            arn = child.get("Arn") if isinstance(child, dict) else None
+            if isinstance(arn, str):
+                m = ALARM_ARN_NAME_RE.search(arn)
+                if m:
+                    names.add(m.group("name"))
+    reason = msg.get("NewStateReason")
+    if isinstance(reason, str):
+        names.update(m.group("name") for m in ALARM_ARN_NAME_RE.finditer(reason))
+    names.discard(msg.get("AlarmName"))
+    return names
+
+
+def parse_alarm(
+    msg: dict[str, Any],
+    alarm_map: dict[str, Any],
+    history: Optional[Callable[[str], Optional[str]]] = None,
+    last_alarm_drill: Optional[Callable[[str], Optional[str]]] = None,
+) -> Page | Dropped:
+    """A CloudWatch alarm notification. Only an alarm named in ``alarm_map`` may page.
+
+    A COMPOSITE is never drilled directly (AWS: a composite set by SetAlarmState "is not guaranteed to
+    return to its actual state"). Its map entry names a ``drill_child``, and a drill sets that child.
+    The composite page is a drill when the drill child is the only child that triggered it. When the
+    notification names no child, the drill child's own history decides (``history(name)`` returns the
+    ``DRILL <id>`` id of a recent ALARM transition, or None). When that history cannot be read, the
+    page goes out as REAL: a drill paged as real is noise; a real page withheld as a drill is a miss.
+
+    A METRIC alarm's return to OK is checked against its own last ALARM transition
+    (``last_alarm_drill(name)``): when that transition was a drill, the return is the drill ending,
+    recorded as ``ignored`` and not sent. An unreadable history sends the resolved notice."""
     name = msg.get("AlarmName")
     entry = alarm_map.get(name) if isinstance(name, str) else None
     if not isinstance(entry, dict):
@@ -236,12 +311,38 @@ def parse_alarm(msg: dict[str, Any], alarm_map: dict[str, Any]) -> Page | Droppe
     old_state = msg.get("OldStateValue")
     reason = msg.get("NewStateReason")
     drill_id = drill_id_from_reason(reason)
+    drill_child = entry.get("drill_child")
+    drill_lookup: Optional[str] = None
+
+    if new_state == "ALARM" and isinstance(drill_child, str) and drill_child:
+        children = _triggering_children(msg)
+        if children:
+            drill_lookup = "notification"
+            if children == {drill_child}:
+                drill_id = _lookup_drill_id(history, drill_child) or "unknown"
+            else:
+                drill_id = None
+        else:
+            try:
+                drill_id = history(drill_child) if history is not None else None
+                drill_lookup = "history"
+            except Exception:  # noqa: BLE001 - an unreadable history pages as real
+                drill_id = None
+                drill_lookup = "failed"
 
     if new_state == "ALARM":
         kind = "drill" if drill_id else "page"
     elif new_state == "OK" and old_state == "ALARM":
-        # The return from a drill is a quiet resolved notice too: its OK reason carries no marker,
-        # and a stateless relay cannot tell it from a real recovery. It is informational either way.
+        # The OK reason of a drill's return carries no marker, so the alarm's own last ALARM
+        # transition decides. A composite's return is still sent as resolved: the composite's own
+        # history names children, not a DRILL marker (the PR body records this).
+        if not drill_child and last_alarm_drill is not None:
+            try:
+                returning_from = last_alarm_drill(name)
+            except Exception:  # noqa: BLE001 - unreadable: the resolved notice goes out
+                returning_from = None
+            if returning_from:
+                return Dropped(reason="drill_returned_to_ok", condition=condition, source="cloudwatch", alarm=name, benign=True)
         kind = "resolved"
     else:
         # INSUFFICIENT_DATA, or OK after INSUFFICIENT_DATA (creation): nothing was paged, so nothing
@@ -249,6 +350,8 @@ def parse_alarm(msg: dict[str, Any], alarm_map: dict[str, Any]) -> Page | Droppe
         return Dropped(reason=f"state_{new_state}_from_{old_state}", condition=condition, source="cloudwatch", alarm=name, benign=True)
 
     what = f"CloudWatch alarm {name} is {new_state}: {_clean(reason, 400)}"
+    if drill_lookup == "failed":
+        what += " (Whether this was a drill could not be read, so it is sent as real.)"
     return Page(
         kind=kind,
         condition=condition,
@@ -259,7 +362,17 @@ def parse_alarm(msg: dict[str, Any], alarm_map: dict[str, Any]) -> Page | Droppe
         drill_id=drill_id,
         dedup_key=f"{condition}:{name}",
         alarm=name,
+        drill_lookup=drill_lookup,
     )
+
+
+def _lookup_drill_id(history: Optional[Callable[[str], Optional[str]]], child: str) -> Optional[str]:
+    if history is None:
+        return None
+    try:
+        return history(child)
+    except Exception:  # noqa: BLE001 - the drill is known from the notification; only its id is lost
+        return None
 
 
 def parse_document(msg: dict[str, Any]) -> Page | Dropped:
@@ -284,9 +397,12 @@ def parse_document(msg: dict[str, Any]) -> Page | Dropped:
     drill_id = _clean(drill_id, 96) if drill_id else None
     # A qontinui.drill event source is a drill whatever kind the transformer wrote: PutEvents cannot
     # forge aws.* sources, so the drill script reaches the real rules through this source (plan D16).
+    aws = msg.get("aws") if isinstance(msg.get("aws"), dict) else {}
     if event_source == DRILL_EVENT_SOURCE or msg.get("drill") is True:
         if kind in ("page", "update", "resolved"):
             kind = "drill"
+        if not drill_id:
+            drill_id = drill_id_from_reason(aws.get("reason")) or drill_id_from_reason(aws.get("message"))
         if not drill_id:
             drill_id = _clean(msg.get("event_id") or "unnamed", 96)
 
@@ -295,7 +411,7 @@ def parse_document(msg: dict[str, Any]) -> Page | Dropped:
         kind=kind,
         condition=condition,
         title=_clean(msg.get("title") or _condition_label(condition), 160),
-        what=_clean(msg.get("what") or msg.get("body") or "", 600),
+        what=_clean(msg.get("what") or msg.get("body") or _aws_what(condition, aws, msg.get("event_time")), 600),
         source=source,
         remediation=_remediation_text(msg.get("remediation")),
         link=_clean(msg.get("link"), 200),
@@ -303,6 +419,23 @@ def parse_document(msg: dict[str, Any]) -> Page | Dropped:
         dedup_key=_clean(msg.get("dedup_key"), 160) or None,
         alert_ids=alert_ids if isinstance(alert_ids, list) else [],
     )
+
+
+def _aws_what(condition: Optional[str], aws: dict[str, Any], event_time: Any) -> str:
+    """The page's first line for an EventBridge-sourced document, built from structured fields the
+    input transformer passed as JSON values (never pasted inside a JSON string, so any text is safe)."""
+    when = _clean(event_time, 40)
+    if condition == "deploy_failed" and aws:
+        service = str(aws.get("service") or "").rsplit("/", 1)[-1] or "an ECS service"
+        return (
+            f"ECS reported {_clean(aws.get('event'), 60) or 'a failed deployment'} for service {service} "
+            f"(deployment {_clean(aws.get('deployment'), 80) or 'unknown'}) at {when}: {_clean(aws.get('reason'), 300)}"
+        )
+    if condition == "storage_or_iops" and aws.get("rds_event_id"):
+        event_id = str(aws.get("rds_event_id"))
+        text = RDS_STORAGE_EVENTS.get(event_id, "an RDS storage event the pager does not describe")
+        return f"{event_id} on {_clean(aws.get('instance'), 80) or 'the database'} at {when}: {text}."
+    return ""
 
 
 def _remediation_text(value: Any) -> str:
@@ -313,7 +446,12 @@ def _remediation_text(value: Any) -> str:
     return _clean(value, 300)
 
 
-def parse_message(raw: Any, alarm_map: dict[str, Any]) -> Page | Dropped:
+def parse_message(
+    raw: Any,
+    alarm_map: dict[str, Any],
+    history: Optional[Callable[[str], Optional[str]]] = None,
+    last_alarm_drill: Optional[Callable[[str], Optional[str]]] = None,
+) -> Page | Dropped:
     """Classify one SNS ``Message`` string."""
     try:
         msg = json.loads(raw) if isinstance(raw, str) else None
@@ -322,7 +460,7 @@ def parse_message(raw: Any, alarm_map: dict[str, Any]) -> Page | Dropped:
     if not isinstance(msg, dict):
         return Dropped(reason="not_json_object")
     if "AlarmName" in msg and "NewStateValue" in msg:
-        return parse_alarm(msg, alarm_map)
+        return parse_alarm(msg, alarm_map, history, last_alarm_drill)
     if msg.get("page_version") == 1:
         return parse_document(msg)
     return Dropped(reason="unrecognised_shape", source=_clean(msg.get("source") or "unknown", 64))
@@ -448,6 +586,17 @@ def deliver(
 # ---------------------------------------------------------------------------
 
 
+def notification_fields(raw: Any) -> Optional[dict[str, Any]]:
+    """The kept fields of a CloudWatch alarm notification, or None for any other message."""
+    try:
+        msg = json.loads(raw) if isinstance(raw, str) else None
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(msg, dict) or "AlarmName" not in msg:
+        return None
+    return {k: msg[k] for k in NOTIFICATION_KEYS if k in msg}
+
+
 def outcome_record(page: Page | Dropped, outcome: Optional[Outcome], rendered: Optional[Rendered], sns_message_id: Optional[str], now: float) -> dict[str, Any]:
     """The one JSON record per message. Fields are values the relay decided, never a secret, never
     a request body, never an adapter's error text."""
@@ -476,6 +625,7 @@ def outcome_record(page: Page | Dropped, outcome: Optional[Outcome], rendered: O
         dedup_key=page.dedup_key,
         alert_ids=page.alert_ids,
         remediation=page.remediation or None,
+        drill_lookup=page.drill_lookup,
         asks=bool(rendered.asks) if rendered else None,
     )
     if outcome is not None:
@@ -592,6 +742,53 @@ def load_vendor_secret(parameter_name: str, region: str = "eu-central-1", client
     return resp["Parameter"]["Value"]
 
 
+def drill_id_from_history(
+    alarm_name: str,
+    client_factory: Optional[Callable[[], Any]] = None,
+    now: Callable[[], float] = time.time,
+    window_seconds: int = DRILL_HISTORY_WINDOW_SECONDS,
+    latest_alarm_only: bool = False,
+) -> Optional[str]:
+    """The ``DRILL <id>`` of the drill child's most recent ALARM transition in the window, or None.
+
+    With ``latest_alarm_only`` only the alarm's newest ALARM transition counts: an older drill is not
+    evidence about the alarm that is now returning to OK.
+
+    History, not DescribeAlarms: a metric alarm set by SetAlarmState returns to its actual state
+    "often within seconds", so by the time the composite's notification arrives the child's CURRENT
+    state reason is usually the OK evaluation, and the drill id is only in the history. Raises when the
+    history cannot be read; the caller then pages as real."""
+    from datetime import datetime, timezone
+
+    if client_factory is not None:
+        client = client_factory()
+    else:
+        import boto3  # lazy
+        from botocore.config import Config
+
+        client = boto3.client("cloudwatch", config=Config(**CLOUDWATCH_CLIENT_CONFIG))
+    end = now()
+    resp = client.describe_alarm_history(
+        AlarmName=alarm_name,
+        HistoryItemType="StateUpdate",
+        StartDate=datetime.fromtimestamp(end - window_seconds, timezone.utc),
+        EndDate=datetime.fromtimestamp(end + 60, timezone.utc),
+        MaxRecords=20,
+        ScanBy="TimestampDescending",
+    )
+    for item in resp.get("AlarmHistoryItems", []):
+        try:
+            data = json.loads(item.get("HistoryData") or "{}")
+        except ValueError:
+            continue
+        new = data.get("newState") if isinstance(data, dict) else None
+        if isinstance(new, dict) and new.get("stateValue") == "ALARM":
+            found = drill_id_from_reason(new.get("stateReason"))
+            if found or latest_alarm_only:
+                return found
+    return None
+
+
 ADAPTERS: dict[str, Callable[..., Adapter]] = {
     "sns_forward": lambda env: SnsForwardAdapter(env.get("EMAIL_TOPIC_ARN", "")),
 }
@@ -634,6 +831,8 @@ def process_record(
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], float] = time.time,
     emit: Callable[[dict[str, Any]], None] = _emit,
+    history: Optional[Callable[[str], Optional[str]]] = None,
+    last_alarm_drill: Optional[Callable[[str], Optional[str]]] = None,
 ) -> dict[str, Any]:
     sns = record.get("Sns", {}) if isinstance(record, dict) else {}
     try:
@@ -642,7 +841,12 @@ def process_record(
         alarm_map = {}
     if not isinstance(alarm_map, dict):
         alarm_map = {}
-    parsed = parse_message(sns.get("Message"), alarm_map)
+    parsed = parse_message(
+        sns.get("Message"),
+        alarm_map,
+        history if history is not None else drill_id_from_history,
+        last_alarm_drill if last_alarm_drill is not None else (lambda name: drill_id_from_history(name, latest_alarm_only=True)),
+    )
     if isinstance(parsed, Dropped):
         rec = outcome_record(parsed, None, None, sns.get("MessageId"), now())
     else:
@@ -653,6 +857,9 @@ def process_record(
             delay = MIN_RETRY_DELAY_SECONDS
         outcome = deliver(parsed, rendered, primary, fallback, sleep=sleep, retry_delay=delay)
         rec = outcome_record(parsed, outcome, rendered, sns.get("MessageId"), now())
+    notification = notification_fields(sns.get("Message"))
+    if notification is not None:
+        rec["notification"] = notification
     emit(rec)
     for line in emf_lines(rec, now()):
         emit(line)
