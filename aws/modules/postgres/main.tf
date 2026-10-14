@@ -12,7 +12,20 @@ variable "max_allocated_storage" { type = number }
 variable "username" { type = string }
 variable "db_name" { type = string }
 variable "multi_az" { type = bool }
-variable "backup_retention_days" { type = number }
+
+# 0 disables RDS automated backups, and RDS then deletes every existing automated
+# backup when that change takes effect (with apply_immediately = false below, in
+# the next maintenance window): the Terraform spelling of losing point-in-time
+# recovery in one apply. A composition may shorten the window for cost, never
+# remove it. (plan 2026-10-14-coord-database-is-one-command-from-total-loss)
+variable "backup_retention_days" {
+  type = number
+
+  validation {
+    condition     = var.backup_retention_days >= 1
+    error_message = "backup_retention_days must be at least 1: 0 disables RDS automated backups, and RDS then deletes every existing automated backup when that change takes effect."
+  }
+}
 
 variable "performance_insights_enabled" {
   description = "Enable RDS Performance Insights. Defaults true: the only live composition of this module is aws/staging, which IS production and has PI on."
@@ -24,6 +37,12 @@ variable "performance_insights_retention_days" {
   description = "PI retention. 7 is the free tier and what the live instance carries; anything else is billable. Ignored when performance_insights_enabled is false."
   type        = number
   default     = 7
+}
+
+variable "deletion_protection" {
+  description = "RDS DeletionProtection. Defaults true: the only live composition of this module is aws/staging, which IS production, and protection is on there. A composition that means to delete the instance sets this false, applies, then destroys."
+  type        = bool
+  default     = true
 }
 
 resource "random_password" "master" {
@@ -115,10 +134,39 @@ resource "aws_db_instance" "main" {
   backup_retention_period    = var.backup_retention_days
   backup_window              = "03:00-04:00"
   maintenance_window         = "sun:04:30-sun:05:30"
-  deletion_protection        = false # staging — flip to true in prod
-  skip_final_snapshot        = true  # staging — flip to false in prod
   apply_immediately          = false
   auto_minor_version_upgrade = true
+
+  # Deletion safety (plan 2026-10-14-coord-database-is-one-command-from-total-loss,
+  # claim r02-rds-deletion-protected). The only live composition of this module is
+  # aws/staging, which IS production, so the old `false # staging — flip to true in
+  # prod` / `true # staging — flip to false in prod` literals were simply wrong:
+  # with them, one `terraform destroy` (or one `delete-db-instance
+  # --skip-final-snapshot`, whose API default also deletes the automated backups)
+  # removed the instance AND every backup of it.
+  #
+  # deletion_protection is AWS-side state. While it is on, RDS refuses
+  # DeleteDBInstance from any caller: terraform destroy, the console, the CLI. It
+  # was turned on live by CLI at 2026-10-14T08:11:39Z. Until this line said so, any
+  # apply touching this resource, targeted or not, would have turned it back OFF:
+  # the provider sends DeletionProtection from config on every ModifyDBInstance. To
+  # really tear down, set the variable false, apply, then destroy.
+  #
+  # The next three are Terraform-side delete-time arguments with NO AWS-side state.
+  # They are sent only with DeleteDBInstance, so an apply that changes only them
+  # makes no ModifyDBInstance call (the only RDS call is the DescribeDBInstances
+  # read that ends every update), and no AWS read can observe them.
+  #   - skip_final_snapshot = false: a delete takes a final snapshot first.
+  #   - final_snapshot_identifier is static on purpose. A timestamp() would differ
+  #     on every plan; and a second delete of the same environment fails on
+  #     DBSnapshotAlreadyExists, which is the safe direction.
+  #   - delete_automated_backups = false (the provider default is true): the
+  #     automated backups, and the point-in-time window they carry, outlive the
+  #     instance until their retention period runs out.
+  deletion_protection       = var.deletion_protection
+  skip_final_snapshot       = false
+  final_snapshot_identifier = "qontinui-${var.environment}-final"
+  delete_automated_backups  = false
 
   # Performance Insights. This directory IS production (see aws/staging/main.tf),
   # PI is already enabled live and already being paid for, so the previous
