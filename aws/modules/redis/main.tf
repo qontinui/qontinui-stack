@@ -38,6 +38,23 @@ resource "aws_elasticache_parameter_group" "main" {
     name  = "maxmemory-policy"
     value = "allkeys-lru"
   }
+
+  # Keyspace notifications for expired keys ("E" keyevent channel, "x" expired
+  # events). qontinui-coord's claims_expiry_watcher
+  # (crates/coord/src/claims_expiry_watcher.rs) is written to subscribe to
+  # __keyevent@0__:expired and needs Ex. As of 2026-10-14 it does not subscribe
+  # in production: ElastiCache refuses its startup CONFIG GET (coord findings
+  # 048552d6 and d8a4bc44).
+  #
+  # Set by hand first: a ModifyCacheParameterGroup call at 2026-09-08T06:29:05Z
+  # (CloudTrail) set notify-keyspace-events = "Ex" on this group. That change was
+  # never codified, so any apply reaching this resource would remove it.
+  # Codified here per the aws-cli-authorized policy, item 5 ("brought under
+  # code").
+  parameter {
+    name  = "notify-keyspace-events"
+    value = "Ex"
+  }
 }
 
 resource "aws_elasticache_replication_group" "main" {
