@@ -33,6 +33,10 @@ When stopped (RDS + ElastiCache stopped, ECS scaled to 0): ~$3/mo for
 storage + ALB. The on/off ritual lives in `scripts/stop.sh` and
 `start.sh`.
 
+Not in the table above: the off-instance database backups, about
+$34-142/month (hard ceiling about $210/month at today's churn). See "Backups
+and DR" below for the formula and the off-switch.
+
 ## Layout
 
 ```
@@ -128,7 +132,74 @@ bash scripts/start.sh
 
 Note: RDS supports stopping for up to 7 days, then auto-restarts. For
 longer pauses, snapshot + destroy the instance and recreate from
-snapshot when needed.
+snapshot when needed. Deletion protection is on, so that destroy first
+needs the steps under "Backups and DR". A stopped instance cannot be
+snapshotted, so on the daily cadence a pause past 07:00 UTC
+(`aws/scripts/staging-stop.sh`) trips the backup-stale alarm.
+
+## Backups and DR
+
+The database (`qontinui_db` on RDS `qontinui-<env>`) has three backup tiers.
+Restores are in qontinui-coord `docs/dr-runbook.md`.
+
+| Tier | Where | Kept | Survives deleting the instance? |
+|------|-------|------|---------------------------------|
+| RDS automated backups (point-in-time recovery) | RDS, this region | `postgres_backup_retention_days` (7) | Only a `terraform destroy` keeps them (`delete_automated_backups = false`), until that retention runs out. A console, CLI or API delete removes them unless told otherwise |
+| AWS Backup snapshot (`modules/backup`), 07:00 UTC daily | vault `qontinui-<env>-rds`, this region | `postgres_offinstance_backup_retention_days` (35; at least 30) | Yes |
+| Copy of each snapshot | vault `qontinui-<env>-rds-dr`, `postgres_offinstance_backup_dr_region` (us-east-2) | `postgres_offinstance_backup_dr_retention_days` (35; at least 30) | Yes, and survives the loss of this region |
+
+A `terraform destroy` also takes a final snapshot, `qontinui-<env>-final`
+(`skip_final_snapshot = false`). The CLI takes one only when given
+`--final-db-snapshot-identifier`.
+
+**Deletion protection** is on (`modules/postgres` `deletion_protection`,
+default true). It is the only barrier that holds for every caller: RDS refuses
+to delete the instance from Terraform, the console, the CLI and the API alike.
+To tear an environment down on purpose:
+
+1. Set `deletion_protection = false` on the module and apply.
+2. Destroy. The destroy takes the final snapshot; delete it yourself if you
+   do not want it.
+3. The backup vaults refuse destruction while they hold recovery points
+   (`force_destroy = false`). Delete the points first.
+
+**What a snapshot costs the instance.** The instance is single-AZ, so each
+snapshot starts with a brief I/O suspension, "a few seconds to a few
+minutes" (RDS, "Creating a DB snapshot"). The snapshot then completes in the
+background; the automated backups measure 27-40 min end to end. The AWS
+Backup job at 07:00 UTC adds one such suspension a day, clear of the
+03:00-04:00 backup window and the Sunday 04:30-05:30 maintenance window.
+
+**Cost and the off-switch.** Off-instance backups cost money every month, so
+they have an off-switch: `postgres_offinstance_backup_enabled` (default
+true). Turning it off stops new backups and copies, and existing ones expire
+on their own schedule.
+
+- RDS bills these snapshots as backup storage, at $0.095/GB-month in both
+  regions, plus $0.01/GB to transfer each copy from us-east-1 to us-east-2.
+- Daily (the default) costs about `$11.9 + $6.19 × d` per month, where `d` is
+  the GB of distinct blocks changed per day. That is $34-142/month at the two
+  readings of `d` (3.5 and 21 GB/day), with a hard ceiling of about $210/month
+  at today's churn.
+- Weekly (`cron(0 7 ? * MON *)`) is the cheaper setting that still keeps 35
+  days: `$11.9 + $0.80 × w`, where `w` is the distinct blocks changed per week.
+  That is $15-130/month, ceiling about $192.
+
+**Alarms**, on the budget topic, are keyed to the schedule's cadence.
+
+- **Daily:** two staleness alarms, which fire when nothing has completed for 26
+  hours.
+  - `qontinui-<env>-rds-backup-stale`: no backup job completed.
+  - `qontinui-<env>-rds-backup-copy-stale`: no copy job completed into the DR
+    vault.
+  - Both sit in ALARM from apply until the first scheduled run completes.
+- **Weekly:** CloudWatch caps an alarm window at 7 days, so no staleness alarm
+  can cover a weekly gap. Three event alarms fire instead:
+  - `qontinui-<env>-rds-backup-failed`
+  - `qontinui-<env>-rds-backup-expired`
+  - `qontinui-<env>-rds-backup-copy-failed`
+
+Changing the schedule changes the alarm set in the same apply.
 
 ## Why not Aurora / Neon / managed-anything-fancier
 
@@ -149,7 +220,6 @@ directory targets self-hosters who want to deploy to their own AWS.
 ## What this configuration intentionally omits
 
 * Multi-AZ. Single AZ currently; flip the variable when HA is needed.
-* Backups beyond RDS's 7-day retention.
 * WAF rules.
 * Bastion host (use SSM Session Manager when you need shell into a task).
 * Custom DB roles + RLS. Auth/RLS land with topology plan Phase 7.

@@ -207,6 +207,13 @@ output "identifier" {
   value = aws_db_instance.main.identifier
 }
 
+# The DB instance ARN: the resource the AWS Backup selection in modules/backup
+# names. Selecting by ARN rather than by tag means the off-instance backup
+# cannot stop silently because somebody edited a tag.
+output "arn" {
+  value = aws_db_instance.main.arn
+}
+
 output "db_name" {
   value = var.db_name
 }

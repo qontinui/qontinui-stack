@@ -274,9 +274,99 @@ variable "postgres_multi_az" {
 }
 
 variable "postgres_backup_retention_days" {
-  description = "RDS automated-backup retention. 7 is the default; 0 disables (don't)."
+  description = "RDS automated-backup retention in days: the point-in-time recovery window, 7 by default. modules/postgres refuses 0, because 0 disables automated backups and RDS then deletes every existing one when that change takes effect."
   type        = number
   default     = 7
+}
+
+# ─── Postgres off-instance backups (modules/backup) ─────────────────────
+
+variable "postgres_offinstance_backup_enabled" {
+  description = <<-EOT
+    Off-switch for the AWS Backup plan that keeps copies of the coord database
+    OUTSIDE the RDS instance: a snapshot in a vault in this region, copied to a
+    vault in postgres_offinstance_backup_dr_region. Default true, because the
+    capability ships on. It costs money every month, so this is the
+    preference to turn off.
+
+    false removes the plan, the selection and the two staleness alarms, so no
+    NEW backup or copy is taken. Recovery points already taken stay until
+    their own retention runs out. The vaults and the role stay too: an empty
+    vault costs nothing, and a vault holding points refuses to be destroyed.
+
+    Recurring cost at the defaults (daily, 35 days in both regions). RDS bills
+    these snapshots as backup storage at $0.095/GB-month in us-east-1 and
+    us-east-2, and transfer from us-east-1 to us-east-2 costs $0.01/GB. With
+    B = the first full copy (~125 GB) and d = GB of distinct blocks changed per
+    day:
+      $0.095 x (B + 62 x d) + $0.30 x d per month = $11.9 + $6.19 x d
+    That is $34-142/month at the two readings of d (3.5 and 21 GB/day), with a
+    hard ceiling of about $210/month at today's churn (d <= ~32 GiB/day), plus
+    $0.20/month for two alarms and about $1.25 once for the first full copy. B
+    grows with the database, adding about $5/month for each month of growth. d
+    is measured from Cost Explorer 8 days after the first copy. A weekly
+    schedule (see postgres_offinstance_backup_schedule) is the cheaper setting
+    that still keeps 35 days: $11.9 + $0.80 x w, where w = distinct blocks
+    changed per week, i.e. $15-130/month (ceiling about $192).
+
+    Plan 2026-10-14-coord-database-is-one-command-from-total-loss, claim
+    r02-off-instance-backup.
+  EOT
+  type        = bool
+  default     = true
+}
+
+variable "postgres_offinstance_backup_schedule" {
+  description = <<-EOT
+    AWS Backup cron expression (UTC) for the off-instance snapshot. The default,
+    07:00 daily, stays clear of the instance's backup window (03:00-04:00) and its
+    Sunday maintenance window (04:30-05:30). AWS Backup fails an RDS job
+    scheduled inside either window or in the hour before it. The cheaper
+    weekly setting is cron(0 7 ? * MON *).
+
+    Only a daily cron(M H * * ? *) or a weekly cron(M H ? * DAY *) is accepted,
+    because modules/backup keys its alarms to the cadence. Daily gets two "no
+    backup / no copy completed for 26 h" staleness alarms. Weekly gets
+    failed/expired event alarms instead: CloudWatch caps an alarm window at 7
+    days, so no staleness alarm can cover a weekly gap without firing every
+    week. Changing this value changes the alarm set in the same apply.
+  EOT
+  type        = string
+  default     = "cron(0 7 * * ? *)"
+}
+
+variable "postgres_offinstance_backup_retention_days" {
+  description = "Days each recovery point stays in this region's vault. 35 clears the r02-off-instance-backup claim's 30-day floor with margin; below 30 is refused so the config cannot quietly drop under what the claim requires."
+  type        = number
+  default     = 35
+
+  validation {
+    condition     = var.postgres_offinstance_backup_retention_days >= 30
+    error_message = "postgres_offinstance_backup_retention_days must be at least 30: claim r02-off-instance-backup requires the off-instance copy to be kept at least 30 days."
+  }
+}
+
+variable "postgres_offinstance_backup_dr_region" {
+  description = <<-EOT
+    Second region for the backup copies. us-east-2 has the same snapshot storage
+    price as us-west-2 at half the transfer price from us-east-1 ($0.01 vs
+    $0.02/GB). Changing it creates a new copy vault in the new region and leaves
+    the old one behind. The points in the old vault expire on their own, and the
+    first copy into the new vault is a full copy.
+  EOT
+  type        = string
+  default     = "us-east-2"
+}
+
+variable "postgres_offinstance_backup_dr_retention_days" {
+  description = "Days each copy stays in the second region's vault. 35 keeps the claim's 30-day floor in the second region too; below 30 is refused."
+  type        = number
+  default     = 35
+
+  validation {
+    condition     = var.postgres_offinstance_backup_dr_retention_days >= 30
+    error_message = "postgres_offinstance_backup_dr_retention_days must be at least 30: claim r02-off-instance-backup requires the second-region copy to be kept at least 30 days too."
+  }
 }
 
 # ─── Redis ──────────────────────────────────────────────────────────────

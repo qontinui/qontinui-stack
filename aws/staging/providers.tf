@@ -18,15 +18,34 @@ terraform {
   }
 }
 
+# One tag set for every provider that CREATES resources, so the second-region
+# backup vault is tagged exactly like everything in the primary region.
+locals {
+  default_tags = {
+    Project     = "qontinui"
+    Environment = "staging"
+    ManagedBy   = "terraform"
+    Stack       = "qontinui-stack"
+  }
+}
+
 provider "aws" {
   region = var.region
 
   default_tags {
-    tags = {
-      Project     = "qontinui"
-      Environment = "staging"
-      ManagedBy   = "terraform"
-      Stack       = "qontinui-stack"
-    }
+    tags = local.default_tags
+  }
+}
+
+# The second region for the off-instance RDS backup copies (modules/backup,
+# plan 2026-10-14-coord-database-is-one-command-from-total-loss). Unlike the
+# read-only `aws.ssm` alias in main.tf, this one creates a resource (the copy
+# vault), so it carries the default tags too.
+provider "aws" {
+  alias  = "dr"
+  region = var.postgres_offinstance_backup_dr_region
+
+  default_tags {
+    tags = local.default_tags
   }
 }

@@ -240,6 +240,60 @@ class ThisStacksIdiomsTests(unittest.TestCase):
         self.assertIn("one-way", reason)
 
 
+class OffInstanceBackupTierTests(unittest.TestCase):
+    """The coord database's off-instance backup tier (``modules/backup``).
+
+    Plan 2026-10-14-coord-database-is-one-command-from-total-loss. Before these
+    types were added, a plan destroying the only copy of the database outside
+    the RDS instance classified ``in_place_change``. That reads like an ordinary
+    edit, and the loss surfaces only on the day a restore is needed.
+    """
+
+    def test_destroying_the_backup_plan_is_an_active_negation(self):
+        cls, _, _ = tpd.classify_change("aws_backup_plan", ["delete"], [])
+        self.assertEqual(cls, tpd.ACTIVE_NEGATION)
+
+    def test_destroying_the_backup_selection_is_an_active_negation(self):
+        # The selection is what points the plan at the instance. Without it
+        # the plan runs and backs up nothing.
+        cls, _, _ = tpd.classify_change("aws_backup_selection", ["delete"], [])
+        self.assertEqual(cls, tpd.ACTIVE_NEGATION)
+
+    def test_replacing_a_backup_vault_is_an_active_negation(self):
+        # kms_key_arn is ForceNew, so a key change arrives as a replace.
+        cls, _, reason = tpd.classify_change("aws_backup_vault", ["delete", "create"], [])
+        self.assertEqual(cls, tpd.ACTIVE_NEGATION)
+        self.assertIn("replace", reason)
+
+    def test_editing_the_backup_rule_in_place_is_an_active_negation(self):
+        # Shortened retention, a schedule moved into the maintenance window and
+        # a dropped cross-Region copy all render as "update in place".
+        cls, attr, reason = tpd.classify_change("aws_backup_plan", ["update"], ["rule"])
+        self.assertEqual(cls, tpd.ACTIVE_NEGATION)
+        self.assertEqual(attr, "rule")
+        self.assertIn("cross-Region", reason)
+
+    def test_a_backup_plan_tag_edit_is_still_an_ordinary_change(self):
+        cls, _, _ = tpd.classify_change("aws_backup_plan", ["update"], ["tags"])
+        self.assertEqual(cls, tpd.IN_PLACE_CHANGE)
+
+    def test_toggling_delete_automated_backups_is_an_active_negation(self):
+        cls, attr, reason = tpd.classify_change(
+            "aws_db_instance", ["update"], ["delete_automated_backups"]
+        )
+        self.assertEqual(cls, tpd.ACTIVE_NEGATION)
+        self.assertEqual(attr, "delete_automated_backups")
+        self.assertIn("point-in-time", reason)
+
+    def test_creating_the_backup_tier_is_a_benign_add(self):
+        # Adding the tier is not a negation. Of what it brings, only the IAM
+        # role and its attachments are security-sensitive creates, and
+        # SECURITY_SENSITIVE_CREATE_TYPES already covers them.
+        for rtype in ("aws_backup_plan", "aws_backup_selection", "aws_backup_vault"):
+            cls, _, _ = tpd.classify_change(rtype, ["create"], [])
+            self.assertEqual(cls, tpd.BENIGN_ADD, rtype)
+
+
 class SecuritySensitiveCreateTests(unittest.TestCase):
     """A bare ``create`` is not benign for everything.
 

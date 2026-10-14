@@ -98,6 +98,32 @@ module "postgres" {
   backup_retention_days = var.postgres_backup_retention_days
 }
 
+# ─── Postgres off-instance backups (AWS Backup, two regions) ───────────
+# A scheduled snapshot of the coord database kept in a vault in this region
+# and copied to a vault in a second region (provider aws.dr), so a backup
+# survives the instance, its own retention settings and the region. The
+# recurring cost and the off-switch are on
+# var.postgres_offinstance_backup_enabled. A providers map turns off implicit
+# inheritance of the default provider, so BOTH mappings are passed. Plan
+# 2026-10-14-coord-database-is-one-command-from-total-loss; restores:
+# qontinui-coord docs/dr-runbook.md.
+
+module "backup" {
+  source = "../modules/backup"
+  providers = {
+    aws    = aws
+    aws.dr = aws.dr
+  }
+
+  environment       = var.environment
+  enabled           = var.postgres_offinstance_backup_enabled
+  db_instance_arn   = module.postgres.arn
+  schedule          = var.postgres_offinstance_backup_schedule
+  retention_days    = var.postgres_offinstance_backup_retention_days
+  dr_retention_days = var.postgres_offinstance_backup_dr_retention_days
+  sns_topic_arn     = module.cost_control.sns_topic_arn
+}
+
 # ─── Redis ──────────────────────────────────────────────────────────────
 
 module "redis" {

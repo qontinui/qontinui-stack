@@ -117,6 +117,17 @@ SERVING_RESOURCE_TYPES = frozenset(
         # modules/session-output-cold) exposes the bucket.
         "aws_s3_bucket_public_access_block",
         "aws_s3_bucket_server_side_encryption_configuration",
+        # The off-instance backup tier of the coord database (modules/backup,
+        # plan 2026-10-14-coord-database-is-one-command-from-total-loss). None of
+        # these serves traffic, but destroying the plan or its selection stops
+        # every future backup and cross-region copy with no error anywhere, and
+        # nobody notices until the day a restore is needed. That is the silent
+        # loss this set exists to surface. A vault refuses destruction while it
+        # holds recovery points, but a plan proposing it is the signal. Its
+        # kms_key_arn is ForceNew, so a key change also arrives as a replace.
+        "aws_backup_plan",
+        "aws_backup_selection",
+        "aws_backup_vault",
     }
 )
 
@@ -206,6 +217,20 @@ NEGATING_ATTRIBUTES: dict[tuple[str, str], str] = {
     ("aws_db_instance", "skip_final_snapshot"): (
         "RDS final-snapshot skip toggled - turning it on makes a later destroy "
         "unrecoverable"
+    ),
+    ("aws_db_instance", "delete_automated_backups"): (
+        "RDS delete_automated_backups toggled - turning it on makes a later "
+        "destroy delete the point-in-time backups with the instance"
+    ),
+    # The off-instance backup tier (see SERVING_RESOURCE_TYPES). A rule edit
+    # in place can shorten retention, move the schedule into a window where
+    # RDS jobs fail, or drop the cross-region copy, all as an ordinary
+    # "update in place". Selections cannot change in place (every attribute is
+    # ForceNew), so their changes arrive as replaces and the destroy arm
+    # catches them.
+    ("aws_backup_plan", "rule"): (
+        "AWS Backup plan rule change - schedule, retention or the cross-Region "
+        "copy of the off-instance RDS backups"
     ),
     ("aws_db_instance", "storage_encrypted"): "RDS storage encryption toggled",
     # Redis, beyond node_type / transit encryption above.

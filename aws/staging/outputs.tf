@@ -74,6 +74,18 @@ output "rds_endpoint" {
   value       = module.postgres.endpoint
 }
 
+output "rds_backup" {
+  description = "Off-instance RDS backups (modules/backup): the vault in this region, the copy vault and its region, the AWS Backup role a restore job passes, the schedule's cadence (which picks the alarm set) and whether the plan is on. Read by restores and drills (qontinui-coord docs/dr-runbook.md)."
+  value = {
+    vault        = module.backup.vault_name
+    dr_vault     = module.backup.dr_vault_name
+    dr_region    = module.backup.dr_region
+    role_arn     = module.backup.role_arn
+    cadence      = module.backup.cadence
+    plan_enabled = var.postgres_offinstance_backup_enabled
+  }
+}
+
 output "redis_endpoint" {
   description = "ElastiCache primary endpoint."
   value       = module.redis.primary_endpoint
