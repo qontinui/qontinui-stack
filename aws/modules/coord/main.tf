@@ -485,14 +485,39 @@ resource "aws_iam_role_policy" "task_twin_auth_observer" {
 # drift slice needs. WITHOUT this grant the calls are AccessDenied and the
 # observer correctly degrades to blind (coverage<1 / drift_class=unknown, never a
 # false "no drift") — it ships dark until this lands. Read-only analogue of
-# `task_twin_infra_observer`/`task_twin_route_observer`. The observer calls
-# EXACTLY four actions: cloudwatch:GetMetricData (RDS FreeableMemory/CPU/
-# DatabaseConnections + ALB metrics), rds:DescribeEvents (the crash/recovery hard
-# signal), elasticloadbalancing:DescribeTargetHealth (coord TG target health), and
-# ecs:DescribeServices (running-vs-desired). None of the four carry resource-level
-# IAM scoping (CloudWatch GetMetricData + ELBv2/RDS Describe* are "*"-only, same as
-# the route/infra observers above); all are strictly read-only — no metric writes,
-# no RDS modify, no ECS update.
+# `task_twin_infra_observer`/`task_twin_route_observer`. The observer calls FOUR
+# actions today:
+#   - cloudwatch:GetMetricData: RDS FreeableMemory, DatabaseConnections,
+#     CPUUtilization and the two CPU credit balances.
+#   - rds:DescribeEvents: the crash/recovery hard signal.
+#   - elasticloadbalancing:DescribeTargetHealth: coord TG target health.
+#   - ecs:DescribeServices: running vs desired.
+# The durability pass adds two more. It is Phase 2 of plan
+# 2026-10-14-coord-observes-rds-storage-protection-and-backups (claim
+# gap-infra-observer-rds), not yet landed in qontinui-coord:
+#   - rds:DescribeDBInstances: deletion protection, storage allocation, backup
+#     retention and PITR lag.
+#   - rds:DescribeDBSnapshots: the AWS Backup snapshots, read in this region and
+#     the backup DR region.
+#
+# Resource types, per the AWS service reference (rds.json, ecs.json,
+# elasticloadbalancing.json; read 2026-10-14):
+#   - rds:DescribeEvents and elasticloadbalancing:DescribeTargetHealth list
+#     none, so they are "*"-only.
+#   - rds:DescribeDBInstances (db), rds:DescribeDBSnapshots (db, snapshot) and
+#     ecs:DescribeServices (service) DO support resource-level scoping.
+# All six stay on "*". For the two new RDS describes that is a decided
+# security-surface fork, recorded in coord finding 39d98219 (it supersedes
+# 7b6d9009):
+#   - Scoped ARNs were removed from the ballot: the cross-region filtered
+#     DescribeDBSnapshots read relies on an unmeasured request-time ARN.
+#   - What "*" exposes is read-only metadata in this account: 9 snapshot
+#     descriptions and one instance on 2026-10-14.
+#   - The reversal is one statement scoped to
+#     arn:aws:rds:*:<account>:db:qontinui-<env> and
+#     arn:aws:rds:*:<account>:snapshot:awsbackup:*.
+# All six are strictly read-only: no metric writes, no RDS modify, no ECS
+# update.
 data "aws_iam_policy_document" "task_twin_infra_health_observer" {
   statement {
     sid       = "TwinInfraHealthCloudWatchGetMetricData"
@@ -506,6 +531,8 @@ data "aws_iam_policy_document" "task_twin_infra_health_observer" {
       "rds:DescribeEvents",
       "elasticloadbalancing:DescribeTargetHealth",
       "ecs:DescribeServices",
+      "rds:DescribeDBInstances",
+      "rds:DescribeDBSnapshots",
     ]
     resources = ["*"]
   }
