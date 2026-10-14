@@ -22,7 +22,9 @@ the full decision matrix:
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -48,6 +50,12 @@ class FakeCognito:
 @pytest.fixture
 def mod(monkeypatch):
     monkeypatch.setenv("USER_POOL_ID", "us-east-1_rgTB9dbZ1")
+    # CI installs pytest and nothing else, and handler.py imports boto3 when it loads. Every test
+    # installs a fake cognito client before the handler calls boto3, so an empty stand-in module is
+    # enough to import it. monkeypatch removes it after each test, so no later test sees it; a
+    # machine that has boto3 keeps the real one.
+    if importlib.util.find_spec("boto3") is None:
+        monkeypatch.setitem(sys.modules, "boto3", types.ModuleType("boto3"))
     import handler as h
 
     importlib.reload(h)

@@ -33,6 +33,12 @@ variable "alert_threshold_percent" {
   type    = number
   default = 80
 }
+# The operator pager's relay (aws/modules/operator-pager) forwards pages to this topic until the
+# operator's vendor decision, and falls back to it after. Null = no relay, no grant.
+variable "operator_pager_relay_role_arn" {
+  type    = string
+  default = null
+}
 
 resource "aws_sns_topic" "budget" {
   name = "qontinui-${var.environment}-budget-alerts"
@@ -77,6 +83,7 @@ data "aws_partition" "current" {}
 #      instances in this region: aws:SourceAccount (confused-deputy guard) plus
 #      ArnLike on `db:*`. It is `db:*` rather than one instance id so that
 #      adding a source_id to the subscription does not silently lose delivery.
+#   4. The operator pager relay — its role, by ARN (see the dynamic statement at the end).
 data "aws_iam_policy_document" "budget_sns" {
   statement {
     sid       = "AllowBudgetsPublish"
@@ -123,6 +130,23 @@ data "aws_iam_policy_document" "budget_sns" {
       test     = "ArnLike"
       variable = "aws:SourceArn"
       values   = ["arn:${data.aws_partition.current.partition}:rds:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:db:*"]
+    }
+  }
+  # 4. The operator pager relay (aws/modules/operator-pager, plan
+  #    2026-10-14-coord-pages-the-operator-for-five-conditions-and-names-the-agent-fixing-each).
+  #    Its sns_forward adapter publishes each page here with a "[PAGE]" subject prefix, and it is the
+  #    fallback when a vendor adapter fails. Named by role ARN: only the relay, nothing else.
+  dynamic "statement" {
+    for_each = var.operator_pager_relay_role_arn == null ? [] : [var.operator_pager_relay_role_arn]
+    content {
+      sid       = "AllowOperatorPagerRelayPublish"
+      actions   = ["SNS:Publish"]
+      effect    = "Allow"
+      resources = [aws_sns_topic.budget.arn]
+      principals {
+        type        = "AWS"
+        identifiers = [statement.value]
+      }
     }
   }
 }

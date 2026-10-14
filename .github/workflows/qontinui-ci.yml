@@ -132,5 +132,9 @@ jobs:
       # run the classifier over synthetic `terraform show -json` documents, never
       # a real plan. One asserts the scrubbing invariant (no before/after value
       # can reach a posted record), which is worth having on every push.
+      # aws/lambdas/ too: the lambda handlers' own unit tests (the presignup autolink and the
+      # operator pager relay) had no CI job until plan
+      # 2026-10-14-coord-pages-the-operator-for-five-conditions-and-names-the-agent-fixing-each
+      # Phase 1 widened this path. Like scripts/tests/, they stub every AWS client.
       - name: pytest
-        run: python -m pytest scripts/tests/ -q
+        run: python -m pytest scripts/tests/ aws/lambdas/ -q

@@ -355,3 +355,18 @@ variable "session_output_cold_ttl_days" {
   type        = number
   default     = 90
 }
+
+
+# ─── Operator pager (plan 2026-10-14 operator pager) ───────────────────
+
+variable "operator_pager_enabled" {
+  description = "Off-switch for the operator pager: false removes the relay's subscription to qontinui-<env>-operator-pager, so no page reaches a human. Sources keep publishing."
+  type        = bool
+  default     = true
+}
+
+variable "operator_pager_adapter" {
+  description = "How the relay delivers pages. sns_forward (forward to the alert email topic) until the operator chooses a pager vendor (plan Phase 6)."
+  type        = string
+  default     = "sns_forward"
+}

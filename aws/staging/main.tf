@@ -330,6 +330,24 @@ module "cost_control" {
   environment   = var.environment
   monthly_limit = var.budget_monthly_limit
   alert_email   = data.aws_ssm_parameter.budget_alert_email.insecure_value
+
+  operator_pager_relay_role_arn = module.operator_pager.relay_role_arn
+}
+
+# ─── Operator pager (one topic every pager source publishes to, one relay) ──
+#
+# Plan 2026-10-14-coord-pages-the-operator-for-five-conditions-and-names-the-agent-fixing-each.
+# Until the operator's vendor decision the relay forwards pages to the alert email topic with a
+# "[PAGE]" subject prefix. var.operator_pager_enabled = false removes the relay's subscription.
+
+module "operator_pager" {
+  source = "../modules/operator-pager"
+
+  environment         = var.environment
+  email_topic_arn     = module.cost_control.sns_topic_arn
+  coord_task_role_arn = module.coord.task_role_arn
+  enabled             = var.operator_pager_enabled
+  adapter             = var.operator_pager_adapter
 }
 
 # ─── Observability (CloudWatch alarms for coord) ────────────────────────
