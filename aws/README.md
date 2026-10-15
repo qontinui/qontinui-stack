@@ -161,16 +161,45 @@ NEW instance:
 
 1. Pick a recovery point:
    `aws backup list-recovery-points-by-backup-vault --backup-vault-name qontinui-<env>-rds`.
-2. Read its restore metadata:
-   `aws backup get-recovery-point-restore-metadata --backup-vault-name qontinui-<env>-rds --recovery-point-arn <arn>`.
-3. Start the restore:
-   `aws backup start-restore-job --resource-type RDS --recovery-point-arn <arn> --iam-role-arn <role> --metadata file://<metadata.json>`.
-   The metadata is step 2's output with a new `DBInstanceIdentifier` and
-   three values set:
-   - `DBParameterGroupName` = `qontinui-<env>-pg16`;
-   - `DBSubnetGroupName` = `qontinui-<env>-pg`;
-   - `VpcSecurityGroupIds` = the id of the `qontinui-<env>-data-plane`
-     security group.
+2. Save its restore metadata. `--query RestoreMetadata` keeps only the flat
+   string-to-string map that `start-restore-job --metadata` takes ("Type:
+   String to string map", AWS Backup API, StartRestoreJob); the full response
+   also carries the vault and recovery point ARNs:
+
+   ```sh
+   aws backup get-recovery-point-restore-metadata \
+     --backup-vault-name qontinui-<env>-rds --recovery-point-arn <arn> \
+     --query RestoreMetadata > metadata.json
+   ```
+
+3. Set a new `DBInstanceIdentifier` (the one required key) and the three
+   objects the new instance must use. Every value in the map is a string, so
+   the security group list goes in as a JSON array encoded inside a string,
+   `"[\"sg-...\"]"`. AWS Backup's restore pages show that form
+   (`"VpcSecurityGroupIds":"[\"sg-012d52c68c6e88f00\"]"`, "Restoring an Amazon
+   Aurora cluster"; `"SecurityGroupIds": "[\"sg-0a1bc2d345ef67890\"]"`, the EC2
+   example in "Restore a backup by resource type"). "Restore an RDS database"
+   gives no format. It points to RDS `RestoreDBInstanceFromDBSnapshot` for the
+   keys, and that page names all four. jq's `tojson` does the encoding:
+
+   ```sh
+   jq --arg sg <data-plane-sg-id> '
+     .DBInstanceIdentifier = "qontinui-<env>-restore"
+     | .DBParameterGroupName = "qontinui-<env>-pg16"
+     | .DBSubnetGroupName = "qontinui-<env>-pg"
+     | .VpcSecurityGroupIds = ([$sg] | tojson)' metadata.json > restore.json
+   ```
+
+   `<data-plane-sg-id>` is the id of the `qontinui-<env>-data-plane` security
+   group.
+
+4. Start the restore:
+
+   ```sh
+   aws backup start-restore-job --resource-type RDS \
+     --recovery-point-arn <arn> --iam-role-arn <role> \
+     --metadata file://restore.json
+   ```
 
 The `rds_backup` output gives the vault names, the DR region and `role_arn`.
 A restore from the DR vault runs in that region, where none of those three
@@ -190,9 +219,12 @@ To tear an environment down on purpose:
 **What a snapshot costs the instance.** The instance is single-AZ, so each
 snapshot starts with a brief I/O suspension, "a few seconds to a few
 minutes" (RDS, "Creating a DB snapshot"). The snapshot then completes in the
-background; the automated backups measure 28-40 min end to end. The AWS
-Backup job at 07:00 UTC adds one such suspension a day, clear of the
-03:00-04:00 backup window and the Sunday 04:30-05:30 maintenance window.
+background. The automated backups took 27.6-47.5 min end to end over
+2026-10-01 to 10-14 (RDS events), and the latest finished at 04:03:42 UTC
+(10-04). The AWS
+Backup job at 07:00 UTC adds one such suspension a day. That is about three
+hours after the latest finish, and clear of the 03:00-04:00 backup window and
+the Sunday 04:30-05:30 maintenance window.
 
 **Cost and the off-switch.** Off-instance backups cost money every month, so
 they have an off-switch: `postgres_offinstance_backup_enabled` (default
