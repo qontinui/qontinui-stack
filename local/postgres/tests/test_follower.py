@@ -540,6 +540,12 @@ class CopyColumnsTest(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
         out = json.loads(res.stdout)
         self.assertEqual(out["rows_read"], out["rows_updated"])
+        # A rewrite owes EVERY non-key column: one column is not enough.
+        check = cli(p.conf, "follower", "check")
+        self.assertEqual(check.returncode, 1, check.stdout)
+        self.assertIn("FAIL copy-columns owed for app.items", check.stdout)
+        res = cli(p.conf, "follower", "copy-columns", "--table", "app.items")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
         self.assertEqual(cli(p.conf, "follower", "check").returncode, 0)
         wait_caught_up(p)
         p.assert_equal(self)
@@ -553,6 +559,18 @@ class CopyColumnsTest(unittest.TestCase):
             self.assertIn("locked", res.stderr)
             res = cli(p.conf, "follower", "run", "--once")
             self.assertIn("cycle skipped", res.stderr)
+
+    def test_5_unopenable_lock_file_is_a_clear_refusal(self):
+        p = self.pair
+        bad = p.conf + ".badlock"
+        with open(p.conf, encoding="utf-8") as fh:
+            text = fh.read()
+        with open(bad, "w", encoding="utf-8") as fh:
+            fh.write(text.replace(f"lock_file = {p.state_dir}/follower.lock", "lock_file = /proc/qpg/follower.lock"))
+        res = cli(bad, "follower", "copy-columns", "--table", "app.items", "--column", "label")
+        self.assertEqual(res.returncode, 5, res.stdout + res.stderr)
+        self.assertIn("cannot open the follower lock file", res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
 
     def test_4_row_security_refuses_instead_of_filtering(self):
         p = self.pair

@@ -179,6 +179,13 @@ MUTATIONS = {
         '                self._install_log_triggers(detail["scope"])',
         ["test_follower.RelogTest"],
     ),
+    # Sixth review: an owed '*' is cleared by a copy of any single column.
+    "owed-cleared-by-any-copy": (
+        "lib/qpg/follower.py",
+        "            covered_all = set(all_nonkey) <= set(cols)\n",
+        "            covered_all = True\n",
+        ["test_follower.CopyColumnsTest"],
+    ),
     # A3's refusal removed.
     "no-move-refusal": (
         "lib/qpg/follower.py",

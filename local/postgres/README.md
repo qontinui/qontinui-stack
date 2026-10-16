@@ -116,7 +116,7 @@ Two operator actions recur in the remedies below.
 
   A `resolve` of a rewrite, key-change or missing-value halt records that a
   copy is owed. `follower check` fails and `follower status` lists the owed
-  copy until copy-columns runs for that table.
+  copy until copy-columns has covered it. A rewrite or key-change owes EVERY non-key column, so only a copy-columns run without `--column` (or one naming all of them) clears it; a missing-value halt owes just its column.
 
 A **re-seed** of one table is not automated. Table sync cannot re-copy a
 table that a schema publication already carries. So it is either the full

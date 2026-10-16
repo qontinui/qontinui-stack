@@ -136,8 +136,11 @@ def follower_lock(path: str):
     own psql process, so no database session lives as long as a cycle. Both
     holders run on this host as the postgres user.
     """
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        raise Locked(f"cannot open the follower lock file {path}: {exc.strerror}") from exc
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -355,7 +358,15 @@ class Follower:
             script.append(f"DELETE FROM follower.replay_log WHERE op IN ({ops}) AND (relid = {oid} OR relid IN "
                           f"(SELECT relid FROM pg_partition_tree({oid})));")
         if kase in ("rewrite", "key-change", "missing-value"):
-            table, columns = (target.rsplit(".", 1) if kase == "missing-value" else (target, "*"))
+            # Owed copies are recorded as nspname.relname resolved by OID — the
+            # form copy-columns' --table matches — so they are always clearable.
+            if kase == "missing-value":
+                table, columns = target.rsplit(".", 1)
+            else:
+                table = self.admin.scalar(
+                    "SELECT n.nspname || '.' || c.relname FROM pg_class c JOIN pg_namespace n "
+                    f"ON n.oid = c.relnamespace WHERE c.oid = {oid}")
+                columns = "*"
             script.append("INSERT INTO follower.owed (relation, columns, xid, kase) VALUES "
                           f"({lit(table)}, {lit(columns)}, {lit(xid)}, {lit(kase)}) ON CONFLICT DO NOTHING;")
         self.admin.execute("\n".join(script))
@@ -430,7 +441,8 @@ class Follower:
                 "SELECT a.attname FROM pg_attribute a WHERE a.attrelid = "
                 f"to_regclass({lit(qualified(schema, name))}) AND a.attnum > 0 AND NOT a.attisdropped "
                 "AND a.attgenerated = '' ORDER BY a.attnum")])
-        cols = columns or [c for c in both[0] if c in both[1] and c not in key]
+        all_nonkey = [c for c in both[0] if c in both[1] and c not in key]
+        cols = columns or all_nonkey
         missing = [c for c in cols if c not in both[0] or c not in both[1]]
         if missing or not cols:
             raise ConfigError(f"columns {missing or cols} are not on both sides of {table}")
@@ -446,8 +458,8 @@ class Follower:
             if time.monotonic() > deadline:
                 raise Halt(f"copy-columns refused: apply did not catch up to the publisher's {lsn}")
             time.sleep(0.5)
-        self._disable()
         try:
+            self._disable()  # inside the try: a timeout still re-enables the subscription
             data = self.pub.copy_out(
                 f"SELECT {sel} FROM {target}",
                 prelude="SET LOCAL row_security = off;\n" + self._version_guard(),
@@ -467,9 +479,12 @@ class Follower:
                    "rows read from the publisher do not exist locally (more than --allow-unmatched); nothing "
                    "was updated'; END IF; END $$;"))
             updated = int((out.strip().splitlines() or ["0"])[-1])
+            # An owed '*' (every non-key column) clears only when this copy
+            # covered every non-key column; a named column clears when copied.
+            covered_all = set(all_nonkey) <= set(cols)
             self.admin.execute(
-                f"DELETE FROM follower.owed WHERE relation = {lit(table)} AND (columns = '*' OR columns = ANY("
-                f"{text_array(cols)}))")
+                f"DELETE FROM follower.owed WHERE relation = {lit(table)} AND (columns = ANY({text_array(cols)})"
+                + (" OR columns = '*'" if covered_all else "") + ")")
         finally:
             self.admin.execute(f"ALTER SUBSCRIPTION {ident(self.cfg.subscription)} ENABLE", single_transaction=False)
         result = {"table": table, "columns": cols, "rows_read": read, "rows_updated": updated,
