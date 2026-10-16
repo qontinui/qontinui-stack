@@ -175,6 +175,23 @@ module "coord" {
   cognito_user_pool_arn = var.cognito_user_pool_arn
 }
 
+# ─── NATS JetStream (ECS Fargate + EFS + Cloud Map) ─────────────────────
+# Hand-built 2026-05-20 and adopted here by import, not created — the
+# `import {}` blocks are in nats-imports.tf. Shares coord's cluster, exec role
+# and client SG. See modules/nats/main.tf before changing anything in it.
+
+module "nats" {
+  source = "../modules/nats"
+
+  environment        = var.environment
+  region             = var.region
+  vpc_id             = module.network.vpc_id
+  subnet_ids         = module.network.private_subnet_ids
+  client_sg_id       = module.network.client_sg_id
+  cluster_id         = module.coord.cluster_id
+  task_exec_role_arn = module.coord.task_exec_role_arn
+}
+
 # ─── Canonical-DB migrator (one-off alembic upgrade head) ───────────────
 # Creates coord.* + public.* in qontinui_db. SQLAlchemy/alembic need the
 # `postgresql://` scheme; the postgres module emits `postgres://`.
