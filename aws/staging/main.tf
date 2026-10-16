@@ -96,6 +96,16 @@ module "postgres" {
   db_name               = var.postgres_db_name
   multi_az              = var.postgres_multi_az
   backup_retention_days = var.postgres_backup_retention_days
+
+  # rds.logical_replication=1 and max_slot_wal_keep_size=8192 (MB), both
+  # pending-reboot, are staged in the module behind this flag. It stays FALSE
+  # until Phase 2 of plan 2026-10-15-coord-and-web-data-move-off-aws-by-logical-
+  # replication: changing the live parameter group is itself a production
+  # mutation, so an untargeted apply after this merge must not touch it. Phase 2
+  # flips this to true, then applies
+  # -target=module.postgres.aws_db_parameter_group.main and takes the announced
+  # 23:00 UTC reboot (operator gate 3fd552ff-f353-4b34-b1b7-b5e61106f39a).
+  logical_replication_enabled = false
 }
 
 # ─── Redis ──────────────────────────────────────────────────────────────
@@ -346,6 +356,28 @@ module "observability" {
   coord_log_group_name = module.coord.log_group_name
 
   postgres_instance_identifier = module.postgres.identifier
+}
+
+# ─── Replication tunnel (off-AWS logical replica) ───────────────────────
+# Tailscale subnet router + reverse forwarder between RDS and the local
+# subscriber (plan 2026-10-15-coord-and-web-data-move-off-aws-by-logical-
+# replication, D2). DISABLED: with enabled = false the module plans zero
+# resources and makes no AWS reads. Phase 3 turns it on, after Phase 1c has
+# imported the qontinui-staging Cloud Map namespace (cloud_map_namespace_id) and
+# the operator has decided OD1-OD3; see the module header for the order.
+
+module "replication_tunnel" {
+  source = "../modules/replication-tunnel"
+
+  enabled = false
+
+  environment          = var.environment
+  region               = var.region
+  vpc_id               = module.network.vpc_id
+  public_subnet_ids    = module.network.public_subnet_ids
+  cluster_id           = module.coord.cluster_id
+  db_security_group_id = module.network.data_plane_sg_id
+  db_subnet_ids        = module.postgres.subnet_ids
 }
 
 # ─── Operator-staged, out-of-region ─────────────────────────────────────

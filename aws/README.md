@@ -51,6 +51,8 @@ aws/
    ├─ redis/                         (ElastiCache replication group)
    ├─ blob/                          (S3 bucket + IAM policy)
    ├─ coord/                         (ECS Fargate service for qontinui-coord)
+   ├─ replication-tunnel/            (Tailscale subnet router for the off-AWS
+   │                                  logical replica; disabled by default)
    └─ tunnel/                        (ALB + ACM + Route53 — ingress)
 ```
 
