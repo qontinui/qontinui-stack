@@ -179,9 +179,12 @@ module "coord" {
 # Hand-built 2026-05-20 and adopted here by import, not created — the
 # `import {}` blocks are in nats-imports.tf. Shares coord's cluster, exec role
 # and client SG. See modules/nats/main.tf before changing anything in it.
+# Off until the operator sets var.nats_under_code (declared in
+# nats-imports.tf, which says why and how).
 
 module "nats" {
   source = "../modules/nats"
+  count  = var.nats_under_code ? 1 : 0
 
   environment        = var.environment
   region             = var.region

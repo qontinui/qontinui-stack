@@ -9,6 +9,8 @@
 # `terraform plan` shows ONLY imports — 0 to add, 0 to change, 0 to destroy.
 # Any edit that makes the plan show a change is a real change to production
 # NATS, and must be made deliberately, not as a side effect of the import.
+# The root instantiates this module only when var.nats_under_code is true
+# (default false), so merging it is a no-op until the operator's gated import.
 # Plan: 2026-10-15-coord-and-web-data-move-off-aws-by-logical-replication,
 # Phase 1c / decision D13.
 #
