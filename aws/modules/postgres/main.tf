@@ -45,6 +45,52 @@ variable "deletion_protection" {
   default     = true
 }
 
+# Logical decoding for the off-AWS replica (plan
+# 2026-10-15-coord-and-web-data-move-off-aws-by-logical-replication, Phase 1b;
+# design D5 + D11). Default false so a composition that does not replicate keeps
+# a parameter group with neither parameter. aws/staging keeps it FALSE until
+# Phase 2, because changing the live parameter group is itself a production
+# mutation that an untargeted apply after merge must not perform. Phase 2 flips
+# it to true in aws/staging and runs
+#   terraform apply -target=module.postgres.aws_db_parameter_group.main
+# followed by the announced reboot.
+#
+# Why setting it true cannot reboot or change live behaviour before that
+# announced reboot:
+#   - Both parameters carry apply_method = "pending-reboot". ModifyDBParameterGroup
+#     with pending-reboot only records the value; RDS never reboots on its own
+#     for it. The instance shows the group as `pending-reboot` until a reboot.
+#   - rds.logical_replication is static, so pending-reboot is the only method
+#     RDS accepts for it.
+#   - max_slot_wal_keep_size is dynamic, and could apply immediately. It is
+#     deliberately pending-reboot too: it bounds WAL kept by replication slots,
+#     no slot can exist before the reboot (wal_level is still `replica`), and
+#     staging both values together means the group, the instance and the
+#     announced reboot all move as one change.
+#   - The only path that applies them early is an unplanned reboot (host
+#     replacement, a maintenance-window minor upgrade). That turns on
+#     wal_level = logical with no publication and no slot: a little more WAL,
+#     no refused writes, no retained WAL.
+variable "logical_replication_enabled" {
+  description = "Stage rds.logical_replication=1 and max_slot_wal_keep_size on the parameter group, both pending-reboot. Takes effect only at the next instance reboot."
+  type        = bool
+  default     = false
+}
+
+# D11: 8 GB caps the WAL an inactive slot may hold (about 4-7 hours of
+# subscriber outage at measured WAL rates) before RDS invalidates the slot,
+# trading a re-seed for production's disk. Unit is MB, as RDS takes it.
+variable "max_slot_wal_keep_size_mb" {
+  description = "max_slot_wal_keep_size in MB, applied only when logical_replication_enabled is true."
+  type        = number
+  default     = 8192
+
+  validation {
+    condition     = var.max_slot_wal_keep_size_mb > 0
+    error_message = "max_slot_wal_keep_size_mb must be positive: -1 (the engine default) lets an inactive slot hold WAL until the disk fills."
+  }
+}
+
 resource "random_password" "master" {
   length  = 32
   special = true
@@ -106,6 +152,20 @@ resource "aws_db_parameter_group" "main" {
   parameter {
     name  = "tcp_keepalives_count"
     value = "6"
+  }
+
+  # Logical decoding for the off-AWS replica; see var.logical_replication_enabled
+  # for why both are pending-reboot and why staging them reboots nothing.
+  dynamic "parameter" {
+    for_each = var.logical_replication_enabled ? {
+      "rds.logical_replication" = "1"
+      "max_slot_wal_keep_size"  = tostring(var.max_slot_wal_keep_size_mb)
+    } : {}
+    content {
+      name         = parameter.key
+      value        = parameter.value
+      apply_method = "pending-reboot"
+    }
   }
 }
 
@@ -217,6 +277,12 @@ output "username" {
 
 output "master_secret_arn" {
   value = aws_secretsmanager_secret.master.arn
+}
+
+# The DB subnet group's subnets: the replication router advertises their CIDRs
+# (not the instance's /32, which moves on host replacement).
+output "subnet_ids" {
+  value = aws_db_subnet_group.main.subnet_ids
 }
 
 # Connection string with the password URL-encoded inline. Sensitive output.
