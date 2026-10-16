@@ -48,8 +48,12 @@ locals {
     efs_sg            = "sg-0d9aa1ccb55156971"
     file_system       = "fs-0fa99b01b8c7a3663"
     access_point      = "fsap-07a5cd0192ce1f957"
-    # Ordered as module.network.private_subnet_ids: [0] is us-east-1a, [1] us-east-1b.
-    mount_targets  = ["fsmt-0511de7df72840128", "fsmt-0a06ee4464cf2eeff"]
+    # Mount target per subnet (module.network private subnets, us-east-1a / -1b),
+    # matching the module's for_each key.
+    mount_targets = {
+      "subnet-028bf10da691b2a0a" = "fsmt-0511de7df72840128"
+      "subnet-0c80a07fd645cd22d" = "fsmt-0a06ee4464cf2eeff"
+    }
     task_role      = "qontinui-staging-nats-task"
     log_group      = "/ecs/qontinui-staging/nats"
     task_def       = "arn:aws:ecs:us-east-1:047719635665:task-definition/qontinui-staging-nats:1"
@@ -107,15 +111,11 @@ import {
 }
 
 import {
-  for_each = local.nats_import_enabled
-  to       = module.nats[0].aws_efs_mount_target.jetstream[0]
-  id       = local.nats_import_ids.mount_targets[0]
-}
-
-import {
-  for_each = local.nats_import_enabled
-  to       = module.nats[0].aws_efs_mount_target.jetstream[1]
-  id       = local.nats_import_ids.mount_targets[1]
+  # Both mount targets in one block: for_each over the subnet -> mount target
+  # map (empty when the gate is off), keyed like the module's for_each.
+  for_each = var.nats_under_code ? local.nats_import_ids.mount_targets : {}
+  to       = module.nats[0].aws_efs_mount_target.jetstream[each.key]
+  id       = each.value
 }
 
 import {
