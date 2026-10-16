@@ -52,7 +52,7 @@ MUTATIONS = {
     # Re-review A2: a renamed table is not detected.
     "no-rename-check": (
         "lib/qpg/follower.py",
-        "        if renamed:\n",
+        '        if renamed and not self._resolved(xid, "rename"):\n',
         "        if False:\n",
         ["test_follower.RenameTest"],
     ),
@@ -84,6 +84,42 @@ MUTATIONS = {
         '        if not self.cfg.getbool("follower", "acknowledge_known_gaps", False):',
         "        if False:",
         ["test_follower.AcknowledgeTest"],
+    ),
+    # Re-review B1: rewrites after the replay's DML are not checked.
+    "no-rewrite-check": (
+        "lib/qpg/follower.py",
+        "        if unsafe:\n",
+        "        if False:\n",
+        ["test_follower.TypeRewriteTest"],
+    ),
+    # Re-review B2: stored defaults keyed by column NAME, so a drop + re-add is missed.
+    "missing-by-name": (
+        "lib/qpg/follower.py",
+        "\"SELECT a.attrelid::text || ':' || a.attnum::text, a.attname,",
+        "\"SELECT a.attrelid::text || ':' || a.attname, a.attname,",
+        ["test_follower.DropAddColumnTest"],
+    ),
+    # Re-review B3: `follower resolve` does not record the resolution.
+    "resolve-not-recorded": (
+        "lib/qpg/follower.py",
+        '            "INSERT INTO follower.resolutions (xid, kase, target) VALUES "\n'
+        '            f"({lit(prior[\'xid\'])}, {lit(kase)}, {lit(target or \'*\')}) ON CONFLICT DO NOTHING")',
+        '            "SELECT 1")',
+        ["test_follower.RenameTest", "test_follower.MissingValueTest"],
+    ),
+    # Re-review B4: the stored-default check ignores recorded resolutions.
+    "resolution-ignored": (
+        "lib/qpg/follower.py",
+        '            if self._resolved(xid, "missing-value", f"{table}.{column}"):\n',
+        "            if False:\n",
+        ["test_follower.MissingValueTest"],
+    ),
+    # Re-review B5: a halt leaves the subscription enabled.
+    "halt-leaves-enabled": (
+        "lib/qpg/follower.py",
+        '            if enabled == "true":\n                self.admin.execute(f"ALTER SUBSCRIPTION',
+        '            if False:\n                self.admin.execute(f"ALTER SUBSCRIPTION',
+        ["test_follower.DmlThenDdlTest"],
     ),
     # A3's refusal removed.
     "no-move-refusal": (

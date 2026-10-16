@@ -109,9 +109,23 @@ CREATE TABLE IF NOT EXISTS follower.armed_versions (
 CREATE TABLE IF NOT EXISTS follower.replay_log (
     id      bigserial PRIMARY KEY,
     relid   oid NOT NULL,
-    op      text NOT NULL CHECK (op IN ('I', 'K')),
+    op      text NOT NULL,
     new_key jsonb NOT NULL,
     old_key jsonb
+);
+-- I insert (key), K key change, T statement-level DML on a table, R a table
+-- rewrite (event trigger). Ordered by id, which is how DML-before-rewrite is told.
+ALTER TABLE follower.replay_log DROP CONSTRAINT IF EXISTS replay_log_op_check;
+ALTER TABLE follower.replay_log ADD CONSTRAINT replay_log_op_check CHECK (op IN ('I', 'K', 'T', 'R'));
+
+-- An operator's recorded resolution of one halt case for one migration
+-- transaction (`qontinui-pg follower resolve`), which the replay checks honour.
+CREATE TABLE IF NOT EXISTS follower.resolutions (
+    xid         text NOT NULL,
+    kase        text NOT NULL,
+    target      text NOT NULL,
+    resolved_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (xid, kase, target)
 );
 
 CREATE TABLE IF NOT EXISTS follower.events (
@@ -195,12 +209,39 @@ BEGIN
 END
 $fn$;
 
+CREATE OR REPLACE FUNCTION follower.replay_touch() RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, follower
+AS $fn$
+BEGIN
+    INSERT INTO follower.replay_log (relid, op, new_key) VALUES (TG_RELID, 'T', jsonb_build_object('op', TG_OP));
+    RETURN NULL;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION follower.replay_rewrite() RETURNS event_trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, follower
+AS $fn$
+BEGIN
+    INSERT INTO follower.replay_log (relid, op, new_key)
+    VALUES (pg_event_trigger_table_rewrite_oid(), 'R',
+            jsonb_build_object('reason', pg_event_trigger_table_rewrite_reason()));
+END
+$fn$;
+
 RESET ROLE;
 
 REVOKE ALL ON FUNCTION follower.stall_marker() FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION follower.stall_marker() TO {ar};
 REVOKE ALL ON FUNCTION follower.replay_log() FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION follower.replay_log() TO {ar};
+REVOKE ALL ON FUNCTION follower.replay_touch() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION follower.replay_touch() TO {ar};
+REVOKE ALL ON FUNCTION follower.replay_rewrite() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION follower.replay_rewrite() TO {ar};
 """
 
 
@@ -217,6 +258,23 @@ ALTER TABLE {target} ENABLE REPLICA TRIGGER {TRIGGER_NAME};
 
 
 LOG_TRIGGER = "qontinui_follower_replay_log"
+TOUCH_TRIGGER = "qontinui_follower_replay_touch"
+REWRITE_EVENT_TRIGGER = "qontinui_follower_replay_rewrite"
+
+
+def touch_trigger_sql(table: str) -> str:
+    """Statement-level, on every table (statement triggers are not inherited by partitions)."""
+    schema, name = table.split(".", 1)
+    target = qualified(schema, name)
+    return (f"DROP TRIGGER IF EXISTS {TOUCH_TRIGGER} ON {target};\n"
+            f"CREATE TRIGGER {TOUCH_TRIGGER} AFTER INSERT OR UPDATE ON {target} "
+            "FOR EACH STATEMENT EXECUTE FUNCTION follower.replay_touch();\n")
+
+
+REWRITE_EVENT_SQL = (
+    f"DROP EVENT TRIGGER IF EXISTS {REWRITE_EVENT_TRIGGER};\n"
+    f"CREATE EVENT TRIGGER {REWRITE_EVENT_TRIGGER} ON table_rewrite EXECUTE FUNCTION follower.replay_rewrite();\n")
+DROP_REWRITE_EVENT_SQL = f"DROP EVENT TRIGGER IF EXISTS {REWRITE_EVENT_TRIGGER};\n"
 
 
 def log_trigger_sql(table: str, kind: str, key: list[str]) -> str:

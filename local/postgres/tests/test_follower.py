@@ -194,6 +194,17 @@ def _halted_reason(pair: Pair) -> str:
     return state["status"] + ": " + (state["reason"] or "")
 
 
+def _subenabled(pair: Pair) -> str:
+    return pair.sub().scalar(f"SELECT subenabled::text FROM pg_subscription WHERE subname = '{pair.sub_name}'")
+
+
+def _copy_column_from_publisher(pair: Pair, table: str, column: str) -> None:
+    """The documented manual remedy for a stored default: copy the column, replica mode, subscription disabled."""
+    rows = pair.pub().rows(f"SELECT id::text, {column}::text FROM {table}")
+    pair.sub().execute("SET LOCAL session_replication_role = replica;\n" + "".join(
+        f"UPDATE {table} SET {column} = '{v}' WHERE id = {i};\n" for i, v in rows))
+
+
 class RenameTest(unittest.TestCase):
     """Re-review A2: a migration that renames a table halts; nothing is emptied."""
 
@@ -206,7 +217,7 @@ class RenameTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.pair.teardown()
 
-    def test_rename_halts_without_emptying(self):
+    def test_1_rename_halts_without_emptying(self):
         p = self.pair
         rows = p.sub().scalar("SELECT count(*) FROM app.settings")
         p.migrate_pub("n2")
@@ -216,6 +227,19 @@ class RenameTest(unittest.TestCase):
         self.assertIn("renamed or moved", reason)
         self.assertIn("app.settings -> app.settings_v2", reason)
         self.assertEqual(p.sub().scalar("SELECT count(*) FROM app.settings_v2"), rows)
+        self.assertEqual(_subenabled(p), "false")
+
+    def test_2_resolve_rename_carries_it_through(self):
+        """Re-review B3: `follower resolve --case rename` is a working exit, not a re-halt."""
+        p = self.pair
+        res = cli(p.conf, "follower", "resolve", "--case", "rename")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        p.pub(APP).execute("INSERT INTO app.settings_v2 (name, value) VALUES ('after rename', 'x')")
+        res = p.follow()
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertEqual(_subenabled(p), "true")
+        wait_caught_up(p)
+        p.assert_equal(self)
 
 
 class ForeignKeyNewTableTest(unittest.TestCase):
@@ -265,6 +289,12 @@ class DmlThenDdlTest(unittest.TestCase):
         reason = _halted_reason(p)
         self.assertIn("DML before later DDL", reason)
         self.assertIn("re-seed", reason)
+        # Re-review B5: this halt happens after re-enable; it must disable the
+        # subscription and say so.
+        self.assertEqual(_subenabled(p), "false")
+        left = p.sub().scalar("SELECT detail ->> 'left' FROM follower.events WHERE kind = 'halted' "
+                              "ORDER BY id DESC LIMIT 1")
+        self.assertIn("DISABLED the subscription", left)
 
 
 class MissingValueTest(unittest.TestCase):
@@ -290,6 +320,75 @@ class MissingValueTest(unittest.TestCase):
     def test_2_differing_stored_default_halts(self):
         p = self.pair
         p.migrate_pub("h3")
+        res = p.follow(timeout=60)
+        self.assertEqual(res.returncode, 3, res.stdout + res.stderr)
+        reason = _halted_reason(p)
+        self.assertIn("stored column default", reason)
+        self.assertIn("app.items.stamped", reason)
+        self.assertEqual(_subenabled(p), "false")
+
+    def test_3_recorded_resolution_after_the_remedy(self):
+        """Re-review B4: after copying the column, a recorded resolution lets the migration through."""
+        p = self.pair
+        _copy_column_from_publisher(p, "app.items", "stamped")
+        res = cli(p.conf, "follower", "resolve", "--case", "missing-value", "--target", "app.items.stamped")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        res = p.follow()
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        wait_caught_up(p)
+        p.assert_equal(self)
+
+
+class TypeRewriteTest(unittest.TestCase):
+    """Re-review B1: DML followed by ALTER … TYPE … USING in one migration halts.
+
+    Apply would carry the UPDATE's value (5) decoded before the rewrite, while
+    the publisher's rows were transformed (500): a silent divergence.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.pair = Pair("t_type_rewrite", web_dir="web-type-using")
+        cls.pair.setup()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.pair.teardown()
+
+    def test_halts(self):
+        p = self.pair
+        p.migrate_pub("y2")
+        res = p.follow(timeout=60)
+        self.assertEqual(res.returncode, 3, res.stdout + res.stderr)
+        reason = _halted_reason(p)
+        self.assertIn("rewritten after the migration changed its rows", reason)
+        self.assertIn("app.items", reason)
+        self.assertEqual(_subenabled(p), "false")
+
+
+class DropAddColumnTest(unittest.TestCase):
+    """Re-review B2: a same-named column dropped and re-added with a stored default is caught."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.pair = Pair("t_drop_add", web_dir="web-drop-add")
+        cls.pair.setup()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.pair.teardown()
+
+    def test_1_constant_default_passes(self):
+        p = self.pair
+        p.migrate_pub("z2")
+        res = p.follow()
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        wait_caught_up(p)
+        p.assert_equal(self)
+
+    def test_2_readded_column_halts(self):
+        p = self.pair
+        p.migrate_pub("z3")
         res = p.follow(timeout=60)
         self.assertEqual(res.returncode, 3, res.stdout + res.stderr)
         reason = _halted_reason(p)

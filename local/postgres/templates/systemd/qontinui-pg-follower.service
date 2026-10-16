@@ -12,6 +12,8 @@ Environment=QONTINUI_PG_CONFIG={config_path}
 Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=/usr/local/bin/qontinui-pg follower run
 Restart=on-failure
+# Exit 2 is a configuration error (or the unacknowledged known gaps): restarting cannot fix it.
+RestartPreventExitStatus=2
 RestartSec=30
 NoNewPrivileges=yes
 PrivateTmp=yes

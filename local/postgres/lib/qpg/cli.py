@@ -7,6 +7,7 @@ Exit codes: 0 ok; 1 a check failed / a difference or alert was found;
 from __future__ import annotations
 
 import argparse
+import configparser
 import ipaddress
 import json
 import os
@@ -49,6 +50,12 @@ def cmd_follower(args, cfg) -> int:
         return 0
     if args.action == "resume":
         f.resume()
+        return 0
+    if args.action == "resolve":
+        if not args.case:
+            raise ConfigError(f"follower resolve needs --case ({', '.join(sorted(f.RESOLVABLE))})")
+        f.resolve(args.case, args.target)
+        print(f"resolved {args.case} {args.target or ''}; resumed")
         return 0
     if args.action == "check":
         return _print_checks(f.check())
@@ -161,13 +168,15 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="group", required=True)
 
     f = sub.add_parser("follower", help="the schema follower (D7, A2-A4)")
-    f.add_argument("action", choices=["install", "seed", "run", "status", "resume", "check",
+    f.add_argument("action", choices=["install", "seed", "run", "status", "resume", "resolve", "check",
                                       "coord-adopt", "coord-refresh", "coord-gate-check"])
     f.add_argument("--once", action="store_true", help="run one cycle")
     f.add_argument("--until-idle", action="store_true", help="loop until settled, halted or --timeout")
     f.add_argument("--timeout", type=float, default=0.0)
     f.add_argument("--version", help="coord version (coord-adopt)")
     f.add_argument("--expect", help="seed: the web revision the loaded schema dump was taken at")
+    f.add_argument("--case", help="resolve: the halt case (rename | missing-value)")
+    f.add_argument("--target", help="resolve missing-value: <schema>.<table>.<column>")
     f.add_argument("--dry-run-notify", action="store_true", help="log notices, never post them")
     f.set_defaults(fn=cmd_follower)
 
@@ -221,7 +230,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         cfg = None if getattr(args, "needs_config", True) is False else config_mod.load(args.config)
         return args.fn(args, cfg)
-    except ConfigError as exc:
+    except (ConfigError, configparser.Error) as exc:
+        print(f"configuration error: {exc}", file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        # A malformed config value (getint/getboolean on a typo): exit 2, which
+        # the follower unit's RestartPreventExitStatus=2 does not restart.
         print(f"configuration error: {exc}", file=sys.stderr)
         return 2
     except Halt as exc:
