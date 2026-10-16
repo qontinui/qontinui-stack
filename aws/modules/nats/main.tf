@@ -34,11 +34,12 @@
 # THE TASK DEFINITION REVISION. Importing revision 1 does not replace it, as
 # long as container_definitions and the other ForceNew arguments match what
 # ECS reports — which is why the JSON below is field-for-field. A mismatch
-# does not plan an in-place edit: it plans a NEW revision plus deregistering
-# :1 and repointing the service (verified: changing only the image to
-# nats:2.10-alpine planned "16 to import, 1 to add, 1 to change, 1 to
-# destroy"). That is the intended path for a deliberate change later; for the
-# import it is the failure signal.
+# does not plan an in-place edit: container_definitions is ForceNew in the
+# provider, so it plans a NEW revision, the deregistration of :1 (the
+# provider's destroy for a task definition) and an in-place repoint of the
+# service. docs/nats-import-plan.txt records one such mutation run. That is
+# the intended path for a deliberate change later; for the import it is the
+# failure signal.
 #
 # TAGS. The live resources carry Project + Environment (+ Name) only. Project
 # and Environment come from the provider's default_tags with the same values,
@@ -57,7 +58,7 @@ variable "environment" { type = string }
 variable "vpc_id" { type = string }
 
 variable "subnet_ids" {
-  description = "Private subnets the NATS task runs in and the EFS mount targets live in, one per AZ, in the order of the live mount targets."
+  description = "Private subnets the NATS task runs in and the EFS mount targets live in, one per AZ. Mount targets are keyed by subnet id, so the order does not matter."
   type        = list(string)
 }
 
@@ -121,6 +122,8 @@ resource "aws_service_discovery_service" "nats" {
 
   lifecycle {
     # force_destroy is a Terraform-only flag the import leaves null.
+    # This also swallows any future edit to that flag in this file: a
+    # deliberate change to it must remove it from ignore_changes first.
     ignore_changes = [tags_all, force_destroy]
   }
 }
@@ -144,6 +147,8 @@ resource "aws_security_group" "nats" {
 
   lifecycle {
     # revoke_rules_on_delete is a Terraform-only flag the import leaves null.
+    # This also swallows any future edit to that flag in this file: a
+    # deliberate change to it must remove it from ignore_changes first.
     ignore_changes = [tags_all, revoke_rules_on_delete]
   }
 }
@@ -184,6 +189,8 @@ resource "aws_security_group" "efs" {
 
   lifecycle {
     # revoke_rules_on_delete is a Terraform-only flag the import leaves null.
+    # This also swallows any future edit to that flag in this file: a
+    # deliberate change to it must remove it from ignore_changes first.
     ignore_changes = [tags_all, revoke_rules_on_delete]
   }
 }
@@ -221,11 +228,17 @@ resource "aws_efs_file_system" "jetstream" {
   }
 }
 
+# Keyed by subnet id, not count-indexed: with count, a reorder of
+# private_subnet_ids would re-pair index and subnet and plan both mount
+# targets for replacement (unmounting the store under the running task).
+# Keyed by subnet id, a reorder is a no-op. Limitation: the keys must be known
+# at plan time, which holds here because the subnets already exist; a brand
+# new environment would have to create the network first.
 resource "aws_efs_mount_target" "jetstream" {
-  count = length(var.subnet_ids)
+  for_each = toset(var.subnet_ids)
 
   file_system_id  = aws_efs_file_system.jetstream.id
-  subnet_id       = var.subnet_ids[count.index]
+  subnet_id       = each.value
   security_groups = [aws_security_group.efs.id]
 }
 
@@ -393,6 +406,8 @@ resource "aws_ecs_task_definition" "nats" {
   lifecycle {
     # skip_destroy is a Terraform-only flag the import leaves null; ignoring it
     # keeps the import from planning a state-only update.
+    # This also swallows any future edit to that flag in this file: a
+    # deliberate change to it must remove it from ignore_changes first.
     ignore_changes = [tags_all, skip_destroy]
   }
 }
@@ -407,8 +422,13 @@ resource "aws_ecs_service" "nats" {
   platform_version = "LATEST"
   desired_count    = 1
 
-  # JetStream on one EFS directory is single-writer: max 200 / min 0 lets a
-  # deployment stop the old task before the new one must be healthy.
+  # The live setting, kept as-is so the import changes nothing. It is NOT
+  # single-writer safe: max 200 lets a deployment start the new task while
+  # the old one still runs, so two nats-server processes can briefly share
+  # the one JetStream directory on EFS. That is an existing risk, not one this
+  # import adds. The single-writer setting is max 100 / min 0 (stop the old
+  # task first); change it together with D13's leafnode task-definition change,
+  # which is the next deployment of this service anyway.
   deployment_maximum_percent         = 200
   deployment_minimum_healthy_percent = 0
   availability_zone_rebalancing      = "ENABLED"
@@ -434,6 +454,8 @@ resource "aws_ecs_service" "nats" {
 
   lifecycle {
     # wait_for_steady_state is a Terraform-only flag the import leaves null.
+    # This also swallows any future edit to that flag in this file: a
+    # deliberate change to it must remove it from ignore_changes first.
     ignore_changes = [tags_all, wait_for_steady_state]
   }
 }

@@ -2,10 +2,10 @@
 #
 # Plan: 2026-10-15-coord-and-web-data-move-off-aws-by-logical-replication, Phase 1c / D13.
 # Produced 2026-10-16 in aws/staging with Terraform 1.9.8, hashicorp/aws 5.100.0
-# (the checked-in lock), against the live production state, on top of bf1c3e5
-# plus the nats_under_code gate. Every plan below ran with -lock=false.
+# (the checked-in lock), against the live production state, on top of 2f6dbdf
+# plus the review fixes committed with this file. Every plan ran with -lock=false.
 #
-# module.nats and all 16 import blocks are gated on var.nats_under_code
+# module.nats and all import blocks are gated on var.nats_under_code
 # (default false, declared in aws/staging/nats-imports.tf), so merging changes
 # nothing until the operator enables it for the gated apply.
 #
@@ -27,6 +27,17 @@
 #      terraform plan -lock=false -input=false -no-color -var nats_under_code=true
 #    Plan: 16 to import, 0 to add, 4 to change, 0 to destroy.
 #    (the same 4 drift changes as in 1, none in module.nats)
+#
+# 4. MUTATION (evidence for the task-definition note in aws/modules/nats/main.tf;
+#    not committed): the container image alone changed to nats:2.10-alpine,
+#    then plan 2's command. Excerpt:
+#       # module.nats[0].aws_ecs_service.nats will be updated in-place
+#           ~ task_definition                    = "qontinui-staging-nats:1" -> (known after apply)
+#       # module.nats[0].aws_ecs_task_definition.nats must be replaced
+#                       ~ image            = "nats:2-alpine" -> "nats:2.10-alpine"
+#                 ] # forces replacement
+#     Plan: 16 to import, 1 to add, 1 to change, 1 to destroy.
+#    The image was restored and plan 2 re-run to 16/0/0/0.
 #
 # Refresh-progress lines are omitted. Mount-target private IPs, AWS-generated
 # DNS names and the Route 53 hosted zone id are replaced with <redacted>; the
@@ -292,7 +303,7 @@ Terraform will perform the following actions:
         }
     }
 
-  # module.nats[0].aws_efs_mount_target.jetstream[0] will be imported
+  # module.nats[0].aws_efs_mount_target.jetstream["subnet-028bf10da691b2a0a"] will be imported
     resource "aws_efs_mount_target" "jetstream" {
         availability_zone_id   = "use1-az2"
         availability_zone_name = "us-east-1a"
@@ -310,7 +321,7 @@ Terraform will perform the following actions:
         subnet_id              = "subnet-028bf10da691b2a0a"
     }
 
-  # module.nats[0].aws_efs_mount_target.jetstream[1] will be imported
+  # module.nats[0].aws_efs_mount_target.jetstream["subnet-0c80a07fd645cd22d"] will be imported
     resource "aws_efs_mount_target" "jetstream" {
         availability_zone_id   = "use1-az4"
         availability_zone_name = "us-east-1b"
