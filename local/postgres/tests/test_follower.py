@@ -189,6 +189,125 @@ class RestampTest(unittest.TestCase):
         self.assertEqual(p.sub().scalar("SELECT count(*) FROM app.items WHERE label = 'downgrade dml'"), "0")
 
 
+def _halted_reason(pair: Pair) -> str:
+    state = json.loads(cli(pair.conf, "follower", "status", check=True).stdout)
+    return state["status"] + ": " + (state["reason"] or "")
+
+
+class RenameTest(unittest.TestCase):
+    """Re-review A2: a migration that renames a table halts; nothing is emptied."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.pair = Pair("t_rename", web_dir="web-rename")
+        cls.pair.setup()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.pair.teardown()
+
+    def test_rename_halts_without_emptying(self):
+        p = self.pair
+        rows = p.sub().scalar("SELECT count(*) FROM app.settings")
+        p.migrate_pub("n2")
+        res = p.follow(timeout=60)
+        self.assertEqual(res.returncode, 3, res.stdout + res.stderr)
+        reason = _halted_reason(p)
+        self.assertIn("renamed or moved", reason)
+        self.assertIn("app.settings -> app.settings_v2", reason)
+        self.assertEqual(p.sub().scalar("SELECT count(*) FROM app.settings_v2"), rows)
+
+
+class ForeignKeyNewTableTest(unittest.TestCase):
+    """Re-review A3: a new table referenced by a foreign key from an existing one.
+
+    TRUNCATE of the new table fails on that key, every time; the follower
+    empties it with DELETE in replica mode instead, and a step that fails
+    `max_step_failures` times running halts rather than looping.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.pair = Pair("t_fk_new_table", web_dir="web-fk")
+        cls.pair.setup()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.pair.teardown()
+
+    def test_follows(self):
+        p = self.pair
+        p.migrate_pub("f2")
+        res = p.follow(timeout=90)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        wait_caught_up(p)
+        p.assert_equal(self)
+        self.assertEqual(p.sub().scalar("SELECT count(*) FROM app.kinds"), "2")
+
+
+class DmlThenDdlTest(unittest.TestCase):
+    """Re-review B1: DML before later DDL in the migration halts and names the gap."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.pair = Pair("t_dml_then_ddl", web_dir="web-dml-ddl")
+        cls.pair.setup()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.pair.teardown()
+
+    def test_halts_naming_the_gap(self):
+        p = self.pair
+        p.migrate_pub("d2")
+        res = p.follow(timeout=90)
+        self.assertEqual(res.returncode, 3, res.stdout + res.stderr)
+        reason = _halted_reason(p)
+        self.assertIn("DML before later DDL", reason)
+        self.assertIn("re-seed", reason)
+
+
+class MissingValueTest(unittest.TestCase):
+    """Re-review B5: a stored column default that differs from the publisher's halts."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.pair = Pair("t_missing_value", web_dir="web-missing")
+        cls.pair.setup()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.pair.teardown()
+
+    def test_1_equal_stored_default_passes(self):
+        p = self.pair
+        p.migrate_pub("h2")
+        res = p.follow()
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        wait_caught_up(p)
+        p.assert_equal(self)
+
+    def test_2_differing_stored_default_halts(self):
+        p = self.pair
+        p.migrate_pub("h3")
+        res = p.follow(timeout=60)
+        self.assertEqual(res.returncode, 3, res.stdout + res.stderr)
+        reason = _halted_reason(p)
+        self.assertIn("stored column default", reason)
+        self.assertIn("app.items.stamped", reason)
+
+
+class AcknowledgeTest(unittest.TestCase):
+    """Re-review C: the follower refuses to run until the known gaps are acknowledged."""
+
+    def test_refuses_without_acknowledgement(self):
+        p = Pair("t_no_ack", no_ack=True)
+        p.write_conf()  # no database is touched: the refusal comes first
+        res = cli(p.conf, "follower", "run", "--once")
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+        self.assertIn("acknowledge_known_gaps", res.stderr)
+
+
 class CoordLaneTest(unittest.TestCase):
     """A2: the coord lane under r16's fallback, with a fixture coord-migrate.
 

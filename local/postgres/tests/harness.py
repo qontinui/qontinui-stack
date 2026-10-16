@@ -84,9 +84,11 @@ class Pair:
     """A publisher database and a subscriber database with the fixture schema."""
 
     def __init__(self, name: str, *, coord_lane: bool = False, extra_conf: str = "",
-                 published: str = "TABLES IN SCHEMA app, TABLE public.alembic_version", web_dir: str = "web"):
+                 published: str = "TABLES IN SCHEMA app, TABLE public.alembic_version", web_dir: str = "web",
+                 no_ack: bool = False):
         self.name = name
         self.web_dir = web_dir
+        self.no_ack = no_ack
         self.sub_name = f"qsub_{name}"
         self.coord_lane = coord_lane
         self.published = published
@@ -146,6 +148,8 @@ version_table = public.alembic_version
 coord_lane = {'true' if self.coord_lane else 'false'}
 {coord_keys}phase8_complete = false
 stall_fresh_seconds = 60
+max_step_failures = 3
+acknowledge_known_gaps = {'false' if self.no_ack else 'true'}
 
 [seqsync]
 floor = 1000
@@ -248,7 +252,8 @@ enabled = false
                 raise
 
     # operations
-    def migrate_pub(self, rev: str, fixture_dir: str = "web") -> None:
+    def migrate_pub(self, rev: str, fixture_dir: str | None = None) -> None:
+        fixture_dir = fixture_dir or self.web_dir
         subprocess.run(
             [sys.executable, os.path.join(FIXTURES, "fake_alembic.py"), "--dir", os.path.join(FIXTURES, fixture_dir),
              "--dsn", dsn("PUB", self.name, APP), "upgrade", rev], check=True, capture_output=True, text=True)

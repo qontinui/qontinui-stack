@@ -12,3 +12,12 @@ CREATE TABLE app.items (
     id    bigserial PRIMARY KEY,
     label text NOT NULL
 );
+-- A partitioned table in scope: the follower's replay-log trigger must go on
+-- the parent only (its partitions inherit it).
+CREATE TABLE app.events (
+    id   uuid NOT NULL DEFAULT gen_random_uuid(),
+    day  date NOT NULL,
+    note text,
+    PRIMARY KEY (id, day)
+) PARTITION BY RANGE (day);
+CREATE TABLE app.events_all PARTITION OF app.events DEFAULT;

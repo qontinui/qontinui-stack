@@ -317,7 +317,7 @@ systemd_apply() {
       "SELECT count(*) FROM pg_settings WHERE pending_restart" 2>/dev/null || echo 0)"
     if [ "${pending:-0}" != 0 ]; then
       local subs
-      subs="$(runuser -u postgres -- psql -X -qtA -p "$PORT" -d "$(conf_get cluster database qontinui_db)" -c \
+      subs="$(runuser -u postgres -- psql -X -qtA -p "$PORT" -d postgres -c \
         "SELECT count(*) FROM pg_subscription" 2>/dev/null || echo UNKNOWN)"
       if [ "$subs" != 0 ]; then
         # A restart stops apply; an unbounded stop invalidates the publisher's

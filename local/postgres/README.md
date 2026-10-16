@@ -17,7 +17,7 @@ the lead.
 | Piece | Plan | What it does |
 |---|---|---|
 | `install.sh` | D4, D15, D16 | Installs PGDG `postgresql-16`, `postgresql-16-pgvector` (0.8.x) and `pgbackrest` as native packages. Creates the cluster on the LUKS volume (it refuses any other volume). Renders `postgresql.conf` and `pg_hba.conf`. The server listens on the tailnet address and the unix socket only. The application role may log in without TLS, but only from the tailnet, because coord connects `NoTls`. Every other client must use `hostssl`. The installer also renders pgBackRest (encrypted repo2, 35 days, `archive-push-queue-max=20GiB`, no repo1 on a one-disk host) and the systemd units. It has three modes: `--check`, `--uninstall`, and safe `--dry-run`/`--root` modes. |
-| `qontinui-pg follower` | D7, A2–A4, B2 | The schema follower (`lib/qpg/follower.py`, see its docstring). It uses a stall marker on `public.alembic_version`: a `BEFORE INSERT OR UPDATE`, `ENABLE REPLICA`, `SECURITY DEFINER` trigger owned by `qontinui_follower`. The follower finds the migration transaction by its xid. With the subscription disabled, it replays the migration locally as `qontinui_user` while a replay-log trigger records every row the replay inserts. It deletes those rows again by typed key, locally, and re-enables the subscription. Apply then carries the migration's own DML with production's values, in commit order, so no follower write can collide with apply, and the follower reads no table data from the publisher. This replaces the plan's SKIP-then-repair (D7 steps 3–4); see the module docstring for why and for the residual cases. It refuses a move into an unpublished schema (A3). The coord lane (A2) sits behind `coord_lane = true`, and `phase8_complete = true` forbids it (A4). |
+| `qontinui-pg follower` | D7, A2–A4, B2 | The schema follower (`lib/qpg/follower.py`, see its docstring). It uses a stall marker on `public.alembic_version`: a `BEFORE INSERT OR UPDATE`, `ENABLE REPLICA`, `SECURITY DEFINER` trigger owned by `qontinui_follower`. The follower finds the migration transaction by its xid. With the subscription disabled, it replays the migration locally as `qontinui_user` while a replay-log trigger records every row the replay inserts. It deletes those rows again by typed key, locally, and re-enables the subscription. Apply then carries the migration's own DML with production's values, in commit order, and the follower reads no table data from the publisher. This replaces the plan's SKIP-then-repair (D7 steps 3–4). It fails closed: it halts on the shapes it can detect, and it refuses to run at all until `[follower] acknowledge_known_gaps = true` (see **Known gaps** below). It refuses a move into an unpublished schema (A3). The coord lane (A2) sits behind `coord_lane = true`, and `phase8_complete = true` forbids it (A4). |
 | `qontinui-pg seqsync` | D6 | Copies sequence positions with a margin per sequence: 3× the largest 5-minute advance in 24 h, never under 1,000. `--final` raises the floor to 10,000. A sequence that reads NULL without privilege is an error. The command never moves a value backwards. `--reverse` copies to RDS for D8, and `--from-data` sets sequences from local data after a restore. |
 | `qontinui-pg watchdog` | D11, A2 item 6, A6 | Checks the slot's `wal_status` and retained WAL (alert at 2 GB), the apply lag, the follower, the host's free space (alert under 30 GB), and the archiver. It reads the publisher's catalog for published tables that have no replica identity. When configured, it also checks the reverse subscription. A signal it cannot read counts as an alert. Notices are logged. They are posted to coord's `/coord/agent-findings` only with `[notify] enabled = true`. |
 | `qontinui-pg partitions` | D9 | Calls lane D's `coord.test_results_partition_maintenance(retention, lookahead)` as `qontinui_user`. |
@@ -54,6 +54,12 @@ its tests RED. Every container is removed on exit. CI runs the same script
 | Continuous publisher inserts and updates on both migrated tables during two migrations: both sides converge, and the log has no apply error but the migrations' own stalls | `test_follower.ConcurrentWritesTest` | `no-undo`, `overwrite-from-publisher` |
 | A2 coord lane: adoption, `REFRESH … copy_data = false`, a boot-lane seed and a background-lane backfill | `test_follower.CoordLaneTest` | `no-undo` |
 | A re-stamp to a version applied before halts instead of passing the marker | `test_follower.RestampTest` | — |
+| Gap 1: DML before later DDL halts and names the gap | `test_follower.DmlThenDdlTest` | `no-dml-ddl-classification` |
+| Gap 2: a rename halts and nothing is emptied | `test_follower.RenameTest` | `no-rename-check` |
+| Gap 5: an equal stored default passes, a differing one halts | `test_follower.MissingValueTest` | `no-missing-value-check` |
+| A new table referenced by a foreign key from an existing table follows | `test_follower.ForeignKeyNewTableTest` | `truncate-new-tables` (fails on every attempt and halts after `max_step_failures`) |
+| A partitioned table in scope: the log trigger goes on the parent only | `test_follower.DoubleDmlTest` | `log-trigger-on-partitions` |
+| The follower refuses to run until the known gaps are acknowledged | `test_follower.AcknowledgeTest` | `no-ack-guard` |
 | A3 refusal of a `SET SCHEMA` into an unpublished schema | `test_follower.MoveRefusalTest` | `no-move-refusal` |
 | B2 ownership: the table owner is not a superuser, the subscription owner is | `test_follower.OwnershipTest` | `no-security-definer` (the initial copy of `alembic_version` never reaches `r`) |
 | B3 security catalog diff, red with one policy dropped | `test_ops.SecDiffTest` | `secdiff-ignores-policies` |
@@ -63,6 +69,28 @@ its tests RED. Every container is removed on exit. CI runs the same script
 
 D9 partitions, the D2 credential and the B1 roles have tests that run green but
 no mutation.
+
+## Known gaps of the schema follower
+
+The follower replays each migration locally, undoes the rows the replay
+inserted, and lets apply carry production's own copy of the migration. That
+is correct only when the replay touches the same rows as production did and
+production's row changes still fit the migrated tables. It halts on every
+shape below that it can detect. `follower run` refuses to start until
+`[follower] acknowledge_known_gaps = true`, which the operator sets after
+reading this section.
+
+| # | Shape | Detected? | What happens | Manual remedy |
+|---|---|---|---|---|
+| 1 | DML before later DDL in one migration transaction (`UPDATE t SET c …; ALTER TABLE t DROP COLUMN c`) | yes | apply fails again on the migration xid (55000 / 23502); the follower halts naming the gap | Re-seed that table. With the subscription disabled, empty it locally, take it out of the subscription and put it back so table sync copies it, then `follower resume`. |
+| 2 | A migration that renames or moves a table | yes | halt before anything is emptied | Confirm the publisher made the same rename, refresh the subscription by hand, then `follower resume`. |
+| 3 | A unique violation (23505) replaying the migration | yes | halt | Compare the key on both sides, remove the local row, then `follower resume`. |
+| 4 | The replay changes a replica-identity key | yes | halt | Re-seed the table (as in 1). |
+| 5 | A column added with a stored default (`atthasmissing`) whose value differs from the publisher's, e.g. `DEFAULT now()` | yes, by comparing `attmissingval` with the publisher's | halt naming table and column | With the subscription disabled, copy that column for the existing rows from the publisher (key + column), then `follower resume`. |
+| 6 | Row selection that differs: production ran the migration under READ COMMITTED alongside other transactions, so a statement there may not have seen rows that commit before the migration does, while the local replay sees all of them | **no** | silent divergence on the rows only one side touched | The Phase 3 parity checks and a re-seed of the table. Avoid long-running data migrations while replication is live. |
+| 7 | Non-deterministic row selection (`DELETE … WHERE ts < now()`) | **no** | silent divergence | As 6. |
+| 8 | A volatile default that rewrites the table without row triggers (`ADD COLUMN … DEFAULT clock_timestamp()`) | **no** | existing rows differ | Copy the column from the publisher as in 5. |
+| 9 | A step that fails `max_step_failures` times running | yes | halt; the subscription stays disabled | Read the error, fix it, `follower resume`. |
 
 ## Operator steps that remain
 

@@ -37,10 +37,53 @@ MUTATIONS = {
     # Review blocker 1: the follower reads table data from the publisher.
     "reads-publisher-data": (
         "lib/qpg/follower.py",
-        "                detail[\"undone\"] = self._undo_replay_inserts(detail)\n",
-        "                detail[\"undone\"] = self._undo_replay_inserts(detail)\n"
+        "                self._check_replay_shape(detail)\n",
+        "                self._check_replay_shape(detail)\n"
         "                self.pub.rows(\"SELECT count(*) FROM app.items\")\n",
         ["test_follower.DoubleDmlTest"],
+    ),
+    # Re-review A4: the replay-log trigger on partitions as well as their parent.
+    "log-trigger-on-partitions": (
+        "lib/qpg/follower.py",
+        '                  for t in scope.values() if not t["partition"]]',
+        '                  for t in scope.values()]',
+        ["test_follower.DoubleDmlTest"],
+    ),
+    # Re-review A2: a renamed table is not detected.
+    "no-rename-check": (
+        "lib/qpg/follower.py",
+        "        if renamed:\n",
+        "        if False:\n",
+        ["test_follower.RenameTest"],
+    ),
+    # Re-review A3: new tables emptied with TRUNCATE, which a foreign key from
+    # an existing table refuses on every attempt.
+    "truncate-new-tables": (
+        "lib/qpg/follower.py",
+        '            script.append(f"DELETE FROM {qualified(*t.split(\'.\', 1))};")',
+        '            script.append(f"TRUNCATE {qualified(*t.split(\'.\', 1))};")',
+        ["test_follower.ForeignKeyNewTableTest"],
+    ),
+    # Re-review B1: DML-before-later-DDL is not named.
+    "no-dml-ddl-classification": (
+        "lib/qpg/follower.py",
+        '        if stall.sqlstate in ("55000", "23502"):',
+        "        if False:",
+        ["test_follower.DmlThenDdlTest"],
+    ),
+    # Re-review B5: stored column defaults are not compared.
+    "no-missing-value-check": (
+        "lib/qpg/follower.py",
+        "        if differing:\n",
+        "        if False:\n",
+        ["test_follower.MissingValueTest"],
+    ),
+    # Re-review C: the follower runs without the known gaps acknowledged.
+    "no-ack-guard": (
+        "lib/qpg/follower.py",
+        '        if not self.cfg.getbool("follower", "acknowledge_known_gaps", False):',
+        "        if False:",
+        ["test_follower.AcknowledgeTest"],
     ),
     # A3's refusal removed.
     "no-move-refusal": (

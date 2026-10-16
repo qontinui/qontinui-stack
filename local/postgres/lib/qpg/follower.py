@@ -22,26 +22,35 @@ effect on the subscriber exactly once, with production's own values:
    replay-log trigger on every subscribed table recording each row the replay
    INSERTS (and any replica-identity key it changes, which halts).
 5. **Undo the replay's inserts, then let apply carry the migration's DML** —
-   still disabled, delete the rows the replay inserted (in replica mode, by
-   typed key, local only). The data is then the pre-migration data again under
-   the post-migration schema, which is exactly what the publisher's copy of the
-   migration transaction expects: re-enabled, apply replays its INSERTs with
-   production's generated values, and its UPDATEs carry whole new tuples, so a
-   non-deterministic backfill lands as production wrote it. Its version-row
-   UPDATE finds no old row (the local replay already moved it) and is skipped.
-   Later publisher transactions follow in commit order, so nothing the
-   follower writes can collide with apply, and the follower reads no table
-   data from the publisher at all.
-6. Tables the migration CREATED are truncated locally and copied by ``REFRESH
-   PUBLICATION WITH (copy_data = true)``; table sync skips the publisher's
-   changes older than its copy, so their seed rows arrive once.
+   still disabled, delete the rows the replay inserted (in replica mode, by the
+   key apply itself uses, captured BEFORE the replay). The data is then the
+   pre-migration data again under the post-migration schema, which is what the
+   publisher's copy of the migration transaction expects: re-enabled, apply
+   replays its INSERTs with production's generated values, and its UPDATEs carry
+   whole new tuples. Its version-row UPDATE finds no old row (the local replay
+   already moved it) and is skipped. Later publisher transactions follow in
+   commit order, and the follower reads no table data from the publisher.
+6. Tables the migration CREATED are emptied locally and copied by ``REFRESH
+   PUBLICATION WITH (copy_data = true)``.
 
-This replaces the plan's SKIP-then-repair (D7 steps 3-4): the repair compared
-live tables while apply ran and could copy in rows apply had yet to insert
-(review of 254ab54). Residual cases it cannot see, and which therefore halt or
-are documented: a replay statement whose row SELECTION is non-deterministic
-(``DELETE … WHERE ts < now()``), a volatile ``DEFAULT`` that rewrites a table
-without row triggers, and a replay that changes a replica-identity key (halts).
+This replaces the plan's SKIP-then-repair (D7 steps 3-4), whose repair raced
+live apply (review of 254ab54). It is NOT a complete design: it fails CLOSED
+on the shapes it can detect and has known gaps it cannot, so ``follower run``
+refuses unless ``[follower] acknowledge_known_gaps = true``:
+
+* detected, HALT: a migration that renames or moves a table; a column added
+  with a stored default (``atthasmissing``) whose value differs from the
+  publisher's (e.g. ``DEFAULT now()``); DML before later DDL in the migration
+  transaction (apply then fails on the migration xid with 55000 / 23502); a
+  unique violation (23505) replaying the migration; a replica-identity key
+  changed by the replay; a step that fails ``max_step_failures`` times running.
+* NOT detected (the README lists the manual remedy for each): row SELECTION
+  that differs between the replay and production — production ran the
+  migration under READ COMMITTED alongside concurrent transactions, so a
+  statement there may not have seen rows that commit before the migration
+  does, while the replay sees all of them; non-deterministic predicates
+  (``DELETE … WHERE ts < now()``); and a volatile default that rewrites a
+  table without firing row triggers.
 
 Every step is persisted in ``follower.state`` so a restart resumes where it
 stopped, and nothing here guesses: an unidentifiable state halts the follower
@@ -62,7 +71,6 @@ from .config import Config, ConfigError
 from .follower_schema import (
     LOG_TRIGGER,
     TRIGGER_NAME,
-    drop_log_trigger_sql,
     log_trigger_sql,
     schema_sql,
     trigger_sql,
@@ -320,10 +328,14 @@ class Follower:
             return None
         row = self.admin.rows(
             f"SELECT pg_replication_origin_progress('pg_{oid}', true)::text, "
-            f"extract(epoch FROM now() - {lit(err.at)}::timestamptz)::bigint::text")[0]
-        progress, age = row[0], int(row[1])
+            f"extract(epoch FROM now() - {lit(err.at)}::timestamptz)::bigint::text, "
+            f"({lit(err.at)}::timestamptz < coalesce((detail ->> 'enabled_at')::timestamptz, '-infinity'))::text "
+            "FROM follower.state WHERE id = 1")[0]
+        progress, age, before_enable = row[0], int(row[1]), row[2] == "true"
         if lsn_int(err.finish_lsn) <= lsn_int(progress):
             return None  # that transaction has since been applied or skipped
+        if before_enable:
+            return None  # logged before the follower last re-enabled apply: history, not the current state
         if age > self.stall_fresh:
             return None  # apply has not retried it recently: not what it is stuck on
         return err
@@ -380,11 +392,35 @@ class Follower:
             f"WHERE s.subname = {lit(self.cfg.subscription)} AND r.srsubstate IN ('i', 'd') ORDER BY 1")
         return [r[0] for r in rows]
 
-    def local_tables(self) -> set[str]:
+    def scope_snapshot(self) -> dict[str, dict]:
+        """Every table in scope by OID: name, partition flag, and the key APPLY uses.
+
+        Apply finds a row by the replica identity: the REPLICA IDENTITY USING
+        INDEX columns, else (DEFAULT) the primary key; FULL / NOTHING have no
+        key, and the whole row is matched.
+        """
         rows = self.admin.rows(
-            "SELECT n.nspname || '.' || c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "SELECT c.oid::text, n.nspname || '.' || c.relname, c.relispartition::text, "
+            "coalesce((SELECT array_to_json(array_agg(a.attname ORDER BY k.ord)) FROM pg_index i "
+            "  JOIN LATERAL unnest(i.indkey) WITH ORDINALITY k(attnum, ord) ON true "
+            "  JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum "
+            "  WHERE i.indrelid = c.oid AND ((c.relreplident = 'i' AND i.indisreplident) "
+            "                              OR (c.relreplident = 'd' AND i.indisprimary)))::text, '[]') "
+            "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
             f"WHERE c.relkind IN ('r', 'p') AND n.nspname = ANY({text_array(self._schemas_in_scope())})")
-        return {r[0] for r in rows}
+        return {r[0]: {"name": r[1], "partition": r[2] == "true", "key": json.loads(r[3])} for r in rows}
+
+    def local_tables(self) -> set[str]:
+        return {t["name"] for t in self.scope_snapshot().values()}
+
+    def missing_value_columns(self, oids: list[str]) -> dict[str, str]:
+        """``oid:attname`` -> stored missing value, for columns with atthasmissing."""
+        if not oids:
+            return {}
+        rows = self.admin.rows(
+            "SELECT a.attrelid::text || ':' || a.attname, coalesce(a.attmissingval::text, '') FROM pg_attribute a "
+            f"WHERE a.atthasmissing AND a.attrelid = ANY(ARRAY[{','.join(oids)}]::oid[])")
+        return {r[0]: r[1] for r in rows}
 
     def _schemas_in_scope(self) -> list[str]:
         extra = {t.split(".", 1)[0] for t, _ in self._version_tables()}
@@ -459,13 +495,28 @@ class Follower:
             f"WHERE remote_xid = {lit(xid)}))::text"
         ) == "true"
 
+    @staticmethod
+    def _restall_reason(stall: Stall) -> str:
+        head = (f"apply failed again on migration transaction {stall.xid} (finish {stall.finish_lsn}) after the "
+                f"follower replayed it: {stall.sqlstate} {stall.message}. ")
+        if stall.sqlstate in ("55000", "23502"):
+            return head + (
+                "KNOWN GAP (DML before later DDL): the migration changed rows and then changed the table's shape in "
+                "the same transaction, so its row changes no longer fit the migrated table. Remedy (manual): "
+                "re-seed the table named above - with the subscription disabled, empty it locally and re-copy it "
+                "from the publisher (take it out of and back into the subscription), then `follower resume`.")
+        if stall.sqlstate == "23505":
+            return head + (
+                "A unique violation replaying the migration: a row the migration writes already exists locally "
+                "(the replay's insert was not undone, or local data diverged). Remedy (manual): find the key in "
+                "the message, compare the row on both sides, remove the local one, then `follower resume`.")
+        return head + "Remedy (manual): read the error; nothing past this transaction has been applied."
+
     def _handle_stall(self, stall: Stall) -> None:
         base = {"xid": stall.xid, "finish_lsn": stall.finish_lsn, "sqlstate": stall.sqlstate,
                 "error": stall.message}
         if self._already_processed(stall.xid):
-            raise Halt(
-                f"apply stalled again on remote transaction {stall.xid} (finish {stall.finish_lsn}), which the "
-                f"follower already applied locally and skipped: {stall.sqlstate} {stall.message}")
+            raise Halt(self._restall_reason(stall))
         source, versions = self._identify(stall.xid)
         if not source:
             raise Halt(
@@ -507,73 +558,105 @@ class Follower:
                 self._disable()
                 detail["step"] = "log"
             elif step == "log":
-                detail["tables_before"] = sorted(self.local_tables())
-                self._install_log_triggers(detail["tables_before"])
+                snap = self.scope_snapshot()
+                detail["scope"] = snap
+                detail["missing_before"] = sorted(self.missing_value_columns(list(snap)))
+                self._install_log_triggers(snap)
                 detail["step"] = "migrate"
             elif step == "migrate":
                 self._migrate(detail["source"], detail["versions"])
                 detail["step"] = "undo"
             elif step == "undo":
-                self._drop_log_triggers(detail["tables_before"])
+                self._drop_log_triggers(detail["scope"])
                 self._verify_local(detail["source"], detail["versions"])
-                detail["undone"] = self._undo_replay_inserts(detail)
-                self._record_applied(detail)
-                detail["step"] = "enable"
+                self._check_replay_shape(detail)
+                # The undo, the applied-version record and the step change
+                # commit together: a crash leaves either all or none of them.
+                self._undo_replay_inserts(detail)
             elif step == "enable":
                 self._enable(detail)
-                self.event("applied", {k: v for k, v in detail.items() if k != "tables_before"})
-                self.set_state("idle")
+                self.event("applied", {k: v for k, v in detail.items() if k not in ("scope", "missing_before")})
+                now = self.admin.scalar("SELECT now()::text")
+                self.set_state("idle", None, {"enabled_at": now, "xid": detail["xid"]})
                 return
             else:
                 raise Halt(f"unknown in-progress step {step!r}")
-            self.set_state("in_progress", None, detail)
+            if step != "undo":
+                self.set_state("in_progress", None, detail)
 
-    def _key_columns(self, table: str) -> list[str]:
-        schema, name = table.split(".", 1)
-        rows = self.admin.rows(
-            "SELECT a.attname FROM pg_index i JOIN pg_class c ON c.oid = i.indrelid "
-            "JOIN pg_namespace n ON n.oid = c.relnamespace "
-            "JOIN LATERAL unnest(i.indkey) WITH ORDINALITY k(attnum, ord) ON true "
-            "JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum "
-            f"WHERE n.nspname = {lit(schema)} AND c.relname = {lit(name)} "
-            "AND (i.indisprimary OR (i.indisreplident AND NOT EXISTS ("
-            "  SELECT 1 FROM pg_index p WHERE p.indrelid = c.oid AND p.indisprimary))) "
-            "ORDER BY i.indisprimary DESC, k.ord")
-        return [r[0] for r in rows]
+    def _check_replay_shape(self, detail: dict) -> None:
+        """Halt on the replay shapes the undo-then-apply design cannot carry."""
+        scope = detail["scope"]
+        now = self.scope_snapshot()
+        renamed = [f"{t['name']} -> {now[oid]['name']} (oid {oid})" for oid, t in scope.items()
+                   if oid in now and now[oid]["name"] != t["name"]]
+        if renamed:
+            raise Halt(
+                f"the migration renamed or moved table(s) {renamed}. The follower tracks tables by OID and does "
+                "not carry a rename through the undo. Remedy (manual): confirm the publisher made the same "
+                "rename, REFRESH the subscription by hand, then `follower resume`.")
+        before = set(detail.get("missing_before", []))
+        added = {k: v for k, v in self.missing_value_columns(list(scope)).items() if k not in before}
+        differing = []
+        for key, local_value in sorted(added.items()):
+            oid, column = key.split(":", 1)
+            table = now.get(oid, {}).get("name") or scope[oid]["name"]
+            remote = self.pub.rows(
+                "SELECT coalesce(attmissingval::text, '') FROM pg_attribute "
+                f"WHERE attrelid = to_regclass({lit(qualified(*table.split('.', 1)))}) AND attname = {lit(column)} "
+                "AND atthasmissing")
+            if not remote or remote[0][0] != local_value:
+                differing.append(f"{table}.{column} (local {local_value!r}, publisher "
+                                 f"{remote[0][0] if remote else 'UNREADABLE'!r})")
+        if differing:
+            raise Halt(
+                "KNOWN GAP (stored column default): the migration added column(s) whose default was stored once "
+                f"per side and differs: {differing}. Existing rows read that stored value and no row change "
+                "carries production's. Remedy (manual): with the subscription disabled, copy that column for "
+                "existing rows from the publisher (UPDATE … FROM a COPY of key + column), then `follower resume`.")
 
-    def _install_log_triggers(self, tables: list[str]) -> None:
+    def _install_log_triggers(self, scope: dict) -> None:
+        # Partitions inherit a partitioned parent's row trigger, so it goes on
+        # the parent (and plain tables) only: never on both.
         versions = {t for t, _ in self._version_tables()}
-        script = [log_trigger_sql(t, "version" if t in versions else "data", self._key_columns(t)) for t in tables]
+        script = [log_trigger_sql(t["name"], "version" if t["name"] in versions else "data", t["key"])
+                  for t in scope.values() if not t["partition"]]
         script.append("TRUNCATE follower.replay_log;")
         self.admin.execute("".join(script))
 
-    def _drop_log_triggers(self, tables: list[str]) -> None:
-        present = [t for t in tables if self._table_exists(self.admin, t)]
-        if present:
-            self.admin.execute("".join(drop_log_trigger_sql(t) for t in present))
+    def _drop_log_triggers(self, scope: dict) -> None:
+        oids = [oid for oid, t in scope.items() if not t["partition"]]
+        if not oids:
+            return
+        rows = self.admin.rows(
+            "SELECT c.oid::regclass::text FROM pg_class c JOIN pg_trigger g ON g.tgrelid = c.oid "
+            f"WHERE c.oid = ANY(ARRAY[{','.join(oids)}]::oid[]) AND g.tgname = {lit(LOG_TRIGGER)} "
+            "AND NOT g.tgisinternal AND g.tgparentid = 0")
+        if rows:
+            self.admin.execute("".join(f"DROP TRIGGER IF EXISTS {LOG_TRIGGER} ON {r[0]};\n" for r in rows))
 
-    def _undo_replay_inserts(self, detail: dict) -> dict:
-        """Delete, locally and by typed key, every row the replay inserted."""
+    def _undo_replay_inserts(self, detail: dict) -> None:
+        """Delete, locally and by apply's key, every row the replay inserted; commit with the next step."""
         changed = self.admin.rows(
             "SELECT l.relid::regclass::text, l.old_key::text, l.new_key::text FROM follower.replay_log l "
             "WHERE l.op = 'K' ORDER BY l.id LIMIT 5")
         if changed:
             raise Halt("the local replay changed a replica-identity key, which the publisher's copy of the "
                        f"migration could not find afterwards: {changed}")
+        scope = detail["scope"]
+        now = self.scope_snapshot()
         groups = self.admin.rows(
-            "SELECT n.nspname, c.relname, count(*)::text FROM follower.replay_log l "
-            "JOIN pg_class c ON c.oid = l.relid JOIN pg_namespace n ON n.oid = c.relnamespace "
-            "WHERE l.op = 'I' GROUP BY 1, 2 ORDER BY 1, 2")
+            "SELECT relid::text, relid::regclass::text, count(*)::text FROM follower.replay_log "
+            "WHERE op = 'I' GROUP BY 1, 2 ORDER BY 2")
         history = {h.table: h.lane for h in self.cfg.coord_history_tables} if self.cfg.coord_lane else {}
         undone: dict[str, int] = {}
         script = ["SET LOCAL session_replication_role = replica;"]
-        arm = []
-        for schema, name, count in groups:
-            table = f"{schema}.{name}"
-            target = qualified(schema, name)
-            key = self._key_columns(table)
-            source = (f"(SELECT new_key FROM follower.replay_log WHERE op = 'I' "
-                      f"AND relid = {lit(target)}::regclass)")
+        for oid, target, count in groups:
+            entry = scope.get(oid) or now.get(oid)
+            if entry is None:
+                continue  # dropped later in the same migration
+            key = entry["key"]
+            source = f"(SELECT new_key FROM follower.replay_log WHERE op = 'I' AND relid = {oid})"
             if key:
                 match = " AND ".join(f"t.{ident(k)} = r.{ident(k)}" for k in key)
                 script.append(
@@ -586,24 +669,29 @@ class Follower:
                     "row_number() OVER (PARTITION BY to_jsonb(t2)) AS n, to_jsonb(t2) AS j "
                     f"FROM {target} t2) x JOIN (SELECT new_key AS j, count(*) AS c FROM {source} s(new_key) "
                     "GROUP BY 1) w ON w.j = x.j AND x.n <= w.c);")
-            undone[table] = int(count)
-            if table == self.cfg.version_table:
-                arm.append(f"INSERT INTO follower.armed_versions (source, version) SELECT 'web', "
-                           f"k.new_key ->> 'version_num' FROM {source} k(new_key) ON CONFLICT DO NOTHING;")
-            elif table in history:
+            undone[entry["name"]] = int(count)
+            if entry["name"] == self.cfg.version_table:
+                script.append(f"INSERT INTO follower.armed_versions (source, version) SELECT 'web', "
+                              f"k.new_key ->> 'version_num' FROM {source} k(new_key) ON CONFLICT DO NOTHING;")
+            elif entry["name"] in history:
                 col = self.cfg.coord_version_column
-                arm.append(f"INSERT INTO follower.armed_versions (source, version) SELECT "
-                           f"{lit('coord:' + history[table])}, k.new_key ->> {lit(col)} "
-                           f"FROM {source} k(new_key) ON CONFLICT DO NOTHING;")
-        new_tables = sorted(set(self.local_tables()) - set(detail["tables_before"]))
-        if new_tables:
-            # Created by the migration: truncated here, copied by the refresh.
-            script.append("TRUNCATE " + ", ".join(qualified(*t.split(".", 1)) for t in new_tables) + ";")
-        script += arm
+                script.append(f"INSERT INTO follower.armed_versions (source, version) SELECT "
+                              f"{lit('coord:' + history[entry['name']])}, k.new_key ->> {lit(col)} "
+                              f"FROM {source} k(new_key) ON CONFLICT DO NOTHING;")
+        # Tables the migration CREATED (new OIDs; partitions ride with their
+        # parent): emptied here with DELETE, which in replica mode does not
+        # trip a foreign key from an existing table, then copied by the refresh.
+        new_tables = sorted(t["name"] for oid, t in now.items() if oid not in scope and not t["partition"])
+        for t in new_tables:
+            script.append(f"DELETE FROM {qualified(*t.split('.', 1))};")
         script.append("TRUNCATE follower.replay_log;")
-        self.admin.execute("\n".join(script))
+        script.append(self._record_applied_sql(detail))
         detail["new_tables"] = new_tables
-        return undone
+        detail["undone"] = undone
+        detail["step"] = "enable"
+        script.append(f"UPDATE follower.state SET status = 'in_progress', reason = NULL, "
+                      f"detail = {lit(json.dumps(detail))}::jsonb, updated_at = now() WHERE id = 1;")
+        self.admin.execute("\n".join(script))
 
     def _enable(self, detail: dict) -> None:
         sub = ident(self.cfg.subscription)
@@ -671,21 +759,23 @@ class Follower:
             if missing:
                 raise Halt(f"after the local coord-migrate run lane {lane} lacks {missing}")
 
-    def _record_applied(self, detail: dict) -> None:
+    def _record_applied_sql(self, detail: dict) -> str:
         xid, lsn = lit(detail["xid"]), lit(detail["finish_lsn"])
+        out = []
         if detail["source"] == "web":
             for v in detail["versions"]:
-                self.admin.execute(
+                out.append(
                     "INSERT INTO follower.applied_revisions (version_num, remote_xid, finish_lsn, via) VALUES "
                     f"({lit(v)}, {xid}, {lsn}, 'follower') ON CONFLICT (version_num) DO UPDATE SET "
-                    "remote_xid = EXCLUDED.remote_xid, finish_lsn = EXCLUDED.finish_lsn")
+                    "remote_xid = EXCLUDED.remote_xid, finish_lsn = EXCLUDED.finish_lsn;")
         else:
             lane = detail["source"].split(":", 1)[1]
             for v in detail["versions"]:
-                self.admin.execute(
+                out.append(
                     "INSERT INTO follower.applied_coord_versions (lane, version, remote_xid, finish_lsn, via) VALUES "
                     f"({lit(lane)}, {lit(v)}, {xid}, {lsn}, 'follower') ON CONFLICT (lane, version) DO UPDATE SET "
-                    "remote_xid = EXCLUDED.remote_xid, finish_lsn = EXCLUDED.finish_lsn")
+                    "remote_xid = EXCLUDED.remote_xid, finish_lsn = EXCLUDED.finish_lsn;")
+        return "\n".join(out)
 
     # ------------------------------------------------------------ run loops
     def settled(self) -> bool:
@@ -694,6 +784,17 @@ class Follower:
         if st["status"] != "idle" or st["head_mismatch_seconds"] is not None:
             return False
         return self.caught_up(self.pub.scalar("SELECT pg_current_wal_lsn()::text"))
+
+    def _halt_failing_step(self, exc: Exception, failures: int) -> str:
+        """A step that keeps failing halts, leaving the subscription as the step left it (disabled)."""
+        try:
+            st = self.state()
+            self.halt(f"step {st['detail'].get('step')!r} failed {failures} times running; the subscription stays "
+                      f"disabled until resolved: {exc}", {"in_progress": st["detail"]})
+            return "halted"
+        except PgError as again:
+            log("follower-halt-failed", str(again))
+            return "error"
 
     def _notify_stuck_step(self, exc: Exception, already: str | None) -> str | None:
         """A database error inside an in-progress step notifies once per step, never loops silently."""
@@ -711,17 +812,28 @@ class Follower:
         return step
 
     def run(self, once: bool = False, until_idle: bool = False, timeout: float = 0.0) -> int:
+        if not self.cfg.getbool("follower", "acknowledge_known_gaps", False):
+            raise ConfigError(
+                "the follower refuses to run until [follower] acknowledge_known_gaps = true: its undo-then-apply "
+                "design has known gaps it cannot detect (local/postgres/README.md, 'Known gaps'); set the key "
+                "only after reading them")
         poll = self.cfg.getint("follower", "poll_seconds", 60)
+        max_failures = self.cfg.getint("follower", "max_step_failures", 5)
         deadline = time.monotonic() + timeout if timeout else None
         notified_step = None
+        failures = 0
         while True:
             try:
                 status = self.cycle()
                 notified_step = None
+                failures = 0
             except PgError as exc:
                 log("follower-cycle-error", str(exc))
                 status = "error"
                 notified_step = self._notify_stuck_step(exc, notified_step)
+                failures = failures + 1 if notified_step and notified_step.startswith("in_progress") else 0
+                if failures >= max_failures:
+                    status = self._halt_failing_step(exc, failures)
             if status == "halted" and (once or until_idle):
                 return 3
             if once:

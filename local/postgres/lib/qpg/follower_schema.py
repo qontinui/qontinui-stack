@@ -227,8 +227,3 @@ def log_trigger_sql(table: str, kind: str, key: list[str]) -> str:
     return (f"DROP TRIGGER IF EXISTS {LOG_TRIGGER} ON {target};\n"
             f"CREATE TRIGGER {LOG_TRIGGER} AFTER INSERT OR UPDATE ON {target} "
             f"FOR EACH ROW EXECUTE FUNCTION follower.replay_log({args});\n")
-
-
-def drop_log_trigger_sql(table: str) -> str:
-    schema, name = table.split(".", 1)
-    return f"DROP TRIGGER IF EXISTS {LOG_TRIGGER} ON {qualified(schema, name)};\n"
