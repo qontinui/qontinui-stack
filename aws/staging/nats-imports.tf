@@ -14,9 +14,12 @@
 #
 # OPERATOR STEPS (each writes nothing until the apply; the apply writes
 # production tfstate and only that):
-#   1. In aws/staging, set `nats_under_code = true` in production.auto.tfvars
-#      (or pass -var nats_under_code=true to both commands below).
-#   2. terraform plan -var nats_under_code=true -target=module.nats -out=nats-import.tfplan
+#   1. In aws/staging, set `nats_under_code = true` in the committed
+#      production.auto.tfvars, landed in the same change as the apply. Do not
+#      use a one-off -var: nothing would persist `true`, and the next
+#      untargeted plan by anyone would plan destroying NATS (stopped only by
+#      the EFS prevent_destroy error, which also blocks every other apply).
+#   2. terraform plan -target=module.nats -out=nats-import.tfplan
 #      The gate: it must read "16 to import, 0 to add, 0 to change, 0 to
 #      destroy". Anything else for module.nats is a real change to production
 #      NATS — do not apply it.
@@ -24,7 +27,8 @@
 #   4. terraform state list module.nats  -> the 16 module.nats[0] addresses.
 # From then on the variable must STAY true: setting it back to false would
 # plan the destruction of the whole NATS stack (the EFS's prevent_destroy
-# makes that plan error rather than run). Once the import has landed these
+# makes that plan error rather than run; it guards only the EFS, so a
+# targeted destroy of another NATS resource is not stopped by it). Once the import has landed these
 # blocks are inert and may be deleted, and the variable flipped to a
 # committed `true`, in a follow-up.
 #
