@@ -28,7 +28,7 @@
 #     cipher passphrase is generated here and shown once on the console (OD4).
 #   * /opt/qontinui-pg (this directory's lib/, templates/ and qontinui-pg) and
 #     /usr/local/bin/qontinui-pg.
-#   * systemd unit qontinui-pg-follower
+#   * systemd units qontinui-pg-{follower,seqsync,watchdog,partitions}
 #     (+ backup-full/backup-diff with pgBackRest). INSTALLED, NOT ENABLED:
 #     enabling them is a Phase 3 step (--enable-services).
 #
@@ -129,7 +129,7 @@ CLUSTER="$(conf_get cluster name qontinui)"
 DATA_DIR="$(conf_get cluster data_directory '')"
 PORT="$(conf_get cluster port 5432)"
 PGB_ENABLED="$(conf_get pgbackrest enabled false)"
-UNIT_NAMES=(follower.service)
+UNIT_NAMES=(follower.service seqsync.timer watchdog.timer partitions.timer)
 case "$PGB_ENABLED" in true|yes|on|1) UNIT_NAMES+=(backup-full.timer backup-diff.timer) ;; esac
 
 need_root() {
@@ -350,7 +350,7 @@ do_install() {
 do_uninstall() {
   need_root
   if [ -z "$ROOT" ]; then
-    for u in follower.service backup-full.timer backup-diff.timer; do
+    for u in follower.service seqsync.timer watchdog.timer partitions.timer backup-full.timer backup-diff.timer; do
       if systemctl list-unit-files "qontinui-pg-$u" >/dev/null 2>&1; then
         run systemctl disable --now "qontinui-pg-$u" 2>/dev/null || true
       fi

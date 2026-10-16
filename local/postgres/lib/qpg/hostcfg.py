@@ -107,7 +107,8 @@ def render(cfg: Config, allow_placeholders: bool = False) -> list[Managed]:
         Managed("/etc/postgresql-common/createcluster.d/50-qontinui.conf",
                 _template("createcluster.conf.tmpl").format(**values), 0o644),
     ]
-    units = ["follower.service"]
+    units = ["follower.service", "seqsync.service", "seqsync.timer", "watchdog.service", "watchdog.timer",
+             "partitions.service", "partitions.timer"]
     if pgb:
         units += ["backup-full.service", "backup-full.timer", "backup-diff.service", "backup-diff.timer"]
         files.append(Managed("/etc/pgbackrest/pgbackrest.conf",
@@ -318,4 +319,6 @@ def check_files(cfg: Config, root: str, allow_placeholders: bool = False) -> lis
     if os.path.exists(cfg_path):
         mode = os.stat(cfg_path).st_mode & 0o777
         out.append(((mode & 0o007) == 0, f"{cfg_path} is not world-readable (it names DSNs) [{oct(mode)}]"))
+    a4 = cfg.a4_violations()
+    out.append((not a4, "A4: no coord source in the follower config after Phase 8" + (f" — {a4}" if a4 else "")))
     return out

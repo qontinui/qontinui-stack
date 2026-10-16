@@ -1,0 +1,17 @@
+{marker}
+[Unit]
+Description=qontinui local/postgres watchdog (plan D11)
+Requires=postgresql@{version}-{cluster}.service
+After=postgresql@{version}-{cluster}.service
+
+[Service]
+Type=oneshot
+User=postgres
+Group=postgres
+Environment=QONTINUI_PG_CONFIG={config_path}
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/local/bin/qontinui-pg watchdog run
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only

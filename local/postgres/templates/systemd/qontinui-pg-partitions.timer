@@ -1,0 +1,10 @@
+{marker}
+[Unit]
+Description=qontinui local/postgres partition maintenance (plan D9)
+
+[Timer]
+OnCalendar={partitions_oncalendar}
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,10 @@
+{marker}
+[Unit]
+Description=qontinui local/postgres sequence sync (plan D6)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target

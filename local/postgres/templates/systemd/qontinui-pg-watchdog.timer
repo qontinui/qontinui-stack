@@ -1,0 +1,10 @@
+{marker}
+[Unit]
+Description=qontinui local/postgres watchdog (plan D11)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+
+[Install]
+WantedBy=timers.target

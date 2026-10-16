@@ -129,6 +129,12 @@ class InstallerTest(unittest.TestCase):
         self.edit(path, lambda t: t.replace("archive-push-queue-max=20GiB\n", ""))
         self.assert_check_fails("archive-push-queue-max")
 
+    def test_09_a4_coord_source_after_phase8_fails(self):
+        make_config(self.conf, {("follower", "phase8_complete"): "true", ("follower", "coord_lane"): "true",
+                                ("follower", "coord_migrate_cmd"): "coord-migrate apply --to {version}"})
+        shutil.copy(self.conf, os.path.join(self.root, "etc/qontinui-pg/qontinui-pg.conf"))
+        self.assert_check_fails("A4")
+
     def test_10_placeholders_are_refused(self):
         root = os.path.join(self.tmp, "root2")
         res = sh("--root", root, "--config", EXAMPLE)

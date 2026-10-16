@@ -13,11 +13,13 @@ import os
 import sys
 
 from . import config as config_mod
-from . import hostcfg
+from . import credential, hostcfg, partitions, roles, secdiff
 from .config import ConfigError
 from .follower import Follower, Halt
 from .notify import Notifier
 from .pg import PgError
+from .seqsync import SeqSync, SeqSyncError
+from .watchdog import Watchdog
 
 
 def _print_checks(results: list[tuple[bool, str]]) -> int:
@@ -60,6 +62,57 @@ def cmd_follower(args, cfg) -> int:
         print(json.dumps(gate, indent=2))
         return 0 if gate["ok"] else 1
     raise ConfigError(f"unknown follower action {args.action}")
+
+
+def cmd_seqsync(args, cfg) -> int:
+    s = SeqSync(cfg, reverse=args.reverse)
+    try:
+        results = s.from_data(args.dry_run) if args.from_data else s.run(final=args.final, dry_run=args.dry_run)
+    except SeqSyncError as exc:
+        print(f"seqsync FAILED: {exc}", file=sys.stderr)
+        return 1
+    counts: dict[str, int] = {}
+    for r in results:
+        counts[r.action] = counts.get(r.action, 0) + 1
+    print(json.dumps({"sequences": len(results), **counts}))
+    return 0
+
+
+def cmd_watchdog(args, cfg) -> int:
+    checks = Watchdog(cfg, Notifier(cfg, force_dry_run=args.dry_run_notify)).run()
+    for c in checks:
+        print(f"{c.status:7} {c.name}: {c.message}")
+    return 0 if all(c.status == "OK" for c in checks) else 1
+
+
+def cmd_credential(args, _cfg) -> int:
+    verifier = credential.new_credential(args.role, args.passfile, args.host, args.port, args.database, args.rotate)
+    print(verifier)
+    return 0
+
+
+def cmd_roles(args, cfg) -> int:
+    if args.action == "apply":
+        verifier = None
+        if args.verifier_file:
+            with open(args.verifier_file, encoding="utf-8") as fh:
+                verifier = fh.read().strip()
+        print(json.dumps(roles.apply(cfg, args.revision_file, verifier, args.allow_missing), indent=2))
+        return 0
+    report = roles.check_grantees(cfg)
+    print(json.dumps(report, indent=2))
+    return 1 if report["missing_locally"] else 0
+
+
+def cmd_secdiff(args, cfg) -> int:
+    report = secdiff.run(cfg)
+    print(json.dumps(report, indent=2, default=str))
+    return 0 if report["empty"] else 1
+
+
+def cmd_partitions(args, cfg) -> int:
+    print(partitions.run(cfg))
+    return 0
 
 
 def cmd_host(args, cfg) -> int:
@@ -115,6 +168,43 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("--dry-run-notify", action="store_true", help="log notices, never post them")
     f.set_defaults(fn=cmd_follower)
 
+    s = sub.add_parser("seqsync", help="sequence sync (D6)")
+    s.add_argument("action", choices=["run"])
+    s.add_argument("--final", action="store_true", help="cutover margin floor")
+    s.add_argument("--reverse", action="store_true", help="local -> [seqsync] reverse_dsn (D8)")
+    s.add_argument("--from-data", action="store_true", help="set column-owned sequences from local data (restore)")
+    s.add_argument("--dry-run", action="store_true")
+    s.set_defaults(fn=cmd_seqsync)
+
+    w = sub.add_parser("watchdog", help="the D11 watchdog")
+    w.add_argument("action", choices=["run"])
+    w.add_argument("--dry-run-notify", action="store_true", help="log notices, never post them")
+    w.set_defaults(fn=cmd_watchdog)
+
+    c = sub.add_parser("credential", help="generate a password locally, print only its SCRAM verifier (D2)")
+    c.add_argument("action", choices=["new"])
+    c.add_argument("--role", required=True)
+    c.add_argument("--passfile", required=True)
+    c.add_argument("--host", default="*")
+    c.add_argument("--port", default="*")
+    c.add_argument("--database", default="*")
+    c.add_argument("--rotate", action="store_true")
+    c.set_defaults(fn=cmd_credential, needs_config=False)
+
+    r = sub.add_parser("roles", help="B1 role step")
+    r.add_argument("action", choices=["apply", "check-grantees"])
+    r.add_argument("--revision-file", help="coordrls_01's revision file at production's head")
+    r.add_argument("--verifier-file", help="file holding the app role's SCRAM verifier (role creation)")
+    r.add_argument("--allow-missing", action="store_true")
+    r.set_defaults(fn=cmd_roles)
+
+    d = sub.add_parser("secdiff", help="B3 security catalog diff (publisher vs subscriber)")
+    d.set_defaults(fn=cmd_secdiff)
+
+    t = sub.add_parser("partitions", help="D9 partition maintenance")
+    t.add_argument("action", choices=["run"])
+    t.set_defaults(fn=cmd_partitions)
+
     h = sub.add_parser("host", help="installer support: render/check managed host files")
     h.add_argument("action", choices=["render", "check", "list", "check-hba-live"])
     h.add_argument("--root", default="", help="filesystem root prefix (render/check into a staging tree)")
@@ -134,6 +224,6 @@ def main(argv: list[str] | None = None) -> int:
     except Halt as exc:
         print(f"halted: {exc}", file=sys.stderr)
         return 3
-    except PgError as exc:
+    except (PgError, roles.RoleError, credential.CredentialError, partitions.PartitionError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

@@ -41,12 +41,40 @@ MUTATIONS = {
         "LANGUAGE plpgsql\n",
         ["test_follower.OwnershipTest"],
     ),
+    # B3: the diff stops comparing policies.
+    "secdiff-ignores-policies": (
+        "lib/qpg/secdiff.py",
+        "    for section in a:\n",
+        "    for section in [k for k in a if k != 'policies']:\n",
+        ["test_ops.SecDiffTest"],
+    ),
+    # A2 item 6: the watchdog stops reading replica identities.
+    "watchdog-no-replica-identity": (
+        "lib/qpg/watchdog.py",
+        "offenders = replica_identity_offenders(self.pub, self.cfg.publication)",
+        "offenders = []",
+        ["test_ops.WatchdogTest"],
+    ),
     # D4: --check stops asserting who may log in without TLS.
     "hba-check-accepts-any-non-tls": (
         "lib/qpg/hostcfg.py",
         "ok = r.database == database and r.user == app and _in_tailnet(r.address, cidrs)",
         "ok = True",
         ["test_installer.InstallerTest"],
+    ),
+    # A4: --check stops guarding the coord source after Phase 8.
+    "no-a4-guard": (
+        "lib/qpg/config.py",
+        "        if not self.phase8_complete:\n            return []\n",
+        "        return []\n",
+        ["test_installer.InstallerTest"],
+    ),
+    # D6: a NULL read becomes a zero instead of an error.
+    "seqsync-null-is-zero": (
+        "lib/qpg/seqsync.py",
+        "                    errors.append(f\"{seq}: last_value read NULL and the role lacks SELECT on it\")\n",
+        "                    pass\n",
+        ["test_ops.SeqSyncTest"],
     ),
 }
 

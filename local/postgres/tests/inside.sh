@@ -14,7 +14,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-TESTS=(test_installer test_follower)
+TESTS=(test_installer test_follower test_ops)
 [ ${#ONLY[@]} -gt 0 ] && TESTS=("${ONLY[@]}")
 
 echo "==> GREEN: ${TESTS[*]} on the real tree"
