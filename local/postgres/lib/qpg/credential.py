@@ -2,7 +2,8 @@
 
 ``qontinui-pg credential new --role R --passfile F`` generates a 32-byte random
 password on this host, writes it to a libpq passfile (mode 0600, owned by the
-user running it — the ``postgres`` system user), and prints ONLY the
+user running it — the ``postgres`` system user — in a directory that user owns
+alone, by default ``/var/lib/qontinui-pg``), and prints ONLY the
 ``SCRAM-SHA-256`` verifier. PostgreSQL accepts the verifier in
 ``CREATE ROLE … PASSWORD 'SCRAM-SHA-256$…'`` / ``ALTER ROLE … PASSWORD …``, so
 the role can be created on RDS (through ECS Exec as qontinui_user) without the
@@ -65,6 +66,13 @@ def _entry_user(line: str) -> str | None:
 
 def write_passfile_entry(passfile: str, role: str, password: str, host: str = "*", port: str = "*",
                          database: str = "*", rotate: bool = False) -> None:
+    parent = os.path.dirname(os.path.abspath(passfile))
+    pst = os.stat(parent)
+    if pst.st_uid != os.geteuid() or pst.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise CredentialError(
+            f"{parent} must be owned by the user writing the passfile and writable by it alone "
+            f"(owner uid {pst.st_uid}, mode {oct(pst.st_mode & 0o777)}); install.sh makes /var/lib/qontinui-pg "
+            "postgres-owned 0700 for this")
     lines: list[str] = []
     if os.path.exists(passfile):
         st = os.stat(passfile)
@@ -77,12 +85,19 @@ def write_passfile_entry(passfile: str, role: str, password: str, host: str = "*
         raise CredentialError(f"{passfile} already holds a password for {role}; pass --rotate to replace it")
     kept = [ln for ln in lines if _entry_user(ln) != role]
     entry = ":".join(_escape(f) for f in (host, port, database, role, password)) + "\n"
-    tmp = passfile + ".tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.writelines(kept + [entry])
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, passfile)
+    tmp = f"{passfile}.{os.getpid()}.tmp"
+    # O_EXCL: never write through a file or symlink someone else placed; the
+    # mode is fixed before a byte of the secret is written.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.writelines(kept + [entry])
+        os.replace(tmp, passfile)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
 
 
 def new_credential(role: str, passfile: str, host: str = "*", port: str = "*", database: str = "*",

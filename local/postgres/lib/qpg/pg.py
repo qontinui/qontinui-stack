@@ -22,7 +22,12 @@ import csv
 import io
 import os
 import subprocess
+import sys
 from dataclasses import dataclass, field
+
+# A row can legitimately carry megabytes (the follower reads a jsonlog tail as
+# one value); the csv module's default 128 KiB field limit would reject it.
+csv.field_size_limit(sys.maxsize)
 
 #: Printed by psql for SQL NULL. Contains a control character, so no value read
 #: from a catalog or a test fixture can collide with it.

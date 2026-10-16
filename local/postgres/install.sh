@@ -316,7 +316,15 @@ systemd_apply() {
     pending="$(runuser -u postgres -- psql -X -qtA -p "$PORT" -c \
       "SELECT count(*) FROM pg_settings WHERE pending_restart" 2>/dev/null || echo 0)"
     if [ "${pending:-0}" != 0 ]; then
-      say "settings pending restart: restarting the cluster (no subscription exists before Phase 3)"
+      local subs
+      subs="$(runuser -u postgres -- psql -X -qtA -p "$PORT" -d "$(conf_get cluster database qontinui_db)" -c \
+        "SELECT count(*) FROM pg_subscription" 2>/dev/null || echo UNKNOWN)"
+      if [ "$subs" != 0 ]; then
+        # A restart stops apply; an unbounded stop invalidates the publisher's
+        # slot (D11). Never restart a subscriber unattended.
+        die "settings need a cluster restart, but pg_subscription holds ${subs} subscription(s) (or could not be read). Restart it yourself in a planned window: systemctl restart postgresql@$PG_VERSION-$CLUSTER"
+      fi
+      say "settings pending restart: restarting the cluster (it holds no subscription)"
       systemctl restart "postgresql@$PG_VERSION-$CLUSTER.service"
     fi
   fi
@@ -370,7 +378,7 @@ do_uninstall() {
   run rm -rf "$ROOT/opt/qontinui-pg"
   run rm -f "$ROOT/usr/local/bin/qontinui-pg"
   [ -z "$ROOT" ] && run systemctl daemon-reload
-  echo "kept: $INSTALLED_CONFIG, /etc/qontinui-pg/pgpass, and the cluster's data."
+  echo "kept: $INSTALLED_CONFIG, /var/lib/qontinui-pg (the passfile), and the cluster's data."
   echo "To destroy the cluster (operator decision, never run here): pg_dropcluster --stop $PG_VERSION $CLUSTER"
 }
 

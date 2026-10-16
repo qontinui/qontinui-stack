@@ -23,7 +23,8 @@ def main() -> int:
     ap.add_argument("rev")
     a = ap.parse_args()
     files = sorted(f for f in os.listdir(a.dir) if f.endswith(".sql"))
-    chain = [(f.split("_", 1)[1][:-4], os.path.join(a.dir, f)) for f in files]
+    # r1 is the base schema (fixtures/base.sql), loaded before any upgrade.
+    chain = [("r1", None)] + [(f.split("_", 1)[1][:-4], os.path.join(a.dir, f)) for f in files]
     revs = [r for r, _ in chain]
     if a.rev not in revs:
         print(f"unknown revision {a.rev}", file=sys.stderr)
@@ -33,7 +34,7 @@ def main() -> int:
     start = revs.index(current) + 1 if current in revs else 0
     end = revs.index(a.rev) + 1
     if start >= end:
-        return 0
+        return 0  # at or past the target: alembic's upgrade does nothing
     script = []
     for rev, path in chain[start:end]:
         with open(path, encoding="utf-8") as fh:

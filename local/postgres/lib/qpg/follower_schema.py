@@ -11,10 +11,12 @@ version table:
 * ``BEFORE INSERT OR UPDATE … FOR EACH ROW``, set ``ENABLE REPLICA``, so it fires
   only under ``session_replication_role = replica`` — in the apply and
   table-sync workers, never in the follower's own migration session;
-* it raises SQLSTATE ``QF001`` when the version a replicated row carries is not
-  in ``follower.applied_revisions`` (web) or ``follower.applied_coord_versions``
-  (coord lane). The migrator's transaction always writes that row, so apply
-  stops at exactly that transaction with none of its DML applied;
+* it passes a replicated version row only when the follower has ARMED that
+  version (``follower.armed_versions``), and consumes the arming as it passes,
+  so each armed version passes exactly once. Otherwise it raises SQLSTATE
+  ``QF001``. The migrator's transaction always writes the version row, so apply
+  stops at exactly that transaction with none of its DML applied. A re-stamp or
+  downgrade to a version applied long ago is not armed, so it stalls too;
 * **B2:** under PostgreSQL 16's default ``run_as_owner = false`` the apply
   worker switches to the table OWNER (``qontinui_user``, not a superuser)
   before firing it. That role cannot read ``follower.*``, so the function is
@@ -89,10 +91,27 @@ CREATE TABLE IF NOT EXISTS follower.state (
 );
 INSERT INTO follower.state (id, status) VALUES (1, 'idle') ON CONFLICT (id) DO NOTHING;
 
-CREATE TABLE IF NOT EXISTS follower.pending_repairs (
-    relation  text PRIMARY KEY,
-    reason    text NOT NULL,
-    queued_at timestamptz NOT NULL DEFAULT now()
+-- A version the stall marker lets through ONCE: the head the initial table
+-- sync copies (seed), and a coord history row the follower's undo removed so
+-- the publisher's own insert can apply. Consumed by the marker as it passes.
+CREATE TABLE IF NOT EXISTS follower.armed_versions (
+    source   text NOT NULL,
+    version  text NOT NULL,
+    armed_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (source, version)
+);
+
+-- Rows the follower's local replay INSERTED into a replicated table, and
+-- replica-identity key changes it made, recorded by follower.replay_log()
+-- while the subscription is disabled. The follower deletes those rows again
+-- before re-enabling, so the publisher's copy of the migration applies onto
+-- exactly the pre-migration data.
+CREATE TABLE IF NOT EXISTS follower.replay_log (
+    id      bigserial PRIMARY KEY,
+    relid   oid NOT NULL,
+    op      text NOT NULL CHECK (op IN ('I', 'K')),
+    new_key jsonb NOT NULL,
+    old_key jsonb
 );
 
 CREATE TABLE IF NOT EXISTS follower.events (
@@ -119,18 +138,19 @@ DECLARE
 BEGIN
     IF TG_ARGV[0] = 'web' THEN
         v := to_jsonb(NEW) ->> 'version_num';
-        IF NOT EXISTS (SELECT 1 FROM follower.applied_revisions a WHERE a.version_num = v) THEN
+        DELETE FROM follower.armed_versions a WHERE a.source = 'web' AND a.version = v;
+        IF NOT FOUND THEN
             RAISE EXCEPTION USING
                 ERRCODE = '{STALL_SQLSTATE}',
-                MESSAGE = format('qontinui-follower stall: web revision %s not applied locally', v);
+                MESSAGE = format('qontinui-follower stall: web revision %s is not armed', v);
         END IF;
     ELSIF TG_ARGV[0] = 'coord' THEN
         v := to_jsonb(NEW) ->> TG_ARGV[2];
-        IF NOT EXISTS (SELECT 1 FROM follower.applied_coord_versions a
-                        WHERE a.lane = TG_ARGV[1] AND a.version = v) THEN
+        DELETE FROM follower.armed_versions a WHERE a.source = 'coord:' || TG_ARGV[1] AND a.version = v;
+        IF NOT FOUND THEN
             RAISE EXCEPTION USING
                 ERRCODE = '{STALL_SQLSTATE}',
-                MESSAGE = format('qontinui-follower stall: coord lane %s version %s not applied locally',
+                MESSAGE = format('qontinui-follower stall: coord lane %s version %s is not armed',
                                  TG_ARGV[1], v);
         END IF;
     ELSE
@@ -140,10 +160,47 @@ BEGIN
 END
 $fn$;
 
+-- The replay log trigger function. It runs inside the follower's local
+-- migration, as the migrating role, so it is SECURITY DEFINER like the marker.
+-- TG_ARGV[0] is 'data' or 'version'; the rest are the replica-identity key
+-- columns (none: the whole row is the key).
+CREATE OR REPLACE FUNCTION follower.replay_log() RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, follower
+AS $fn$
+DECLARE
+    keys text[] := TG_ARGV[1:];
+    nk jsonb;
+    ok jsonb;
+BEGIN
+    IF cardinality(keys) = 0 THEN
+        nk := to_jsonb(NEW);
+    ELSE
+        SELECT jsonb_object_agg(k, to_jsonb(NEW) -> k) INTO nk FROM unnest(keys) k;
+    END IF;
+    IF TG_OP = 'INSERT' THEN
+        INSERT INTO follower.replay_log (relid, op, new_key) VALUES (TG_RELID, 'I', nk);
+    ELSIF TG_ARGV[0] = 'data' THEN
+        IF cardinality(keys) = 0 THEN
+            ok := to_jsonb(OLD);
+        ELSE
+            SELECT jsonb_object_agg(k, to_jsonb(OLD) -> k) INTO ok FROM unnest(keys) k;
+        END IF;
+        IF ok IS DISTINCT FROM nk THEN
+            INSERT INTO follower.replay_log (relid, op, new_key, old_key) VALUES (TG_RELID, 'K', nk, ok);
+        END IF;
+    END IF;
+    RETURN NULL;
+END
+$fn$;
+
 RESET ROLE;
 
 REVOKE ALL ON FUNCTION follower.stall_marker() FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION follower.stall_marker() TO {ar};
+REVOKE ALL ON FUNCTION follower.replay_log() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION follower.replay_log() TO {ar};
 """
 
 
@@ -157,3 +214,21 @@ CREATE TRIGGER {TRIGGER_NAME} BEFORE INSERT OR UPDATE ON {target}
     FOR EACH ROW EXECUTE FUNCTION follower.stall_marker({arglist});
 ALTER TABLE {target} ENABLE REPLICA TRIGGER {TRIGGER_NAME};
 """
+
+
+LOG_TRIGGER = "qontinui_follower_replay_log"
+
+
+def log_trigger_sql(table: str, kind: str, key: list[str]) -> str:
+    """The replay-log trigger, installed only while the subscription is disabled."""
+    schema, name = table.split(".", 1)
+    target = qualified(schema, name)
+    args = ", ".join(lit(a) for a in [kind, *key])
+    return (f"DROP TRIGGER IF EXISTS {LOG_TRIGGER} ON {target};\n"
+            f"CREATE TRIGGER {LOG_TRIGGER} AFTER INSERT OR UPDATE ON {target} "
+            f"FOR EACH ROW EXECUTE FUNCTION follower.replay_log({args});\n")
+
+
+def drop_log_trigger_sql(table: str) -> str:
+    schema, name = table.split(".", 1)
+    return f"DROP TRIGGER IF EXISTS {LOG_TRIGGER} ON {qualified(schema, name)};\n"

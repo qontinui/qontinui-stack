@@ -29,13 +29,13 @@ ssl_key_file = REPLACE_ME
 [subscriber]
 admin_dsn = host=/var/run/postgresql port=5432 dbname=qontinui_db user=postgres
 app_dsn = host=/var/run/postgresql port=5432 dbname=qontinui_db user=qontinui_user
-passfile = /etc/qontinui-pg/pgpass
+passfile = /var/lib/qontinui-pg/pgpass
 
 [publisher]
 # The replication role's read-only connection through the tunnel (D2). Used by
 # the follower, sequence sync, watchdog, secdiff and check-grantees.
 dsn = host=REPLACE_ME port=5432 dbname=qontinui_db user=qontinui_replication sslmode=verify-full sslrootcert=/etc/qontinui-pg/rds-ca-bundle.pem
-passfile = /etc/qontinui-pg/pgpass
+passfile = /var/lib/qontinui-pg/pgpass
 
 [replication]
 subscription = qontinui_sub
@@ -60,8 +60,6 @@ coord_version_column = version
 phase8_complete = false
 stall_fresh_seconds = 120
 migrate_timeout_seconds = 3600
-repair_full_max_rows = 1000000
-repair_bucket_rows = 10000
 log_tail_bytes = 4194304
 
 [follower.env]

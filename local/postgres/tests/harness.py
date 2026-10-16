@@ -202,7 +202,7 @@ enabled = false
             f"CREATE PUBLICATION qontinui_pub FOR {self.published} WITH (publish_via_partition_root = true)")
         self.write_conf()
         cli(self.conf, "follower", "install", check=True)
-        cli(self.conf, "follower", "seed", check=True)
+        cli(self.conf, "follower", "seed", "--expect", "r1", check=True)
         self.subscribe()
 
     def subscribe(self, wait: bool = True) -> None:

@@ -120,8 +120,18 @@ class Watchdog:
             return Check("apply_lag", "UNKNOWN", f"subscription {self.cfg.subscription} absent")
         enabled, age, running = rows[0]
         limit = self.cfg.getint("watchdog", "lag_alert_seconds", 1800)
+        state = self._state()
         if enabled != "true":
-            return Check("apply_lag", "ALERT", "subscription is DISABLED")
+            # The follower disables the subscription for every migration it
+            # replays (D7's window is minutes); only a long disable alerts.
+            since = state.setdefault("disabled_since", time.time())
+            self._save_state(state)
+            held = int(time.time() - since)
+            if held > limit:
+                return Check("apply_lag", "ALERT", f"subscription has been DISABLED for {held} s (limit {limit})")
+            return Check("apply_lag", "OK", f"subscription disabled for {held} s (within {limit} s)")
+        if state.pop("disabled_since", None) is not None:
+            self._save_state(state)
         if running != "true":
             return Check("apply_lag", "ALERT", "no apply worker is running")
         if age == "":

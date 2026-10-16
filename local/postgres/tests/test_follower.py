@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
+import threading
+import time
 import unittest
 
 from harness import APP, FIXTURES, REPL, Pair, cli, dsn, wait_caught_up
@@ -21,9 +24,12 @@ class DoubleDmlTest(unittest.TestCase):
     r2 seeds a gen_random_uuid() row into an existing table (only the stall
     marker stops it); r3 adds a column and backfills it with clock_timestamp()
     (a missing-column error stops it first); r4+r5 land in ONE migrator
-    transaction with a new seeded table. Red with SKIP disabled (the replayed
-    seed collides with the local one, or arrives twice) and red with the
-    repair disabled (the local uuids and timestamps differ from production's).
+    transaction with a new seeded table. Red when the replay's inserts are not
+    undone (the publisher's seed collides with the local one), red when the
+    replay runs with the subscription enabled (apply races the replay), and
+    red if the follower reads table data from the publisher (review blocker 1:
+    the r3 step asserts the publisher's scan counters on app.items do not move
+    while the follower works).
     """
 
     @classmethod
@@ -35,12 +41,16 @@ class DoubleDmlTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.pair.teardown()
 
-    def follow_and_compare(self, rev: str):
+    def follow_and_compare(self, rev: str, assert_no_publisher_reads: str | None = None):
         p = self.pair
         p.migrate_pub(rev)
         # Ordinary application writes keep flowing around the migration.
         p.pub(APP).execute(f"INSERT INTO app.items (label) VALUES ('after {rev}')")
+        before = scans(p, assert_no_publisher_reads) if assert_no_publisher_reads else None
         res = p.follow()
+        if before is not None:
+            self.assertEqual(scans(p, assert_no_publisher_reads), before,
+                             f"the follower read {assert_no_publisher_reads} on the publisher")
         self.assertEqual(res.returncode, 0, f"follower did not settle after {rev}:\n{res.stdout}\n{res.stderr}")
         wait_caught_up(p)
         self.assertEqual(p.sub().scalar("SELECT version_num FROM public.alembic_version"), rev)
@@ -51,7 +61,7 @@ class DoubleDmlTest(unittest.TestCase):
         self.assertEqual(self.pair.sub().scalar("SELECT count(*) FROM app.settings WHERE name = 'feature_x'"), "1")
 
     def test_2_column_and_nondeterministic_backfill(self):
-        self.follow_and_compare("r3")
+        self.follow_and_compare("r3", assert_no_publisher_reads="app.items")
         self.assertEqual(self.pair.sub().scalar("SELECT count(*) FROM app.items WHERE migrated_at IS NULL "
                                                 "AND label NOT LIKE 'after%'"), "0")
 
@@ -66,13 +76,126 @@ class DoubleDmlTest(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
 
 
+def scans(pair: Pair, table: str) -> str:
+    """seq_scan + idx_scan of a publisher table, after its stats have flushed."""
+    time.sleep(1.5)
+    schema, name = table.split(".")
+    return pair.pub().scalar(
+        "SELECT (coalesce(seq_scan, 0) + coalesce(idx_scan, 0))::text FROM pg_stat_user_tables "
+        f"WHERE schemaname = '{schema}' AND relname = '{name}'")
+
+
+class ConcurrentWritesTest(unittest.TestCase):
+    """Review blocker 2: the follower's writes can never collide with apply.
+
+    A writer thread inserts and updates app.settings and app.items on the
+    publisher continuously — before, during and after two migrations that
+    touch exactly those tables (r2 seeds app.settings, r3 backfills app.items).
+    Afterwards both sides are equal, and the subscriber's log holds no apply
+    error other than the stall on each migration's own transaction — in
+    particular no unique violation. Red under `no-undo`, and under
+    `overwrite-from-publisher` (254ab54's race: copying the publisher's
+    current rows ahead of apply).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.pair = Pair("t_concurrent")
+        cls.pair.setup()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.pair.teardown()
+
+    def test_concurrent_publisher_writes_during_follow(self):
+        p = self.pair
+        stop = threading.Event()
+        errors: list[str] = []
+        writes = [0]
+
+        def writer():
+            db = p.pub(APP)
+            n = 0
+            while not stop.is_set():
+                n += 1
+                try:
+                    db.execute(
+                        f"INSERT INTO app.settings (name, value) VALUES ('w{n}', 'v');"
+                        "UPDATE app.settings SET value = md5(random()::text) "
+                        f"WHERE name IN ('base', 'w{max(1, n - 1)}');"
+                        f"INSERT INTO app.items (label) VALUES ('w{n}');"
+                        f"UPDATE app.items SET label = label || '.' WHERE id = {1 + n % 50};")
+                    writes[0] += 1
+                except Exception as exc:  # noqa: BLE001 - surfaced by the assertion below
+                    errors.append(str(exc))
+                time.sleep(0.05)
+
+        start = p.sub().scalar("SELECT now()::text")
+        t = threading.Thread(target=writer, daemon=True)
+        t.start()
+        try:
+            time.sleep(1)
+            for rev in ("r2", "r3"):
+                p.migrate_pub(rev)
+                res = p.follow()
+                self.assertEqual(res.returncode, 0, f"follower did not settle after {rev}:\n{res.stdout}\n{res.stderr}")
+            time.sleep(1)
+        finally:
+            stop.set()
+            t.join(timeout=30)
+        self.assertEqual(errors, [])
+        self.assertGreater(writes[0], 20, "the writer must actually have run during the migrations")
+        wait_caught_up(p)
+        p.assert_equal(self)
+        migration_xids = {json.loads(r[0])["xid"] for r in p.sub().rows(
+            "SELECT detail::text FROM follower.events WHERE kind = 'stall'")}
+        self.assertEqual(len(migration_xids), 2, "one stall per migration")
+        bad = []
+        for line in p.sub().scalar("SELECT pg_read_file(pg_current_logfile('jsonlog'))").splitlines():
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if rec.get("error_severity") != "ERROR" or rec.get("timestamp", "") < start[:23]:
+                continue
+            m = re.search(r"in transaction (\d+)", rec.get("context") or "")
+            if rec.get("state_code") == "23505" or (m and m.group(1) not in migration_xids):
+                bad.append((rec.get("state_code"), rec.get("message"), rec.get("context")))
+        self.assertEqual(bad, [], "apply hit an error outside the migrations' own stalls")
+
+
+class RestampTest(unittest.TestCase):
+    """Review minor 7: a re-stamp to a version applied before is not let through."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.pair = Pair("t_restamp")
+        cls.pair.setup()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.pair.teardown()
+
+    def test_restamp_halts(self):
+        p = self.pair
+        p.migrate_pub("r2")
+        self.assertEqual(p.follow().returncode, 0)
+        p.pub(APP).execute("INSERT INTO app.items (label) VALUES ('downgrade dml'); "
+                           "UPDATE public.alembic_version SET version_num = 'r1'")
+        res = p.follow(timeout=60)
+        self.assertEqual(res.returncode, 3, res.stdout + res.stderr)
+        state = json.loads(cli(p.conf, "follower", "status", check=True).stdout)
+        self.assertIn("expected ['r1']", state["reason"])
+        self.assertEqual(p.sub().scalar("SELECT count(*) FROM app.items WHERE label = 'downgrade dml'"), "0")
+
+
 class CoordLaneTest(unittest.TestCase):
     """A2: the coord lane under r16's fallback, with a fixture coord-migrate.
 
     Adoption on both sides, the history tables joining the publication, the
     REFRESH with copy_data = false, then a boot-lane version seeding a
-    gen_random_uuid() row and a background-lane idempotent backfill. Red with
-    the SKIP or the repair disabled.
+    gen_random_uuid() row and a background-lane idempotent backfill. Red under
+    `no-undo`.
     """
 
     @classmethod
@@ -193,6 +316,16 @@ class OwnershipTest(unittest.TestCase):
         p.assert_equal(self)
         check = cli(p.conf, "follower", "check")
         self.assertEqual(check.returncode, 0, check.stdout)
+
+    def test_parallel_streaming_is_refused(self):
+        p = self.pair
+        p.sub().execute(f"ALTER SUBSCRIPTION {p.sub_name} SET (streaming = parallel)", single_transaction=False)
+        try:
+            check = cli(p.conf, "follower", "check")
+            self.assertEqual(check.returncode, 1, check.stdout)
+            self.assertIn("FAIL subscription streaming is not parallel", check.stdout)
+        finally:
+            p.sub().execute(f"ALTER SUBSCRIPTION {p.sub_name} SET (streaming = on)", single_transaction=False)
 
 
 if __name__ == "__main__":

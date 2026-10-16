@@ -13,19 +13,34 @@ import os
 import sys
 
 MUTATIONS = {
-    # D7 step 3 disabled: the publisher's copy of the migration is not skipped.
-    "no-skip": (
+    # Review blocker 2: the replay's inserted rows are not undone, so the
+    # publisher's copy of the migration collides with them.
+    "no-undo": (
         "lib/qpg/follower.py",
-        "f\"ALTER SUBSCRIPTION {ident(self.cfg.subscription)} SKIP (lsn = {lit(detail['finish_lsn'])})\"",
-        "\"SELECT 'mutation: SKIP disabled'\"",
-        ["test_follower.DoubleDmlTest", "test_follower.CoordLaneTest"],
+        'match = " AND ".join(f"t.{ident(k)} = r.{ident(k)}" for k in key)',
+        'match = "false AND " + " AND ".join(f"t.{ident(k)} = r.{ident(k)}" for k in key)',
+        ["test_follower.DoubleDmlTest", "test_follower.CoordLaneTest", "test_follower.ConcurrentWritesTest"],
     ),
-    # D7 step 4 disabled: differences are found but never overwritten.
-    "no-repair": (
-        "lib/qpg/repair.py",
-        "        result.rewritten += overwrite(pub, sub, s, keys)\n",
-        "        result.clean = True\n        return result\n",
-        ["test_follower.DoubleDmlTest", "test_follower.CoordLaneTest"],
+    # Review blocker 2, the race itself: put back 254ab54's overwrite of a
+    # replicated table from the publisher's CURRENT rows. Rows committed there
+    # but not yet applied get copied in, and apply's own INSERT then collides.
+    "overwrite-from-publisher": (
+        "lib/qpg/follower.py",
+        "        if detail.get(\"was_enabled\", True):\n",
+        "        self.admin.execute_with_copy(\n"
+        "            \"SET LOCAL session_replication_role = replica; DELETE FROM app.settings;\",\n"
+        "            \"COPY app.settings (id, name, value) FROM STDIN\",\n"
+        "            self.pub.copy_out(\"SELECT id, name, value FROM app.settings\"))\n"
+        "        if detail.get(\"was_enabled\", True):\n",
+        ["test_follower.ConcurrentWritesTest"],
+    ),
+    # Review blocker 1: the follower reads table data from the publisher.
+    "reads-publisher-data": (
+        "lib/qpg/follower.py",
+        "                detail[\"undone\"] = self._undo_replay_inserts(detail)\n",
+        "                detail[\"undone\"] = self._undo_replay_inserts(detail)\n"
+        "                self.pub.rows(\"SELECT count(*) FROM app.items\")\n",
+        ["test_follower.DoubleDmlTest"],
     ),
     # A3's refusal removed.
     "no-move-refusal": (
@@ -37,8 +52,8 @@ MUTATIONS = {
     # B2: the stall marker runs as the table owner, not as the follower role.
     "no-security-definer": (
         "lib/qpg/follower_schema.py",
-        "LANGUAGE plpgsql\nSECURITY DEFINER\n",
-        "LANGUAGE plpgsql\n",
+        "LANGUAGE plpgsql\nSECURITY DEFINER\nSET search_path = pg_catalog, follower\nAS $fn$\nDECLARE\n    v text;",
+        "LANGUAGE plpgsql\nSET search_path = pg_catalog, follower\nAS $fn$\nDECLARE\n    v text;",
         ["test_follower.OwnershipTest"],
     ),
     # B3: the diff stops comparing policies.

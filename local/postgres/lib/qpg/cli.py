@@ -38,7 +38,9 @@ def cmd_follower(args, cfg) -> int:
         print("follower schema and stall triggers installed")
         return 0
     if args.action == "seed":
-        print(json.dumps(f.seed()))
+        if not args.expect:
+            raise ConfigError("follower seed needs --expect <the web revision the schema dump was taken at>")
+        print(json.dumps(f.seed(args.expect)))
         return 0
     if args.action == "run":
         return f.run(once=args.once, until_idle=args.until_idle, timeout=args.timeout)
@@ -165,6 +167,7 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("--until-idle", action="store_true", help="loop until settled, halted or --timeout")
     f.add_argument("--timeout", type=float, default=0.0)
     f.add_argument("--version", help="coord version (coord-adopt)")
+    f.add_argument("--expect", help="seed: the web revision the loaded schema dump was taken at")
     f.add_argument("--dry-run-notify", action="store_true", help="log notices, never post them")
     f.set_defaults(fn=cmd_follower)
 
