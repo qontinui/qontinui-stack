@@ -1,0 +1,22 @@
+{marker}
+[Unit]
+Description=qontinui local/postgres schema follower (plan D7)
+Requires=postgresql@{version}-{cluster}.service
+After=postgresql@{version}-{cluster}.service network-online.target
+
+[Service]
+Type=simple
+User=postgres
+Group=postgres
+Environment=QONTINUI_PG_CONFIG={config_path}
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/local/bin/qontinui-pg follower run
+Restart=on-failure
+RestartSec=30
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

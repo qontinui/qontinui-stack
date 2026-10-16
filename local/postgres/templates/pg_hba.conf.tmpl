@@ -1,0 +1,26 @@
+{marker}
+# Rendered by local/postgres/install.sh. `install.sh --check` asserts the D4
+# rule on this file AND on what the server actually loaded (pg_hba_file_rules).
+#
+# TYPE  DATABASE  USER  ADDRESS  METHOD
+
+# The unix socket: the local superuser by peer identity (the follower's admin
+# connection, the timers), everyone else by password.
+local   all  postgres  peer
+local   all  all  scram-sha-256
+
+# D4 (re-vet 2026-10-16): coord connects with tokio-postgres NoTls, so a
+# hostssl-only rule would refuse it at cutover. The APPLICATION ROLE's non-TLS
+# login is admitted only to its database and only from the tailnet, where
+# WireGuard encrypts it.
+{app_lines}
+
+# Every other client: TLS, from the tailnet only.
+{ssl_lines}
+{repl_lines}
+
+# Anything else is refused.
+host    all          all  0.0.0.0/0  reject
+host    all          all  ::/0       reject
+host    replication  all  0.0.0.0/0  reject
+host    replication  all  ::/0       reject

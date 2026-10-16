@@ -1,0 +1,47 @@
+name: local-postgres
+
+# The local/postgres tree (plan 2026-10-15-coord-and-web-data-move-off-aws-by-
+# logical-replication, Phases 1d/1e): the subscriber host's installer, the
+# schema follower, sequence sync, watchdog, partition timer and the B1/B3
+# steps. tests/run.sh starts a PUBLISHER and a SUBSCRIBER PostgreSQL 16 +
+# pgvector in Docker with real logical replication between them, runs every
+# test, then re-runs each test under its source mutation (tests/mutations.py)
+# and fails if any mutation leaves its test green.
+#
+# Path-filtered on purpose, which is safe ONLY because this is not a required
+# ruleset context: a path-filtered REQUIRED check is skipped on unrelated PRs
+# and deadlocks them (the "ghost required check" class noted in
+# powershell-parse.yml). It is not a candidate-CI producer either — coord's
+# merge train reads qontinui-ci.yml's push trigger, which stays the only one.
+#
+# Credential-free like every workflow here: no AWS, no database outside the
+# job's own containers, throwaway passwords generated per run.
+on:
+  pull_request:
+    paths:
+      - 'local/postgres/**'
+      - '.github/workflows/local-postgres.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'local/postgres/**'
+      - '.github/workflows/local-postgres.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  local-postgres:
+    name: local/postgres (PostgreSQL 16 + pgvector, logical replication)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck
+        run: shellcheck local/postgres/install.sh local/postgres/tests/run.sh local/postgres/tests/inside.sh
+
+      - name: tests, then every mutation must turn its tests red
+        run: bash local/postgres/tests/run.sh

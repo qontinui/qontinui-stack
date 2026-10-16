@@ -1,0 +1,10 @@
+{marker}
+[Unit]
+Description=qontinui local/postgres pgBackRest diff backup (plan D15)
+
+[Timer]
+OnCalendar={diff_oncalendar}
+Persistent=true
+
+[Install]
+WantedBy=timers.target

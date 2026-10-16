@@ -1,0 +1,131 @@
+# qontinui-pg.conf — local/postgres configuration (plan
+# 2026-10-15-coord-and-web-data-move-off-aws-by-logical-replication, D4-D16).
+#
+# Install as /etc/qontinui-pg/qontinui-pg.conf, mode 0640, owner root:postgres.
+# Every REPLACE_ME is a host-specific value that must NOT be committed: this
+# repository is public. No password goes in this file; libpq reads passwords
+# from the passfile below (mode 0600, owner postgres), which
+# `qontinui-pg credential new` writes.
+
+[cluster]
+version = 16
+name = qontinui
+# On the LUKS-encrypted volume (OD1). install.sh refuses a data directory that
+# is not on a dm-crypt device unless given --allow-unencrypted.
+data_directory = /srv/qontinui-pg/16/qontinui
+# This host's tailnet address; the server listens on it and the unix socket only.
+tailnet_address = REPLACE_ME
+tailnet_cidrs = 100.64.0.0/10, fd7a:115c:a1e0::/48
+port = 5432
+database = qontinui_db
+app_role = qontinui_user
+follower_role = qontinui_follower
+# Physical replication users admitted over hostssl (Phase 5's rack standby). Empty: none.
+replication_users =
+# The host's tailnet certificate (`tailscale cert`).
+ssl_cert_file = REPLACE_ME
+ssl_key_file = REPLACE_ME
+
+[subscriber]
+admin_dsn = host=/var/run/postgresql port=5432 dbname=qontinui_db user=postgres
+app_dsn = host=/var/run/postgresql port=5432 dbname=qontinui_db user=qontinui_user
+passfile = /etc/qontinui-pg/pgpass
+
+[publisher]
+# The replication role's read-only connection through the tunnel (D2). Used by
+# the follower, sequence sync, watchdog, secdiff and check-grantees.
+dsn = host=REPLACE_ME port=5432 dbname=qontinui_db user=qontinui_replication sslmode=verify-full sslrootcert=/etc/qontinui-pg/rds-ca-bundle.pem
+passfile = /etc/qontinui-pg/pgpass
+
+[replication]
+subscription = qontinui_sub
+publication = qontinui_pub
+published_schemas = coord, coord_parts, agent, project, devenv, auth, overview, web, cloud
+
+[follower]
+poll_seconds = 60
+# Run AS THE APPLICATION ROLE (B2). {rev} is the revision the publisher's
+# migration transaction left behind; {app_dsn} is [subscriber] app_dsn.
+migrate_cmd = alembic -c /srv/qontinui-web/backend/alembic.ini upgrade {rev}
+# Optional: bring the qontinui-web checkout to a commit carrying {rev} first.
+prepare_cmd =
+version_table = public.alembic_version
+# A2, r16's fallback only. Off by default; A4 forbids any of these once
+# phase8_complete is true (install.sh --check fails).
+coord_lane = false
+coord_migrate_cmd =
+coord_adopt_cmd =
+coord_history_tables =
+coord_version_column = version
+phase8_complete = false
+stall_fresh_seconds = 120
+migrate_timeout_seconds = 3600
+repair_full_max_rows = 1000000
+repair_bucket_rows = 10000
+log_tail_bytes = 4194304
+
+[follower.env]
+# Extra environment for migrate_cmd (alembic's env.py reads its URL from here).
+# DATABASE_URL = postgresql+psycopg2://qontinui_user@/qontinui_db?host=/var/run/postgresql
+
+[seqsync]
+floor = 1000
+final_floor = 10000
+window_hours = 24
+# D8's 7 rollback days: local -> RDS (`seqsync run --reverse`).
+reverse_dsn =
+
+[watchdog]
+retained_wal_alert_bytes = 2147483648
+lag_alert_seconds = 1800
+follower_lag_alert_seconds = 1800
+free_space_floor_gb = 30
+renotify_minutes = 60
+state_file = /var/lib/qontinui-pg/watchdog-state.json
+# A command printing RDS AllocatedStorage; absent, notices state it as UNKNOWN.
+allocated_storage_cmd =
+# A6: the reverse subscription on RDS during D8's window.
+reverse_dsn =
+reverse_subscription =
+
+[partitions]
+# D9: on once lane D's conversion has replayed here; off again at cutover.
+enabled = false
+function = coord.test_results_partition_maintenance
+retention_days = 14
+lookahead_days = 3
+on_calendar = hourly
+require_function = false
+
+[secdiff]
+# Grantees that exist only on RDS by design (the replication role).
+ignore_roles = qontinui_replication
+
+[notify]
+# Default: notices are logged only. When enabled, they are posted as findings.
+enabled = false
+coord_url = https://coord.qontinui.io
+# One `Authorization: Bearer …` line, mode 0600, owner postgres.
+header_file = /etc/qontinui-pg/coord-notify.header
+topic = operator-notify
+kind = status
+resource_keys = plan:2026-10-15-coord-and-web-data-move-off-aws-by-logical-replication
+
+[pgbackrest]
+# Phase 4. Off: archive_mode stays off and no backup timers are installed.
+enabled = false
+stanza = qontinui
+# No repo1 on a one-disk interim host (D4); set it on the rack (Phase 5).
+repo1_path =
+repo2_type = REPLACE_ME
+repo2_path = REPLACE_ME
+retention_full_days = 35
+archive_push_queue_max = 20GiB
+process_max = 4
+full_on_calendar = Sun *-*-* 02:00:00
+diff_on_calendar = Mon..Sat *-*-* 02:00:00
+
+[pgbackrest.repo2]
+# Further repo2-* keys for the chosen off-site store (OD4), e.g. for sftp:
+# sftp-host = REPLACE_ME
+# sftp-host-user = REPLACE_ME

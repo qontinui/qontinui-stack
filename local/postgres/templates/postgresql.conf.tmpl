@@ -1,0 +1,41 @@
+{marker}
+# Included from /etc/postgresql/{version}/{cluster}/conf.d/. Rendered from
+# qontinui-pg.conf by local/postgres/install.sh; hand edits are drift that
+# `install.sh --check` reports.
+
+# D4: listen on the tailnet address and the unix socket only.
+listen_addresses = '{tailnet_address}'
+port = {port}
+unix_socket_directories = '/var/run/postgresql'
+
+# D2 / D4: TLS for every client except the application role's tailnet login
+# (pg_hba.conf). The certificate is the host's tailnet certificate.
+ssl = on
+ssl_cert_file = '{ssl_cert_file}'
+ssl_key_file = '{ssl_key_file}'
+password_encryption = 'scram-sha-256'
+
+# Logical: the subscriber publishes back to RDS for D8's 7-day reverse window,
+# and it is the source of D10's physical standby (logical implies replica).
+wal_level = logical
+max_wal_senders = 10
+max_replication_slots = 10
+max_logical_replication_workers = 8
+# D3: one table sync at a time, so each sync stays inside the slot cap's window.
+max_sync_workers_per_subscription = 1
+wal_retrieve_retry_interval = '5s'
+
+# The schema follower (D7) reads apply errors (remote xid + finish LSN) from
+# the jsonlog through pg_read_file, as the local superuser.
+logging_collector = on
+log_destination = 'stderr,jsonlog'
+log_directory = 'log'
+log_filename = 'postgresql-%Y-%m-%d.log'
+log_rotation_age = '1d'
+log_rotation_size = 0
+log_file_mode = 0600
+
+# D15: WAL archiving to pgBackRest (asynchronous; archive-push-queue-max bounds
+# the local queue). Off until [pgbackrest] enabled = true (Phase 4).
+archive_mode = {archive_mode}
+archive_command = '{archive_command}'

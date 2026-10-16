@@ -1,0 +1,13 @@
+{marker}
+[Unit]
+Description=qontinui local/postgres pgBackRest full backup (plan D15)
+Requires=postgresql@{version}-{cluster}.service
+After=postgresql@{version}-{cluster}.service
+
+[Service]
+Type=oneshot
+User=postgres
+Group=postgres
+ExecStart=/usr/bin/pgbackrest --stanza={stanza} --type=full backup
+NoNewPrivileges=yes
+PrivateTmp=yes
