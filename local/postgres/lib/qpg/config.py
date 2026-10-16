@@ -60,10 +60,16 @@ class Config:
         return self.p.get(section, key, fallback=fallback)
 
     def getint(self, section: str, key: str, fallback: int) -> int:
-        return self.p.getint(section, key, fallback=fallback)
+        try:
+            return self.p.getint(section, key, fallback=fallback)
+        except ValueError as exc:
+            raise ConfigError(f"[{section}] {key} is not an integer ({self.path}): {exc}") from exc
 
     def getbool(self, section: str, key: str, fallback: bool) -> bool:
-        return self.p.getboolean(section, key, fallback=fallback)
+        try:
+            return self.p.getboolean(section, key, fallback=fallback)
+        except ValueError as exc:
+            raise ConfigError(f"[{section}] {key} is not a boolean ({self.path}): {exc}") from exc
 
     def require(self, section: str, key: str) -> str:
         value = self.p.get(section, key, fallback=None)

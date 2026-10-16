@@ -52,7 +52,7 @@ MUTATIONS = {
     # Re-review A2: a renamed table is not detected.
     "no-rename-check": (
         "lib/qpg/follower.py",
-        '        if renamed and not self._resolved(xid, "rename"):\n',
+        "        if renamed and unresolved:\n",
         "        if False:\n",
         ["test_follower.RenameTest"],
     ),
@@ -102,10 +102,11 @@ MUTATIONS = {
     # Re-review B3: `follower resolve` does not record the resolution.
     "resolve-not-recorded": (
         "lib/qpg/follower.py",
-        '            "INSERT INTO follower.resolutions (xid, kase, target) VALUES "\n'
-        '            f"({lit(prior[\'xid\'])}, {lit(kase)}, {lit(target or \'*\')}) ON CONFLICT DO NOTHING")',
-        '            "SELECT 1")',
-        ["test_follower.RenameTest", "test_follower.MissingValueTest"],
+        '        script = [f"INSERT INTO follower.resolutions (sub_oid, xid, kase, target) VALUES '
+        '({lit(sub)}, {lit(xid)}, "\n'
+        '                  f"{lit(kase)}, {lit(target)}) ON CONFLICT DO NOTHING;"]',
+        '        script = ["SELECT 1;"]',
+        ["test_follower.RenameTest", "test_follower.MissingValueTest", "test_follower.TypeRewriteTest"],
     ),
     # Re-review B4: the stored-default check ignores recorded resolutions.
     "resolution-ignored": (
@@ -120,6 +121,27 @@ MUTATIONS = {
         '            if enabled == "true":\n                self.admin.execute(f"ALTER SUBSCRIPTION',
         '            if False:\n                self.admin.execute(f"ALTER SUBSCRIPTION',
         ["test_follower.DmlThenDdlTest"],
+    ),
+    # Fourth review B1: resolving a rewrite / key change keeps its log rows, so it re-halts forever.
+    "resolve-keeps-log": (
+        "lib/qpg/follower.py",
+        '        if kase in ("rewrite", "key-change"):\n',
+        "        if False:\n",
+        ["test_follower.TypeRewriteTest", "test_follower.KeyChangeTest"],
+    ),
+    # Fourth review B2: a computed default added before a rewrite is not checked.
+    "no-gained-default-check": (
+        "lib/qpg/follower.py",
+        "                if gained:\n",
+        "                if False:\n",
+        ["test_follower.ComputedDefaultRewriteTest"],
+    ),
+    # Fourth review B3: a halt leaves the replay triggers (one database-wide) installed.
+    "halt-keeps-triggers": (
+        "lib/qpg/follower.py",
+        "        cleaned = self._cleanup_replay_triggers()\n",
+        "        cleaned = ''\n",
+        ["test_follower.MigrateFailureTest"],
     ),
     # A3's refusal removed.
     "no-move-refusal": (

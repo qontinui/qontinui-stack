@@ -51,6 +51,11 @@ def cmd_follower(args, cfg) -> int:
     if args.action == "resume":
         f.resume()
         return 0
+    if args.action == "copy-columns":
+        if not args.table:
+            raise ConfigError("follower copy-columns needs --table <schema>.<table> [--column <c>]...")
+        print(json.dumps(f.copy_columns(args.table, args.column)))
+        return 0
     if args.action == "resolve":
         if not args.case:
             raise ConfigError(f"follower resolve needs --case ({', '.join(sorted(f.RESOLVABLE))})")
@@ -168,7 +173,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="group", required=True)
 
     f = sub.add_parser("follower", help="the schema follower (D7, A2-A4)")
-    f.add_argument("action", choices=["install", "seed", "run", "status", "resume", "resolve", "check",
+    f.add_argument("action", choices=["install", "seed", "run", "status", "resume", "resolve", "copy-columns", "check",
                                       "coord-adopt", "coord-refresh", "coord-gate-check"])
     f.add_argument("--once", action="store_true", help="run one cycle")
     f.add_argument("--until-idle", action="store_true", help="loop until settled, halted or --timeout")
@@ -176,7 +181,9 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("--version", help="coord version (coord-adopt)")
     f.add_argument("--expect", help="seed: the web revision the loaded schema dump was taken at")
     f.add_argument("--case", help="resolve: the halt case (rename | missing-value)")
-    f.add_argument("--target", help="resolve missing-value: <schema>.<table>.<column>")
+    f.add_argument("--target", help="resolve: the target the halt names (table, or table.column)")
+    f.add_argument("--table", help="copy-columns: <schema>.<table>")
+    f.add_argument("--column", action="append", help="copy-columns: a column (repeatable; default: all non-key)")
     f.add_argument("--dry-run-notify", action="store_true", help="log notices, never post them")
     f.set_defaults(fn=cmd_follower)
 
@@ -231,11 +238,6 @@ def main(argv: list[str] | None = None) -> int:
         cfg = None if getattr(args, "needs_config", True) is False else config_mod.load(args.config)
         return args.fn(args, cfg)
     except (ConfigError, configparser.Error) as exc:
-        print(f"configuration error: {exc}", file=sys.stderr)
-        return 2
-    except ValueError as exc:
-        # A malformed config value (getint/getboolean on a typo): exit 2, which
-        # the follower unit's RestartPreventExitStatus=2 does not restart.
         print(f"configuration error: {exc}", file=sys.stderr)
         return 2
     except Halt as exc:

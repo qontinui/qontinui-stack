@@ -29,7 +29,8 @@ effect on the subscriber exactly once, with production's own values:
    replays its INSERTs with production's generated values, and its UPDATEs carry
    whole new tuples. Its version-row UPDATE finds no old row (the local replay
    already moved it) and is skipped. Later publisher transactions follow in
-   commit order, and the follower reads no table data from the publisher.
+   commit order. The replay path reads no table data from the publisher (only
+   the operator-run ``copy-columns`` remedy does, one table at a time).
 6. Tables the migration CREATED are emptied locally and copied by ``REFRESH
    PUBLICATION WITH (copy_data = true)``.
 
@@ -108,7 +109,21 @@ def lsn_int(lsn: str | None) -> int:
 
 
 class Halt(RuntimeError):
-    """The follower must stop and alert; nothing it could do next is safe."""
+    """The follower must stop and alert; nothing it could do next is safe.
+
+    ``case`` and ``targets`` name an operator-resolvable halt
+    (``follower resolve --case <case> --target <target>``); they are stored in
+    the halt detail, and ``resolve`` accepts only what the current halt names.
+    """
+
+    def __init__(self, message: str, case: str | None = None, targets: list[str] | None = None):
+        super().__init__(message)
+        self.case = case
+        self.targets = targets or []
+
+
+def resolve_cli(case: str, targets: list[str]) -> str:
+    return "; ".join(f"`qontinui-pg follower resolve --case {case} --target {t}`" for t in targets)
 
 
 @dataclass
@@ -207,9 +222,22 @@ class Follower:
             f"({lit(kind)}, {lit(json.dumps(detail, default=str))}::jsonb)")
         log(f"follower-{kind}", kind, **{"detail": detail})
 
+    def _cleanup_replay_triggers(self) -> str:
+        """Drop the database-wide rewrite event trigger and every replay trigger, wherever they are."""
+        try:
+            rows = self.admin.rows(
+                "SELECT g.tgrelid::regclass::text, g.tgname FROM pg_trigger g "
+                f"WHERE g.tgname IN ({lit(LOG_TRIGGER)}, {lit(TOUCH_TRIGGER)}) AND g.tgparentid = 0")
+            self.admin.execute(DROP_REWRITE_EVENT_SQL + "".join(
+                f"DROP TRIGGER IF EXISTS {ident(r[1])} ON {r[0]};\n" for r in rows))
+            return f"Replay triggers removed ({len(rows)} table trigger(s) and the rewrite event trigger)."
+        except PgError as exc:
+            return f"Replay triggers could NOT be removed ({exc}); `follower check` lists them."
+
     def halt(self, reason: str, detail: dict | None = None) -> None:
         """Halt, and DISABLE the subscription on every halt path, saying truthfully what was left."""
         detail = dict(detail or {})
+        cleaned = self._cleanup_replay_triggers()
         try:
             enabled = self.admin.scalar(
                 f"SELECT subenabled::text FROM pg_subscription WHERE subname = {lit(self.cfg.subscription)}")
@@ -224,13 +252,15 @@ class Follower:
                 left = "The subscription does not exist."
         except PgError as exc:
             left = f"The follower could NOT disable the subscription ({exc}); apply may keep retrying."
+        left = f"{left} {cleaned}"
         self.set_state("halted", reason, detail)
         self.event("halted", {"reason": reason, "left": left, **detail})
         self.notifier.notice(
             "local/postgres schema follower HALTED",
             f"{reason}\n\n{left} Nothing past the stalled transaction is applied while it is disabled; the "
-            "publisher's slot holds the WAL meanwhile (bounded by max_slot_wal_keep_size). Resolve, then run "
-            "`qontinui-pg follower resume` (or `follower resolve <case>` where the reason names one).",
+            "publisher's slot holds the WAL meanwhile (bounded by max_slot_wal_keep_size). "
+            + (f"Resolve with {resolve_cli(detail['halt_case'], detail['halt_targets'])}."
+               if detail.get("halt_case") else "Resolve, then run `qontinui-pg follower resume`."),
             {"reason": reason, "left": left, **detail},
         )
 
@@ -241,7 +271,12 @@ class Follower:
             return
         prior = st["detail"].get("in_progress")
         if prior:
-            # The step machine re-enables the subscription at its enable step.
+            # The halt removed the replay triggers. A migration that halted
+            # before the undo re-installs them (keeping the log: part of the
+            # replay may have committed) before it re-runs. The step machine
+            # re-enables the subscription at its enable step.
+            if prior.get("step") in ("log", "migrate"):
+                prior["step"] = "relog" if "scope" in prior else "log"
             self.set_state("in_progress", None, prior)
         else:
             if st["detail"].get("subscription_disabled_by_halt"):
@@ -254,31 +289,100 @@ class Follower:
     RESOLVABLE = {
         "rename": "the publisher made the same rename/move; carry it through (the table keeps its OID on both "
                   "sides and stays subscribed)",
-        "missing-value": "the operator copied <table>.<column> for existing rows from the publisher while the "
-                         "subscription was disabled",
+        "missing-value": "carry the migration through; afterwards copy <schema>.<table>.<column> for existing rows "
+                         "from the publisher with `follower copy-columns`",
+        "rewrite": "carry the migration through; afterwards copy the rewritten table's affected columns from the "
+                   "publisher with `follower copy-columns`",
+        "key-change": "carry the migration through; afterwards copy the table's non-key columns from the publisher "
+                      "with `follower copy-columns`",
     }
 
     def resolve(self, kase: str, target: str | None) -> None:
-        """Record an operator resolution for the halted migration, then resume it."""
+        """Record an operator resolution for the CURRENT halt; resume once every target it named is resolved."""
         if kase not in self.RESOLVABLE:
             raise ConfigError(f"unknown case {kase!r}; resolvable: {sorted(self.RESOLVABLE)}")
         st = self.state()
         prior = st["detail"].get("in_progress")
         if st["status"] != "halted" or not prior:
             raise Halt(f"`follower resolve` needs a follower halted inside a migration step (status {st['status']})")
-        if kase == "missing-value" and (not target or target.count(".") != 2):
-            raise ConfigError("resolve missing-value needs --target <schema>.<table>.<column>")
-        self.admin.execute(
-            "INSERT INTO follower.resolutions (xid, kase, target) VALUES "
-            f"({lit(prior['xid'])}, {lit(kase)}, {lit(target or '*')}) ON CONFLICT DO NOTHING")
-        self.event("resolved", {"xid": prior["xid"], "case": kase, "target": target or "*",
-                                "meaning": self.RESOLVABLE[kase]})
+        halt_case = st["detail"].get("halt_case")
+        targets = st["detail"].get("halt_targets", [])
+        if halt_case != kase:
+            raise ConfigError(f"the current halt is {halt_case or 'not resolvable'!r}, not {kase!r}")
+        if target not in targets:
+            raise ConfigError(f"--target must be one of the halt's targets {targets}, got {target!r}")
+        sub = self.sub_oid()
+        xid = prior["xid"]
+        script = [f"INSERT INTO follower.resolutions (sub_oid, xid, kase, target) VALUES ({lit(sub)}, {lit(xid)}, "
+                  f"{lit(kase)}, {lit(target)}) ON CONFLICT DO NOTHING;"]
+        if kase in ("rewrite", "key-change"):
+            ops = "'T', 'R'" if kase == "rewrite" else "'K'"
+            rel = f"to_regclass({lit(qualified(*target.split('.', 1)))})"
+            script.append(f"DELETE FROM follower.replay_log WHERE op IN ({ops}) AND (relid = {rel} OR relid IN "
+                          f"(SELECT relid FROM pg_partition_tree({rel})));")
+        self.admin.execute("\n".join(script))
+        self.event("resolved", {"xid": xid, "case": kase, "target": target, "meaning": self.RESOLVABLE[kase]})
+        remaining = [t for t in targets if not self._resolved(xid, kase, t)]
+        if remaining:
+            log("follower-resolve", f"recorded; still unresolved: {remaining}")
+            return
         self.resume()
 
-    def _resolved(self, xid: str, kase: str, target: str = "*") -> bool:
+    def _resolved(self, xid: str, kase: str, target: str) -> bool:
         return self.admin.scalar(
-            f"SELECT count(*) FROM follower.resolutions WHERE xid = {lit(xid)} AND kase = {lit(kase)} "
-            f"AND target = {lit(target)}") != "0"
+            f"SELECT count(*) FROM follower.resolutions WHERE sub_oid = {lit(self.sub_oid())} AND xid = {lit(xid)} "
+            f"AND kase = {lit(kase)} AND target = {lit(target)}") != "0"
+
+    def copy_columns(self, table: str, columns: list[str] | None) -> dict:
+        """Overwrite existing rows' column values from the publisher, collision-free.
+
+        The remedy the rewrite / key-change / missing-value halts name, run once
+        the migration has been carried through. With the subscription DISABLED,
+        it reads key + columns from the publisher (one bounded read of one table,
+        on the operator's request) and UPDATEs only rows that already exist
+        locally, in replica mode. It never inserts, so it cannot collide with a
+        row apply has yet to insert; a row the publisher changed again later is
+        replaced again, in order, by apply.
+        """
+        st = self.state()
+        if st["status"] != "idle":
+            raise Halt(f"copy-columns needs an idle follower (status {st['status']}); resolve the halt first")
+        entry = next((t for t in self.scope_snapshot().values() if t["name"] == table), None)
+        if entry is None or not entry["key"]:
+            raise ConfigError(f"{table} is not a subscribed table with a key")
+        key = entry["key"]
+        schema, name = table.split(".", 1)
+        both = []
+        for db in (self.admin, self.pub):
+            both.append([r[0] for r in db.rows(
+                "SELECT a.attname FROM pg_attribute a WHERE a.attrelid = "
+                f"to_regclass({lit(qualified(schema, name))}) AND a.attnum > 0 AND NOT a.attisdropped "
+                "AND a.attgenerated = '' ORDER BY a.attnum")])
+        cols = columns or [c for c in both[0] if c in both[1] and c not in key]
+        missing = [c for c in cols if c not in both[0] or c not in both[1]]
+        if missing or not cols:
+            raise ConfigError(f"columns {missing or cols} are not on both sides of {table}")
+        target = qualified(schema, name)
+        sel = ", ".join(ident(c) for c in key + cols)
+        enabled = self.admin.scalar(
+            f"SELECT subenabled::text FROM pg_subscription WHERE subname = {lit(self.cfg.subscription)}") == "true"
+        self._disable()
+        try:
+            data = self.pub.copy_out(f"SELECT {sel} FROM {target}")
+            tmp = "qpg_copy_columns"
+            sets = ", ".join(f"{ident(c)} = s.{ident(c)}" for c in cols)
+            match = " AND ".join(f"t.{ident(k)} = s.{ident(k)}" for k in key)
+            self.admin.execute_with_copy(
+                "SET LOCAL session_replication_role = replica;\n"
+                f"CREATE TEMP TABLE {tmp} ON COMMIT DROP AS SELECT {sel} FROM {target} WITH NO DATA;",
+                f"COPY {tmp} ({sel}) FROM STDIN", data,
+                f"UPDATE {target} t SET {sets} FROM {tmp} s WHERE {match};")
+        finally:
+            if enabled:
+                self.admin.execute(f"ALTER SUBSCRIPTION {ident(self.cfg.subscription)} ENABLE",
+                                   single_transaction=False)
+        self.event("copied-columns", {"table": table, "columns": cols})
+        return {"table": table, "columns": cols, "subscription_reenabled": enabled}
 
     def _guard_a4(self) -> None:
         violations = self.cfg.a4_violations()
@@ -468,6 +572,14 @@ class Follower:
             f"WHERE c.relkind IN ('r', 'p') AND n.nspname = ANY({text_array(self._schemas_in_scope())})")
         return {r[0]: {"name": r[1], "partition": r[2] == "true", "key": json.loads(r[3])} for r in rows}
 
+    def max_attnums(self, oids: list[str]) -> dict[str, int]:
+        if not oids:
+            return {}
+        rows = self.admin.rows(
+            "SELECT attrelid::text, max(attnum)::text FROM pg_attribute "
+            f"WHERE attrelid = ANY(ARRAY[{','.join(oids)}]::oid[]) GROUP BY 1")
+        return {r[0]: int(r[1]) for r in rows}
+
     def local_tables(self) -> set[str]:
         return {t["name"] for t in self.scope_snapshot().values()}
 
@@ -519,6 +631,8 @@ class Follower:
         except Halt as exc:
             st = self.state()
             detail = {"in_progress": st["detail"]} if st["status"] == "in_progress" else {}
+            if exc.case:
+                detail.update(halt_case=exc.case, halt_targets=exc.targets)
             self.halt(str(exc), detail)
             return "halted"
 
@@ -566,8 +680,8 @@ class Follower:
             return head + (
                 "KNOWN GAP (DML before later DDL): the migration changed rows and then changed the table's shape in "
                 "the same transaction, so its row changes no longer fit the migrated table. Remedy (manual): "
-                "re-seed the table named above - with the subscription disabled, empty it locally and re-copy it "
-                "from the publisher (take it out of and back into the subscription), then `follower resume`.")
+                "re-seed the table named above. A one-table re-seed is not automated yet; see "
+                "local/postgres/README.md, Known gaps, row 1. The subscription stays disabled until then.")
         if stall.sqlstate == "23505":
             return head + (
                 "A unique violation replaying the migration: a row the migration writes already exists locally "
@@ -624,7 +738,14 @@ class Follower:
                 snap = self.scope_snapshot()
                 detail["scope"] = snap
                 detail["missing_before"] = sorted(self.missing_value_columns(list(snap)))
+                detail["attnums_before"] = self.max_attnums(list(snap))
+                self.admin.execute("TRUNCATE follower.replay_log")
                 self._install_log_triggers(snap)
+                detail["step"] = "migrate"
+            elif step == "relog":
+                # Resuming a migration that halted before its undo: the log so
+                # far is kept, the triggers come back, the migration re-runs.
+                self._install_log_triggers(detail["scope"])
                 detail["step"] = "migrate"
             elif step == "migrate":
                 self._migrate(detail["source"], detail["versions"])
@@ -654,12 +775,25 @@ class Follower:
         now = self.scope_snapshot()
         renamed = [f"{t['name']} -> {now[oid]['name']} (oid {oid})" for oid, t in scope.items()
                    if oid in now and now[oid]["name"] != t["name"]]
-        if renamed and not self._resolved(xid, "rename"):
+        renamed_targets = [now[oid]["name"] for oid, t in scope.items() if oid in now and now[oid]["name"] != t["name"]]
+        unresolved = [t for t in renamed_targets if not self._resolved(xid, "rename", t)]
+        if renamed and unresolved:
             raise Halt(
                 f"the migration renamed or moved table(s) {renamed}. Remedy: confirm on the publisher that it made "
-                "the same rename, then run `qontinui-pg follower resolve rename`, which carries it through (the "
-                "table keeps its OID and its subscription on both sides) and resumes.")
-        self._check_rewrites(scope, now)
+                f"the same rename, then run {resolve_cli('rename', unresolved)}, which carries it through (the "
+                "table keeps its OID and its subscription on both sides) and resumes.",
+                case="rename", targets=unresolved)
+        changed = self.admin.rows(
+            "SELECT DISTINCT l.relid::regclass::text FROM follower.replay_log l WHERE l.op = 'K' ORDER BY 1")
+        if changed:
+            tables = [r[0] for r in changed]
+            raise Halt(
+                f"KNOWN GAP (key change): the local replay changed a replica-identity key in {tables}, which the "
+                "publisher's copy of the migration then cannot find. Remedy: "
+                f"{resolve_cli('key-change', tables)}, then, once the follower is idle, "
+                "`qontinui-pg follower copy-columns --table <that table>` to take every non-key column from the "
+                "publisher.", case="key-change", targets=tables)
+        self._check_rewrites(scope, now, detail.get("attnums_before", {}))
         before = set(detail.get("missing_before", []))
         added = {k: v for k, v in self.missing_value_columns(list(scope)).items() if k not in before}
         differing = []
@@ -668,22 +802,24 @@ class Follower:
             table = now.get(oid, {}).get("name") or scope[oid]["name"]
             if self._resolved(xid, "missing-value", f"{table}.{column}"):
                 continue
+            target = f"{table}.{column}"
             remote = self.pub.rows(
                 "SELECT coalesce(attmissingval::text, '') FROM pg_attribute "
                 f"WHERE attrelid = to_regclass({lit(qualified(*table.split('.', 1)))}) AND attname = {lit(column)} "
                 "AND atthasmissing", canonical=True)
             if not remote or remote[0][0] != local_value:
-                differing.append(f"{table}.{column} (local {local_value!r}, publisher "
-                                 f"{remote[0][0] if remote else 'UNREADABLE'!r})")
+                differing.append((target, f"local {local_value!r}, publisher "
+                                          f"{remote[0][0] if remote else 'UNREADABLE'!r}"))
         if differing:
+            targets = [t for t, _ in differing]
             raise Halt(
                 "KNOWN GAP (stored column default): the migration added column(s) whose default was stored once "
                 f"per side and differs: {differing}. Existing rows read that stored value and no row change "
-                "carries production's. Remedy: with the subscription disabled (it is), copy that column for the "
-                "existing rows from the publisher (UPDATE … FROM a COPY of key + column, in replica mode), then "
-                "run `qontinui-pg follower resolve missing-value --target <schema>.<table>.<column>` per column.")
+                f"carries production's. Remedy: {resolve_cli('missing-value', targets)}, then, once the follower "
+                "is idle, `qontinui-pg follower copy-columns --table <schema>.<table> --column <column>` for each.",
+                case="missing-value", targets=targets)
 
-    def _check_rewrites(self, scope: dict, now: dict) -> None:
+    def _check_rewrites(self, scope: dict, now: dict, attnums_before: dict) -> None:
         """A table rewritten AFTER the replay changed its rows, or rewritten for a volatile default, halts.
 
         Apply carries the migration's row changes as they were decoded, BEFORE
@@ -696,22 +832,37 @@ class Follower:
             "  SELECT 1 FROM follower.replay_log t WHERE t.op = 'T' AND t.id < r.id AND (t.relid = r.relid "
             "  OR t.relid IN (SELECT relid FROM pg_partition_ancestors(r.relid))))::text "
             "FROM follower.replay_log r WHERE r.op = 'R' ORDER BY r.id")
-        unsafe = []
+        unsafe: dict[str, str] = {}
         for oid, reason, dml_before in rows:
             if oid not in scope:
                 continue
             name = now.get(oid, scope[oid])["name"]
+            # A partition's rewrite is resolved through its partitioned parent.
+            table = self.admin.scalar(
+                f"SELECT coalesce((SELECT a.relid::regclass::text FROM pg_partition_ancestors({oid}) a "
+                f"WHERE a.relid <> {oid} ORDER BY a.relid LIMIT 1), {oid}::regclass::text)")
             if dml_before == "true":
-                unsafe.append(f"{name}: rewritten after the migration changed its rows")
+                unsafe[table] = f"{name}: rewritten after the migration changed its rows"
             elif int(reason) & 2:
-                unsafe.append(f"{name}: rewritten to fill a column with a volatile default")
+                unsafe[table] = f"{name}: rewritten to fill a column with a volatile default"
+            else:
+                gained = self.admin.rows(
+                    "SELECT a.attname FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid "
+                    f"AND d.adnum = a.attnum WHERE a.attrelid = {oid} AND NOT a.attisdropped "
+                    f"AND a.attnum > {int(attnums_before.get(oid, 0))} AND (d.adbin::text LIKE '%{{FUNCEXPR%' "
+                    "OR d.adbin::text LIKE '%{SQLVALUEFUNCTION%')")
+                if gained:
+                    unsafe[table] = (f"{name}: rewritten after the migration added column(s) "
+                                     f"{[g[0] for g in gained]} with a computed default (the rewrite stores each "
+                                     "side's own value)")
         if unsafe:
+            targets = sorted(unsafe)
             raise Halt(
-                f"KNOWN GAP (rewrite after DML / volatile default): {unsafe}. The publisher's row changes were "
-                "decoded before the rewrite, or the default was computed once per side, so the rows would diverge "
-                "silently. Remedy (manual): re-seed the table - with the subscription disabled (it is), empty it "
-                "locally, take it out of the subscription and back in so table sync copies it, then "
-                "`follower resume`.")
+                f"KNOWN GAP (rewrite after DML / computed default): {sorted(unsafe.values())}. The publisher's row "
+                "changes were decoded before the rewrite, or a default was computed once per side, so the rows "
+                f"would diverge silently. Remedy: {resolve_cli('rewrite', targets)}, then, once the follower is "
+                "idle, `qontinui-pg follower copy-columns --table <table> --column <each affected column>`.",
+                case="rewrite", targets=targets)
 
     def _install_log_triggers(self, scope: dict) -> None:
         # Partitions inherit a partitioned parent's row trigger, so it goes on
@@ -721,7 +872,6 @@ class Follower:
                   for t in scope.values() if not t["partition"]]
         script += [touch_trigger_sql(t["name"]) for t in scope.values()]
         script.append(REWRITE_EVENT_SQL)
-        script.append("TRUNCATE follower.replay_log;")
         self.admin.execute("".join(script))
 
     def _drop_log_triggers(self, scope: dict) -> None:
@@ -737,12 +887,6 @@ class Follower:
 
     def _undo_replay_inserts(self, detail: dict) -> None:
         """Delete, locally and by apply's key, every row the replay inserted; commit with the next step."""
-        changed = self.admin.rows(
-            "SELECT l.relid::regclass::text, l.old_key::text, l.new_key::text FROM follower.replay_log l "
-            "WHERE l.op = 'K' ORDER BY l.id LIMIT 5")
-        if changed:
-            raise Halt("the local replay changed a replica-identity key, which the publisher's copy of the "
-                       f"migration could not find afterwards: {changed}")
         scope = detail["scope"]
         now = self.scope_snapshot()
         groups = self.admin.rows(
@@ -785,6 +929,7 @@ class Follower:
         for t in new_tables:
             script.append(f"DELETE FROM {qualified(*t.split('.', 1))};")
         script.append("TRUNCATE follower.replay_log;")
+        script.append(f"DELETE FROM follower.resolutions WHERE xid = {lit(detail['xid'])};")
         script.append(self._record_applied_sql(detail))
         detail["new_tables"] = new_tables
         detail["undone"] = undone
@@ -1059,9 +1204,11 @@ class Follower:
             results.append((stream != "p", f"subscription streaming is not parallel (sequential apply) [{stream}]"))
         st = self.state()
         results.append((st["status"] != "halted", f"follower not halted [{st['status']}: {st['reason']}]"))
-        if st["status"] == "idle":
+        in_replay = st["status"] == "in_progress" and st["detail"].get("step") == "migrate"
+        if not in_replay:
             leftover = self.admin.scalar(
                 f"SELECT (SELECT count(*) FROM pg_trigger WHERE tgname IN ({lit(LOG_TRIGGER)}, {lit(TOUCH_TRIGGER)})) "
                 f"+ (SELECT count(*) FROM pg_event_trigger WHERE evtname = {lit(REWRITE_EVENT_TRIGGER)})")
-            results.append((leftover == "0", f"no replay-log trigger left installed while idle [{leftover}]"))
+            results.append((leftover == "0", f"no replay trigger or rewrite event trigger left installed "
+                                             f"outside a replay [{leftover}]"))
         return results

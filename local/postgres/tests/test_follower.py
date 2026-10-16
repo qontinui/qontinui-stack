@@ -198,11 +198,20 @@ def _subenabled(pair: Pair) -> str:
     return pair.sub().scalar(f"SELECT subenabled::text FROM pg_subscription WHERE subname = '{pair.sub_name}'")
 
 
-def _copy_column_from_publisher(pair: Pair, table: str, column: str) -> None:
-    """The documented manual remedy for a stored default: copy the column, replica mode, subscription disabled."""
-    rows = pair.pub().rows(f"SELECT id::text, {column}::text FROM {table}")
-    pair.sub().execute("SET LOCAL session_replication_role = replica;\n" + "".join(
-        f"UPDATE {table} SET {column} = '{v}' WHERE id = {i};\n" for i, v in rows))
+def _resolve_follow_copy(test: unittest.TestCase, p: Pair, case: str, target: str, table: str, *columns: str):
+    """The documented remedy: resolve the halt, let the follower carry the migration, copy the columns."""
+    res = cli(p.conf, "follower", "resolve", "--case", case, "--target", target)
+    test.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+    res = p.follow()
+    test.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+    args = ["follower", "copy-columns", "--table", table]
+    for c in columns:
+        args += ["--column", c]
+    res = cli(p.conf, *args)
+    test.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+    test.assertEqual(_subenabled(p), "true")
+    wait_caught_up(p)
+    p.assert_equal(test)
 
 
 class RenameTest(unittest.TestCase):
@@ -232,7 +241,9 @@ class RenameTest(unittest.TestCase):
     def test_2_resolve_rename_carries_it_through(self):
         """Re-review B3: `follower resolve --case rename` is a working exit, not a re-halt."""
         p = self.pair
-        res = cli(p.conf, "follower", "resolve", "--case", "rename")
+        res = cli(p.conf, "follower", "resolve", "--case", "rename", "--target", "app.settings")
+        self.assertEqual(res.returncode, 2, "a target the halt did not name is refused")
+        res = cli(p.conf, "follower", "resolve", "--case", "rename", "--target", "app.settings_v2")
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
         p.pub(APP).execute("INSERT INTO app.settings_v2 (name, value) VALUES ('after rename', 'x')")
         res = p.follow()
@@ -327,16 +338,9 @@ class MissingValueTest(unittest.TestCase):
         self.assertIn("app.items.stamped", reason)
         self.assertEqual(_subenabled(p), "false")
 
-    def test_3_recorded_resolution_after_the_remedy(self):
-        """Re-review B4: after copying the column, a recorded resolution lets the migration through."""
-        p = self.pair
-        _copy_column_from_publisher(p, "app.items", "stamped")
-        res = cli(p.conf, "follower", "resolve", "--case", "missing-value", "--target", "app.items.stamped")
-        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
-        res = p.follow()
-        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
-        wait_caught_up(p)
-        p.assert_equal(self)
+    def test_3_recorded_resolution_then_copy(self):
+        """Re-review B4: a recorded resolution lets the migration through; copy-columns fixes the column."""
+        _resolve_follow_copy(self, self.pair, "missing-value", "app.items.stamped", "app.items", "stamped")
 
 
 class TypeRewriteTest(unittest.TestCase):
@@ -362,8 +366,86 @@ class TypeRewriteTest(unittest.TestCase):
         self.assertEqual(res.returncode, 3, res.stdout + res.stderr)
         reason = _halted_reason(p)
         self.assertIn("rewritten after the migration changed its rows", reason)
-        self.assertIn("app.items", reason)
+        self.assertIn("follower resolve --case rewrite --target app.items", reason)
         self.assertEqual(_subenabled(p), "false")
+
+    def test_resolve(self):
+        """Fourth review B1 + minor 5: a mismatched case is refused; `resolve --case rewrite` gets out."""
+        p = self.pair
+        res = cli(p.conf, "follower", "resolve", "--case", "rename", "--target", "app.items")
+        self.assertEqual(res.returncode, 2, "the current halt is a rewrite, not a rename")
+        _resolve_follow_copy(self, p, "rewrite", "app.items", "app.items", "amount")
+
+
+class ComputedDefaultRewriteTest(unittest.TestCase):
+    """Fourth review B2: ADD COLUMN … DEFAULT now() and a later rewrite of the same table halt."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.pair = Pair("t_computed_rewrite", web_dir="web-missrw")
+        cls.pair.setup()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.pair.teardown()
+
+    def test_halts_and_resolves(self):
+        p = self.pair
+        p.migrate_pub("m2")
+        res = p.follow(timeout=60)
+        self.assertEqual(res.returncode, 3, res.stdout + res.stderr)
+        reason = _halted_reason(p)
+        self.assertIn("computed default", reason)
+        self.assertIn("stamped", reason)
+        _resolve_follow_copy(self, p, "rewrite", "app.items", "app.items", "stamped")
+
+
+class KeyChangeTest(unittest.TestCase):
+    """Fourth review B1: the key-change halt has a working exit."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.pair = Pair("t_key_change", web_dir="web-keychange")
+        cls.pair.setup()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.pair.teardown()
+
+    def test_halts_and_resolves(self):
+        p = self.pair
+        p.migrate_pub("k2")
+        res = p.follow(timeout=60)
+        self.assertEqual(res.returncode, 3, res.stdout + res.stderr)
+        self.assertIn("follower resolve --case key-change --target app.items", _halted_reason(p))
+        _resolve_follow_copy(self, p, "key-change", "app.items", "app.items")
+
+
+class MigrateFailureTest(unittest.TestCase):
+    """Fourth review B3: a halt inside the replay leaves no trigger installed, database-wide."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.pair = Pair("t_migrate_failure", web_dir="web-type-using")
+        cls.pair.setup()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.pair.teardown()
+
+    def test_halt_removes_replay_triggers(self):
+        p = self.pair
+        p.sub().execute("ALTER TABLE app.items ADD COLUMN amount int")  # makes the local replay fail
+        p.migrate_pub("y2")
+        res = p.follow(timeout=60)
+        self.assertEqual(res.returncode, 3, res.stdout + res.stderr)
+        self.assertIn("local migration command failed", _halted_reason(p))
+        self.assertEqual(p.sub().scalar(
+            "SELECT count(*) FROM pg_event_trigger WHERE evtname LIKE 'qontinui_follower%'"), "0")
+        self.assertEqual(p.sub().scalar(
+            "SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'qontinui_follower_replay%'"), "0")
+        check = cli(p.conf, "follower", "check")
+        self.assertIn("OK   no replay trigger or rewrite event trigger left installed", check.stdout)
 
 
 class DropAddColumnTest(unittest.TestCase):

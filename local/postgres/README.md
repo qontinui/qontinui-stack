@@ -17,7 +17,7 @@ the lead.
 | Piece | Plan | What it does |
 |---|---|---|
 | `install.sh` | D4, D15, D16 | Installs PGDG `postgresql-16`, `postgresql-16-pgvector` (0.8.x) and `pgbackrest` as native packages. Creates the cluster on the LUKS volume (it refuses any other volume). Renders `postgresql.conf` and `pg_hba.conf`. The server listens on the tailnet address and the unix socket only. The application role may log in without TLS, but only from the tailnet, because coord connects `NoTls`. Every other client must use `hostssl`. The installer also renders pgBackRest (encrypted repo2, 35 days, `archive-push-queue-max=20GiB`, no repo1 on a one-disk host) and the systemd units. It has three modes: `--check`, `--uninstall`, and safe `--dry-run`/`--root` modes. |
-| `qontinui-pg follower` | D7, A2–A4, B2 | The schema follower (`lib/qpg/follower.py`, see its docstring). It uses a stall marker on `public.alembic_version`: a `BEFORE INSERT OR UPDATE`, `ENABLE REPLICA`, `SECURITY DEFINER` trigger owned by `qontinui_follower`. The follower finds the migration transaction by its xid. With the subscription disabled, it replays the migration locally as `qontinui_user` while a replay-log trigger records every row the replay inserts. It deletes those rows again by typed key, locally, and re-enables the subscription. Apply then carries the migration's own DML with production's values, in commit order, and the follower reads no table data from the publisher. This replaces the plan's SKIP-then-repair (D7 steps 3–4). It fails closed: it halts on the shapes it can detect, and it refuses to run at all until `[follower] acknowledge_known_gaps = true` (see **Known gaps** below). It refuses a move into an unpublished schema (A3). The coord lane (A2) sits behind `coord_lane = true`, and `phase8_complete = true` forbids it (A4). |
+| `qontinui-pg follower` | D7, A2–A4, B2 | The schema follower (`lib/qpg/follower.py`, see its docstring). It uses a stall marker on `public.alembic_version`: a `BEFORE INSERT OR UPDATE`, `ENABLE REPLICA`, `SECURITY DEFINER` trigger owned by `qontinui_follower`. The follower finds the migration transaction by its xid. With the subscription disabled, it replays the migration locally as `qontinui_user` while a replay-log trigger records every row the replay inserts. It deletes those rows again by typed key, locally, and re-enables the subscription. Apply then carries the migration's own DML with production's values, in commit order. The replay path reads no table data from the publisher; only the operator-run `copy-columns` remedy does, one table at a time. This replaces the plan's SKIP-then-repair (D7 steps 3–4). It fails closed: it halts on the shapes it can detect, and it refuses to run at all until `[follower] acknowledge_known_gaps = true` (see **Known gaps** below). It refuses a move into an unpublished schema (A3). The coord lane (A2) sits behind `coord_lane = true`, and `phase8_complete = true` forbids it (A4). |
 | `qontinui-pg seqsync` | D6 | Copies sequence positions with a margin per sequence: 3× the largest 5-minute advance in 24 h, never under 1,000. `--final` raises the floor to 10,000. A sequence that reads NULL without privilege is an error. The command never moves a value backwards. `--reverse` copies to RDS for D8, and `--from-data` sets sequences from local data after a restore. |
 | `qontinui-pg watchdog` | D11, A2 item 6, A6 | Checks the slot's `wal_status` and retained WAL (alert at 2 GB), the apply lag, the follower, the host's free space (alert under 30 GB), and the archiver. It reads the publisher's catalog for published tables that have no replica identity. When configured, it also checks the reverse subscription. A signal it cannot read counts as an alert. Notices are logged. They are posted to coord's `/coord/agent-findings` only with `[notify] enabled = true`. |
 | `qontinui-pg partitions` | D9 | Calls lane D's `coord.test_results_partition_maintenance(retention, lookahead)` as `qontinui_user`. |
@@ -60,10 +60,14 @@ its tests RED. Every container is removed on exit. CI runs the same script
 | A new table referenced by a foreign key from an existing table follows | `test_follower.ForeignKeyNewTableTest` | `truncate-new-tables` (fails on every attempt and halts after `max_step_failures`) |
 | A partitioned table in scope: the log trigger goes on the parent only | `test_follower.DoubleDmlTest` | `log-trigger-on-partitions` |
 | The follower refuses to run until the known gaps are acknowledged | `test_follower.AcknowledgeTest` | `no-ack-guard` |
-| Gap 10: DML then `ALTER … TYPE … USING` halts | `test_follower.TypeRewriteTest` | `no-rewrite-check` |
+| Gap 6: DML then `ALTER … TYPE … USING` halts | `test_follower.TypeRewriteTest` | `no-rewrite-check` |
 | Gap 5 with a column dropped and re-added under the same name | `test_follower.DropAddColumnTest` | `missing-by-name` |
 | `follower resolve --case rename` carries a rename through | `test_follower.RenameTest` | `resolve-not-recorded` |
-| `follower resolve --case missing-value` after copying the column | `test_follower.MissingValueTest` | `resolve-not-recorded`, `resolution-ignored` |
+| `follower resolve --case missing-value`, then `copy-columns` | `test_follower.MissingValueTest` | `resolve-not-recorded`, `resolution-ignored` |
+| Gap 6 exit: a mismatched case is refused; `resolve --case rewrite` and `copy-columns` converge | `test_follower.TypeRewriteTest` | `resolve-keeps-log`, `resolve-not-recorded` |
+| Gap 8: a computed default added, then the table rewritten | `test_follower.ComputedDefaultRewriteTest` | `no-gained-default-check` |
+| Gap 4 exit: `resolve --case key-change`, then `copy-columns` | `test_follower.KeyChangeTest` | `resolve-keeps-log` |
+| A halt inside the replay leaves no trigger installed, including the database-wide event trigger | `test_follower.MigrateFailureTest` | `halt-keeps-triggers` |
 | A halt after re-enable disables the subscription and says so | `test_follower.DmlThenDdlTest` | `halt-leaves-enabled` |
 | A3 refusal of a `SET SCHEMA` into an unpublished schema | `test_follower.MoveRefusalTest` | `no-move-refusal` |
 | B2 ownership: the table owner is not a superuser, the subscription owner is | `test_follower.OwnershipTest` | `no-security-definer` (the initial copy of `alembic_version` never reaches `r`) |
@@ -85,19 +89,49 @@ shape below that it can detect. **Every halt disables the subscription**, and th
 `[follower] acknowledge_known_gaps = true`, which the operator sets after
 reading this section.
 
-| # | Shape | Detected? | What happens | Manual remedy |
+Two operator actions recur in the remedies below.
+- `qontinui-pg follower resolve --case <case> --target <target>` records a
+  resolution for the halt that is CURRENT. It refuses any other case or a
+  target the halt did not name, and resumes once every named target is
+  resolved. Each halt message prints the exact command.
+- `qontinui-pg follower copy-columns --table <schema>.<table> [--column <c>]…`
+  runs once the follower is idle. With the subscription disabled, it
+  overwrites existing rows' columns from the publisher, matched on the key,
+  in replica mode. It only UPDATEs, so it cannot collide with a row apply has
+  yet to insert. It makes one bounded read of one table on the publisher,
+  only when the operator runs it. It then restores the subscription's
+  enabled state.
+
+A **re-seed** of one table is not automated. Table sync cannot re-copy a
+table that a schema publication already carries. So it is either the full
+re-seed of D11, or a lead-run procedure with a temporary second subscription.
+That is a follow-up, and until then it is the remedy only where no
+copy-columns remedy exists.
+
+| # | Shape | Detected? | What happens | Remedy |
 |---|---|---|---|---|
-| 1 | DML before later DDL in one migration transaction (`UPDATE t SET c …; ALTER TABLE t DROP COLUMN c`) | yes | apply fails again on the migration xid (55000 / 23502); the follower halts naming the gap | Re-seed that table. With the subscription disabled, empty it locally, take it out of the subscription and put it back so table sync copies it, then `follower resume`. |
-| 2 | A migration that renames or moves a table | yes | halt before anything is emptied; subscription disabled | Confirm the publisher made the same rename, then `qontinui-pg follower resolve --case rename`. That records the resolution and resumes; the table keeps its OID and its subscription on both sides. |
+| 1 | DML before later DDL in one migration transaction (`UPDATE t SET c …; ALTER TABLE t DROP COLUMN c`) | yes | apply fails again on the migration xid (55000 / 23502); halt naming the gap | Re-seed the table (not automated, see above). |
+| 2 | A migration that renames or moves a table | yes | halt before anything is emptied | Confirm the publisher made the same rename, then `resolve --case rename --target <new name>`. The table keeps its OID and its subscription on both sides. |
 | 3 | A unique violation (23505) replaying the migration | yes | halt | Compare the key on both sides, remove the local row, then `follower resume`. |
-| 4 | The replay changes a replica-identity key | yes | halt | Re-seed the table (as in 1). |
-| 5 | A column added with a stored default (`atthasmissing`) whose value differs from the publisher's, e.g. `DEFAULT now()`, including a same-named column dropped and re-added | yes, by comparing `attmissingval` with the publisher's, per attnum | halt naming table and column; subscription disabled | With the subscription disabled, copy that column for the existing rows from the publisher (key + column, replica mode). Then run `qontinui-pg follower resolve --case missing-value --target <schema>.<table>.<column>` for each column. |
-| 6 | Row selection that differs: production ran the migration under READ COMMITTED alongside other transactions, so a statement there may not have seen rows that commit before the migration does, while the local replay sees all of them | **no** | silent divergence on the rows only one side touched | The Phase 3 parity checks and a re-seed of the table. Avoid long-running data migrations while replication is live. |
-| 7 | Non-deterministic row selection (`DELETE … WHERE ts < now()`) | **no** | silent divergence | As 6. |
-| 8 | A volatile default that rewrites the table without row triggers (`ADD COLUMN … DEFAULT clock_timestamp()`) | yes: a `table_rewrite` event trigger, installed only during the replay, records the rewrite reason | halt; subscription disabled | Re-seed the table (as in 1). |
-| 10 | Row changes followed by a rewrite that transforms values (`UPDATE …; ALTER … TYPE … USING x * 100`) | yes: a statement-level trigger records the DML and the event trigger records the rewrite, ordered | halt; subscription disabled | Re-seed the table (as in 1). Any rewrite after DML halts, even one that would not transform the data (a plain `int` → `bigint`). That is deliberate: it fails closed. |
-| 11 | `ALTER TABLE … DETACH PARTITION` / `ATTACH PARTITION` in a migration | **no** | the detached table keeps its local rows, but the publisher's later changes route by the parent; an attached table's existing rows are not copied | Treat as a re-seed of the parent. Avoid partition DETACH/ATTACH while replication is live (lane D's maintenance function only creates and drops children). |
-| 9 | A step that fails `max_step_failures` times running (publisher outages do not count) | yes | halt; subscription disabled | Read the error, fix it, `follower resume`. |
+| 4 | The replay changes a replica-identity key | yes | halt | When the replay's new keys equal the publisher's (a deterministic key update), run `resolve --case key-change --target <table>` and then `copy-columns --table <table>`. Otherwise re-seed the table. |
+| 5 | A column added with a stored default (`atthasmissing`) whose value differs from the publisher's, e.g. `DEFAULT now()`. This includes a same-named column dropped and re-added; values are compared per attnum. | yes | halt naming table and column | `resolve --case missing-value --target <schema>.<table>.<column>`, then `copy-columns --table <schema>.<table> --column <column>`. |
+| 6 | A rewrite after the replay changed the table's rows (`UPDATE …; ALTER … TYPE … USING x * 100`) | yes. While the replay runs, a statement trigger on each table and a database-wide `table_rewrite` event trigger log, in order, which tables were changed and which were rewritten. Every halt removes them, and `follower check` flags any left over. | halt; any rewrite after DML halts, even a harmless `int` → `bigint` (fail closed) | `resolve --case rewrite --target <table>`, then `copy-columns` for each transformed column. |
+| 7 | A rewrite that fills a volatile default (`ADD COLUMN … DEFAULT clock_timestamp()`) | yes, from the rewrite event's reason | halt | As 6. |
+| 8 | A computed default (`DEFAULT now()`) added, then the same table rewritten in the same migration. The rewrite clears `atthasmissing` and stores each side's own value. | yes: a rewritten table that gained a column whose default is a function call | halt | As 6, copying the new column. |
+| 9 | A step that fails `max_step_failures` times running (publisher outages do not count) | yes | halt | Read the error, fix it, `follower resume`. |
+| 10 | Row selection that differs: production ran the migration under READ COMMITTED alongside other transactions, so a statement there may not have seen rows that commit before the migration does, while the local replay sees all of them | **no** | silent divergence on the rows only one side touched | The Phase 3 parity checks, then copy-columns or a re-seed. Avoid long-running data migrations while replication is live. |
+| 11 | Non-deterministic row selection (`DELETE … WHERE ts < now()`) | **no** | silent divergence | As 10. |
+| 12 | `ALTER TABLE … DETACH PARTITION` / `ATTACH PARTITION` in a migration | **no** | the detached table keeps its local rows while the publisher's later changes route by the parent; an attached table's existing rows are not copied | Re-seed the parent. Avoid DETACH/ATTACH while replication is live; lane D's maintenance function only creates and drops children. |
+
+Every halt disables the subscription and removes the replay triggers, and
+the halt notice says what state it left. Resuming a migration that halted
+before its undo re-installs the triggers. It keeps the replay log, because
+part of the replay may have committed. Then it re-runs the migration.
+
+**Operator writes during a halt** to a table the halted migration touches can
+cause a later, false halt, for example a unique violation when apply
+replays the migration. The false halt is fail-closed: nothing diverges, but
+the follower stops again. Keep manual writes to the remedies above.
 
 ## Operator steps that remain
 
