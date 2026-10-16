@@ -2,31 +2,40 @@
 #
 # Plan: 2026-10-15-coord-and-web-data-move-off-aws-by-logical-replication, Phase 1c / D13.
 # Produced 2026-10-16 in aws/staging with Terraform 1.9.8, hashicorp/aws 5.100.0
-# (the checked-in lock), against the live production state, on top of 4ae93cb:
+# (the checked-in lock), against the live production state, on top of bf1c3e5
+# plus the nats_under_code gate. Every plan below ran with -lock=false.
 #
-#   terraform plan -lock=false -input=false -no-color -target=module.nats
+# module.nats and all 16 import blocks are gated on var.nats_under_code
+# (default false, declared in aws/staging/nats-imports.tf), so merging changes
+# nothing until the operator enables it for the gated apply.
+#
+# 1. DEFAULT (nats_under_code = false), untargeted:
+#      terraform plan -lock=false -input=false -no-color
+#    Plan: 0 to add, 4 to change, 0 to destroy.
+#    No nats resource and no import appears. The 4 changes are pre-existing
+#    drift in modules this change does not touch (finding 8fa1e007):
+#       # module.cost_control.aws_budgets_budget.monthly will be updated in-place
+#       # module.cost_control.aws_sns_topic_subscription.budget_email will be updated in-place
+#       # module.cross_idp_linking.aws_lambda_function.presignup will be updated in-place
+#       # module.observability.aws_cloudwatch_metric_alarm.rds_free_storage_low will be updated in-place
+#
+# 2. ENABLED, targeted (the operator's gate; full text below):
+#      terraform plan -lock=false -input=false -no-color -var nats_under_code=true -target=module.nats
+#    Plan: 16 to import, 0 to add, 0 to change, 0 to destroy.
+#
+# 3. ENABLED, untargeted:
+#      terraform plan -lock=false -input=false -no-color -var nats_under_code=true
+#    Plan: 16 to import, 0 to add, 4 to change, 0 to destroy.
+#    (the same 4 drift changes as in 1, none in module.nats)
 #
 # Refresh-progress lines are omitted. Mount-target private IPs, AWS-generated
 # DNS names and the Route 53 hosted zone id are replaced with <redacted>; the
 # repo is public. No secret value appears: the NATS password is referenced by
 # Secrets Manager ARN only.
-#
-# RESULT, TARGETED (-target=module.nats):
-#   Plan: 16 to import, 0 to add, 0 to change, 0 to destroy.
-#
-# RESULT, UNTARGETED (same command without -target):
-#   Plan: 16 to import, 0 to add, 4 to change, 0 to destroy.
-#   The 4 changes are pre-existing drift in modules this change does not touch
-#   (finding 8fa1e007 records untargeted drift), none of them in module.nats:
-#     # module.cost_control.aws_budgets_budget.monthly will be updated in-place
-#     # module.cost_control.aws_sns_topic_subscription.budget_email will be updated in-place
-#     # module.cross_idp_linking.aws_lambda_function.presignup will be updated in-place
-#     # module.observability.aws_cloudwatch_metric_alarm.rds_free_storage_low will be updated in-place
-#
 
 Terraform will perform the following actions:
 
-  # module.nats.aws_cloudwatch_log_group.nats will be imported
+  # module.nats[0].aws_cloudwatch_log_group.nats will be imported
     resource "aws_cloudwatch_log_group" "nats" {
         arn               = "arn:aws:logs:us-east-1:047719635665:log-group:/ecs/qontinui-staging/nats"
         id                = "/ecs/qontinui-staging/nats"
@@ -43,7 +52,7 @@ Terraform will perform the following actions:
         }
     }
 
-  # module.nats.aws_ecs_service.nats will be imported
+  # module.nats[0].aws_ecs_service.nats will be imported
     resource "aws_ecs_service" "nats" {
         availability_zone_rebalancing      = "ENABLED"
         cluster                            = "arn:aws:ecs:us-east-1:047719635665:cluster/qontinui-staging"
@@ -96,7 +105,7 @@ Terraform will perform the following actions:
         }
     }
 
-  # module.nats.aws_ecs_task_definition.nats will be imported
+  # module.nats[0].aws_ecs_task_definition.nats will be imported
     resource "aws_ecs_task_definition" "nats" {
         arn                      = "arn:aws:ecs:us-east-1:047719635665:task-definition/qontinui-staging-nats:1"
         arn_without_revision     = "arn:aws:ecs:us-east-1:047719635665:task-definition/qontinui-staging-nats"
@@ -207,7 +216,7 @@ Terraform will perform the following actions:
         }
     }
 
-  # module.nats.aws_efs_access_point.jetstream will be imported
+  # module.nats[0].aws_efs_access_point.jetstream will be imported
     resource "aws_efs_access_point" "jetstream" {
         arn             = "arn:aws:elasticfilesystem:us-east-1:047719635665:access-point/fsap-07a5cd0192ce1f957"
         file_system_arn = "arn:aws:elasticfilesystem:us-east-1:047719635665:file-system/fs-0fa99b01b8c7a3663"
@@ -240,7 +249,7 @@ Terraform will perform the following actions:
         }
     }
 
-  # module.nats.aws_efs_file_system.jetstream will be imported
+  # module.nats[0].aws_efs_file_system.jetstream will be imported
     resource "aws_efs_file_system" "jetstream" {
         arn                             = "arn:aws:elasticfilesystem:us-east-1:047719635665:file-system/fs-0fa99b01b8c7a3663"
         availability_zone_id            = null
@@ -257,9 +266,9 @@ Terraform will perform the following actions:
         provisioned_throughput_in_mibps = 0
         size_in_bytes                   = [
             {
-                value             = 41415761920
+                value             = 41428469760
                 value_in_ia       = 393216
-                value_in_standard = 41415368704
+                value_in_standard = 41428076544
             },
         ]
         tags                            = {
@@ -283,7 +292,7 @@ Terraform will perform the following actions:
         }
     }
 
-  # module.nats.aws_efs_mount_target.jetstream[0] will be imported
+  # module.nats[0].aws_efs_mount_target.jetstream[0] will be imported
     resource "aws_efs_mount_target" "jetstream" {
         availability_zone_id   = "use1-az2"
         availability_zone_name = "us-east-1a"
@@ -301,7 +310,7 @@ Terraform will perform the following actions:
         subnet_id              = "subnet-028bf10da691b2a0a"
     }
 
-  # module.nats.aws_efs_mount_target.jetstream[1] will be imported
+  # module.nats[0].aws_efs_mount_target.jetstream[1] will be imported
     resource "aws_efs_mount_target" "jetstream" {
         availability_zone_id   = "use1-az4"
         availability_zone_name = "us-east-1b"
@@ -319,7 +328,7 @@ Terraform will perform the following actions:
         subnet_id              = "subnet-0c80a07fd645cd22d"
     }
 
-  # module.nats.aws_iam_role.task will be imported
+  # module.nats[0].aws_iam_role.task will be imported
     resource "aws_iam_role" "task" {
         arn                   = "arn:aws:iam::047719635665:role/qontinui-staging-nats-task"
         assume_role_policy    = jsonencode(
@@ -380,7 +389,7 @@ Terraform will perform the following actions:
         }
     }
 
-  # module.nats.aws_iam_role_policy.efs_access will be imported
+  # module.nats[0].aws_iam_role_policy.efs_access will be imported
     resource "aws_iam_role_policy" "efs_access" {
         id          = "qontinui-staging-nats-task:efs-jetstream-access"
         name        = "efs-jetstream-access"
@@ -410,7 +419,7 @@ Terraform will perform the following actions:
         role        = "qontinui-staging-nats-task"
     }
 
-  # module.nats.aws_security_group.efs will be imported
+  # module.nats[0].aws_security_group.efs will be imported
     resource "aws_security_group" "efs" {
         arn         = "arn:aws:ec2:us-east-1:047719635665:security-group/sg-0d9aa1ccb55156971"
         description = "EFS mount target SG for NATS JetStream (NFS from NATS task SG)"
@@ -459,7 +468,7 @@ Terraform will perform the following actions:
         vpc_id      = "vpc-0edd313dac53b8193"
     }
 
-  # module.nats.aws_security_group.nats will be imported
+  # module.nats[0].aws_security_group.nats will be imported
     resource "aws_security_group" "nats" {
         arn         = "arn:aws:ec2:us-east-1:047719635665:security-group/sg-0bccde2ab9d86a134"
         description = "NATS server task SG (4222 NATS client, 8222 monitor)"
@@ -521,7 +530,7 @@ Terraform will perform the following actions:
         vpc_id      = "vpc-0edd313dac53b8193"
     }
 
-  # module.nats.aws_security_group_rule.efs_nfs_from_nats will be imported
+  # module.nats[0].aws_security_group_rule.efs_nfs_from_nats will be imported
     resource "aws_security_group_rule" "efs_nfs_from_nats" {
         cidr_blocks              = []
         description              = "NFS from NATS task"
@@ -538,7 +547,7 @@ Terraform will perform the following actions:
         type                     = "ingress"
     }
 
-  # module.nats.aws_security_group_rule.nats_client_from_coord will be imported
+  # module.nats[0].aws_security_group_rule.nats_client_from_coord will be imported
     resource "aws_security_group_rule" "nats_client_from_coord" {
         cidr_blocks              = []
         description              = "NATS client from coord SG"
@@ -555,7 +564,7 @@ Terraform will perform the following actions:
         type                     = "ingress"
     }
 
-  # module.nats.aws_security_group_rule.nats_monitor_from_coord will be imported
+  # module.nats[0].aws_security_group_rule.nats_monitor_from_coord will be imported
     resource "aws_security_group_rule" "nats_monitor_from_coord" {
         cidr_blocks              = []
         description              = "NATS monitor port from coord SG"
@@ -572,7 +581,7 @@ Terraform will perform the following actions:
         type                     = "ingress"
     }
 
-  # module.nats.aws_service_discovery_private_dns_namespace.main will be imported
+  # module.nats[0].aws_service_discovery_private_dns_namespace.main will be imported
     resource "aws_service_discovery_private_dns_namespace" "main" {
         arn         = "arn:aws:servicediscovery:us-east-1:047719635665:namespace/ns-e2witsivqy5zd2u5"
         description = "Private DNS namespace for qontinui staging services"
@@ -587,7 +596,7 @@ Terraform will perform the following actions:
         vpc         = "vpc-0edd313dac53b8193"
     }
 
-  # module.nats.aws_service_discovery_service.nats will be imported
+  # module.nats[0].aws_service_discovery_service.nats will be imported
     resource "aws_service_discovery_service" "nats" {
         arn          = "arn:aws:servicediscovery:us-east-1:047719635665:service/srv-fguwnb2txqq7i5rx"
         description  = "NATS server service registration for qontinui-staging"
