@@ -149,6 +149,8 @@ coord_lane = {'true' if self.coord_lane else 'false'}
 {coord_keys}phase8_complete = false
 stall_fresh_seconds = 60
 max_step_failures = 3
+lock_file = {self.state_dir}/follower.lock
+copy_catchup_seconds = 30
 acknowledge_known_gaps = {'false' if self.no_ack else 'true'}
 
 [seqsync]

@@ -16,7 +16,7 @@ import sys
 from . import config as config_mod
 from . import credential, hostcfg, partitions, roles, secdiff
 from .config import ConfigError
-from .follower import Follower, Halt
+from .follower import Follower, Halt, Locked
 from .notify import Notifier
 from .pg import PgError
 from .seqsync import SeqSync, SeqSyncError
@@ -46,7 +46,7 @@ def cmd_follower(args, cfg) -> int:
     if args.action == "run":
         return f.run(once=args.once, until_idle=args.until_idle, timeout=args.timeout)
     if args.action == "status":
-        print(json.dumps(f.state(), indent=2))
+        print(json.dumps({**f.state(), "copy_columns_owed": f.owed()}, indent=2))
         return 0
     if args.action == "resume":
         f.resume()
@@ -54,7 +54,7 @@ def cmd_follower(args, cfg) -> int:
     if args.action == "copy-columns":
         if not args.table:
             raise ConfigError("follower copy-columns needs --table <schema>.<table> [--column <c>]...")
-        print(json.dumps(f.copy_columns(args.table, args.column)))
+        print(json.dumps(f.copy_columns(args.table, args.column, args.allow_unmatched)))
         return 0
     if args.action == "resolve":
         if not args.case:
@@ -184,6 +184,8 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("--target", help="resolve: the target the halt names (table, or table.column)")
     f.add_argument("--table", help="copy-columns: <schema>.<table>")
     f.add_argument("--column", action="append", help="copy-columns: a column (repeatable; default: all non-key)")
+    f.add_argument("--allow-unmatched", type=int, default=0,
+                   help="copy-columns: publisher rows that may be missing locally (newer than the subscriber)")
     f.add_argument("--dry-run-notify", action="store_true", help="log notices, never post them")
     f.set_defaults(fn=cmd_follower)
 
@@ -243,6 +245,9 @@ def main(argv: list[str] | None = None) -> int:
     except Halt as exc:
         print(f"halted: {exc}", file=sys.stderr)
         return 3
+    except Locked as exc:
+        print(f"locked: {exc}", file=sys.stderr)
+        return 5
     except (PgError, roles.RoleError, credential.CredentialError, partitions.PartitionError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

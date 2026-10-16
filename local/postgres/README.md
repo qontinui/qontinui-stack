@@ -68,6 +68,9 @@ its tests RED. Every container is removed on exit. CI runs the same script
 | Gap 8: a computed default added, then the table rewritten | `test_follower.ComputedDefaultRewriteTest` | `no-gained-default-check` |
 | Gap 4 exit: `resolve --case key-change`, then `copy-columns` | `test_follower.KeyChangeTest` | `resolve-keeps-log` |
 | A halt inside the replay leaves no trigger installed, including the database-wide event trigger | `test_follower.MigrateFailureTest` | `halt-keeps-triggers` |
+| copy-columns refuses across an unreplayed migration, takes the lock, refuses under row-level security, and clears the owed copy | `test_follower.CopyColumnsTest` | `no-version-guard`, `copy-columns-no-lock`, `copy-columns-rls-on` |
+| Gap 8 with DROP DEFAULT after the rewrite | `test_follower.DropDefaultRewriteTest` | `gained-needs-default` |
+| A resumed replay re-installs its triggers by OID, after a partial replay renamed a table | `test_follower.RelogTest` | `relog-by-stored-name` |
 | A halt after re-enable disables the subscription and says so | `test_follower.DmlThenDdlTest` | `halt-leaves-enabled` |
 | A3 refusal of a `SET SCHEMA` into an unpublished schema | `test_follower.MoveRefusalTest` | `no-move-refusal` |
 | B2 ownership: the table owner is not a superuser, the subscription owner is | `test_follower.OwnershipTest` | `no-security-definer` (the initial copy of `alembic_version` never reaches `r`) |
@@ -94,13 +97,26 @@ Two operator actions recur in the remedies below.
   resolution for the halt that is CURRENT. It refuses any other case or a
   target the halt did not name, and resumes once every named target is
   resolved. Each halt message prints the exact command.
-- `qontinui-pg follower copy-columns --table <schema>.<table> [--column <c>]…`
-  runs once the follower is idle. With the subscription disabled, it
-  overwrites existing rows' columns from the publisher, matched on the key,
-  in replica mode. It only UPDATEs, so it cannot collide with a row apply has
-  yet to insert. It makes one bounded read of one table on the publisher,
-  only when the operator runs it. It then restores the subscription's
-  enabled state.
+- `qontinui-pg follower copy-columns --table <schema>.<table> [--column <c>]… [--allow-unmatched N]`
+  runs once the follower is idle. It overwrites existing rows' columns from
+  the publisher, collision-free:
+  - It holds the follower lock, so the daemon skips its cycles meanwhile.
+  - It waits until apply has caught up to the publisher, then disables the
+    subscription itself.
+  - It reads key + columns in ONE repeatable-read snapshot on the publisher.
+    That snapshot first checks the publisher's version tables equal the
+    subscriber's, so the copy is refused if production has applied a
+    migration the subscriber has not.
+  - It reads with `row_security = off`, so a row-level policy makes the copy
+    fail instead of silently filtering it.
+  - It only UPDATEs existing rows (by key, replica mode), so it cannot
+    collide with apply. It fails if more than N rows read from the publisher
+    do not exist locally.
+  - It reports rows read and rows updated, and re-enables the subscription.
+
+  A `resolve` of a rewrite, key-change or missing-value halt records that a
+  copy is owed. `follower check` fails and `follower status` lists the owed
+  copy until copy-columns runs for that table.
 
 A **re-seed** of one table is not automated. Table sync cannot re-copy a
 table that a schema publication already carries. So it is either the full
@@ -117,7 +133,7 @@ copy-columns remedy exists.
 | 5 | A column added with a stored default (`atthasmissing`) whose value differs from the publisher's, e.g. `DEFAULT now()`. This includes a same-named column dropped and re-added; values are compared per attnum. | yes | halt naming table and column | `resolve --case missing-value --target <schema>.<table>.<column>`, then `copy-columns --table <schema>.<table> --column <column>`. |
 | 6 | A rewrite after the replay changed the table's rows (`UPDATE …; ALTER … TYPE … USING x * 100`) | yes. While the replay runs, a statement trigger on each table and a database-wide `table_rewrite` event trigger log, in order, which tables were changed and which were rewritten. Every halt removes them, and `follower check` flags any left over. | halt; any rewrite after DML halts, even a harmless `int` → `bigint` (fail closed) | `resolve --case rewrite --target <table>`, then `copy-columns` for each transformed column. |
 | 7 | A rewrite that fills a volatile default (`ADD COLUMN … DEFAULT clock_timestamp()`) | yes, from the rewrite event's reason | halt | As 6. |
-| 8 | A computed default (`DEFAULT now()`) added, then the same table rewritten in the same migration. The rewrite clears `atthasmissing` and stores each side's own value. | yes: a rewritten table that gained a column whose default is a function call | halt | As 6, copying the new column. |
+| 8 | A column added and the same table then rewritten in the same migration, e.g. alembic's add-with-default, rewrite, DROP DEFAULT idiom. The rewrite stores each side's own default value, and after DROP DEFAULT the catalog shows nothing. | yes: any rewritten pre-existing table that gained a column halts, whatever its default (fail closed) | halt | As 6, copying the new column. |
 | 9 | A step that fails `max_step_failures` times running (publisher outages do not count) | yes | halt | Read the error, fix it, `follower resume`. |
 | 10 | Row selection that differs: production ran the migration under READ COMMITTED alongside other transactions, so a statement there may not have seen rows that commit before the migration does, while the local replay sees all of them | **no** | silent divergence on the rows only one side touched | The Phase 3 parity checks, then copy-columns or a re-seed. Avoid long-running data migrations while replication is live. |
 | 11 | Non-deterministic row selection (`DELETE … WHERE ts < now()`) | **no** | silent divergence | As 10. |

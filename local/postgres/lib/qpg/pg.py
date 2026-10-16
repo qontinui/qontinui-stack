@@ -127,22 +127,30 @@ class Psql:
         """Run a script of statements; optionally as one transaction (``-1``)."""
         return self._run(script.rstrip() + "\n", ["-1"] if single_transaction else None)
 
-    def copy_out(self, select_sql: str) -> bytes:
-        """``COPY (select) TO STDOUT`` in text format, as raw bytes."""
+    def copy_out(self, select_sql: str, prelude: str = "", in_transaction: str = "") -> bytes:
+        """``COPY (select) TO STDOUT`` in text format, as raw bytes.
+
+        ``in_transaction`` (e.g. ``ISOLATION LEVEL REPEATABLE READ READ ONLY``)
+        wraps ``prelude`` and the COPY in one transaction, so statements in the
+        prelude (a guard that raises) see the same snapshot as the COPY.
+        """
         cmd = [self.psql, "-X", "-q", "-v", "ON_ERROR_STOP=1", "-d", self.conninfo, "-f", "-"]
         env = dict(os.environ)
         env.update(self.env)
-        script = CANONICAL_SESSION + f"\nCOPY ({select_sql}) TO STDOUT;\n"
+        body = (prelude.rstrip() + "\n" if prelude else "") + f"COPY ({select_sql}) TO STDOUT;\n"
+        if in_transaction:
+            body = f"BEGIN {in_transaction};\n{body}COMMIT;\n"
+        script = CANONICAL_SESSION + "\n" + body
         proc = subprocess.run(cmd, input=script.encode(), capture_output=True, env=env, timeout=self.timeout)
         if proc.returncode != 0:
             raise PgError(self.label, proc.returncode, proc.stderr.decode("utf-8", "replace"))
         return proc.stdout
 
-    def execute_with_copy(self, before: str, copy_stmt: str, data: bytes, after: str = "") -> None:
-        """One transaction: ``before``; ``COPY ... FROM STDIN`` fed ``data``; ``after``."""
+    def execute_with_copy(self, before: str, copy_stmt: str, data: bytes, after: str = "") -> str:
+        """One transaction: ``before``; ``COPY ... FROM STDIN`` fed ``data``; ``after``. Returns the output."""
         tail = data
         if tail and not tail.endswith(b"\n"):
             tail += b"\n"
         script = before.rstrip() + "\n" + copy_stmt.rstrip().rstrip(";") + ";\n"
         payload = tail + b"\\.\n" + after.encode("utf-8") + b"\n"
-        self._run(script, ["-1"], stdin_tail=payload)
+        return self._run(script, ["-1"], stdin_tail=payload)

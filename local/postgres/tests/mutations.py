@@ -143,6 +143,42 @@ MUTATIONS = {
         "        cleaned = ''\n",
         ["test_follower.MigrateFailureTest"],
     ),
+    # Fifth review 1: copy-columns reads the publisher without the version guard.
+    "no-version-guard": (
+        "lib/qpg/follower.py",
+        '                prelude="SET LOCAL row_security = off;\\n" + self._version_guard(),',
+        '                prelude="SET LOCAL row_security = off;\\n",',
+        ["test_follower.CopyColumnsTest"],
+    ),
+    # Fifth review 2: copy-columns runs without the follower lock.
+    "copy-columns-no-lock": (
+        "lib/qpg/follower.py",
+        "        with follower_lock(self.lock_path):\n            return self._copy_columns(",
+        "        if True:\n            return self._copy_columns(",
+        ["test_follower.CopyColumnsTest"],
+    ),
+    # Fifth review 5: the publisher read honours row security (silently filtering).
+    "copy-columns-rls-on": (
+        "lib/qpg/follower.py",
+        '                prelude="SET LOCAL row_security = off;\\n" + self._version_guard(),',
+        '                prelude=self._version_guard(),',
+        ["test_follower.CopyColumnsTest"],
+    ),
+    # Fifth review 3: only gained columns that still have a default count.
+    "gained-needs-default": (
+        "lib/qpg/follower.py",
+        '                    f"SELECT a.attname FROM pg_attribute a WHERE a.attrelid = {oid} AND NOT a.attisdropped "',
+        '                    f"SELECT a.attname FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid "\n'
+        '                    f"AND d.adnum = a.attnum WHERE a.attrelid = {oid} AND NOT a.attisdropped "',
+        ["test_follower.DropDefaultRewriteTest"],
+    ),
+    # Fifth review 4: relog re-installs the triggers by the stored names.
+    "relog-by-stored-name": (
+        "lib/qpg/follower.py",
+        '                self._install_log_triggers({oid: current[oid] for oid in detail["scope"] if oid in current})',
+        '                self._install_log_triggers(detail["scope"])',
+        ["test_follower.RelogTest"],
+    ),
     # A3's refusal removed.
     "no-move-refusal": (
         "lib/qpg/follower.py",

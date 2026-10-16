@@ -120,6 +120,17 @@ ALTER TABLE follower.replay_log ADD CONSTRAINT replay_log_op_check CHECK (op IN 
 
 -- An operator's recorded resolution of one halt case for one migration
 -- transaction (`qontinui-pg follower resolve`), which the replay checks honour.
+-- A copy-columns run an operator owes after resolving a rewrite, key-change
+-- or missing-value halt; `follower check` fails while one is outstanding.
+CREATE TABLE IF NOT EXISTS follower.owed (
+    relation text NOT NULL,
+    columns  text NOT NULL,
+    xid      text NOT NULL,
+    kase     text NOT NULL,
+    owed_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (relation, columns)
+);
+
 -- Keyed by the subscription's OID as well as the remote xid, so a resolution
 -- can never be read against another subscription's (or a re-created one's) xid.
 CREATE TABLE IF NOT EXISTS follower.resolutions (

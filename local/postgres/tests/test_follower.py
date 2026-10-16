@@ -489,6 +489,142 @@ class AcknowledgeTest(unittest.TestCase):
         self.assertIn("acknowledge_known_gaps", res.stderr)
 
 
+
+class CopyColumnsTest(unittest.TestCase):
+    """Fifth review 1, 2, 5 and the owed-copy minor: copy-columns is guarded, locked and RLS-honest."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.pair = Pair("t_copy_columns", web_dir="web-type-using")
+        cls.pair.setup()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.pair.teardown()
+
+    def _follower(self):
+        from qpg import config as config_mod
+        from qpg.follower import Follower
+        from qpg.notify import Notifier
+        cfg = config_mod.load(self.pair.conf)
+        return Follower(cfg, Notifier(cfg, force_dry_run=True))
+
+    def test_1_refuses_across_an_unreplayed_migration(self):
+        """Even when the caught-up check is defeated, the snapshot's version guard refuses the copy."""
+        from qpg.pg import PgError
+        p = self.pair
+        p.migrate_pub("y2")  # the follower is not running: the subscriber has not replayed it
+        res = cli(p.conf, "follower", "copy-columns", "--table", "app.items", "--column", "label")
+        self.assertEqual(res.returncode, 3, res.stdout + res.stderr)
+        self.assertIn("did not catch up", res.stderr)
+        f = self._follower()
+        f.caught_up = lambda lsn: True
+        with self.assertRaises(PgError) as ctx:
+            f.copy_columns("app.items", ["label"])
+        self.assertIn("has applied a migration the subscriber has not", str(ctx.exception))
+        self.assertEqual(_subenabled(p), "true", "copy-columns restores the subscription")
+
+    def test_2_owed_until_copied(self):
+        p = self.pair
+        res = p.follow(timeout=60)
+        self.assertEqual(res.returncode, 3, res.stdout + res.stderr)
+        res = cli(p.conf, "follower", "resolve", "--case", "rewrite", "--target", "app.items")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertEqual(p.follow().returncode, 0)
+        check = cli(p.conf, "follower", "check")
+        self.assertEqual(check.returncode, 1, check.stdout)
+        self.assertIn("FAIL copy-columns owed for app.items", check.stdout)
+        status = json.loads(cli(p.conf, "follower", "status", check=True).stdout)
+        self.assertEqual([o["table"] for o in status["copy_columns_owed"]], ["app.items"])
+        res = cli(p.conf, "follower", "copy-columns", "--table", "app.items", "--column", "amount")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        out = json.loads(res.stdout)
+        self.assertEqual(out["rows_read"], out["rows_updated"])
+        self.assertEqual(cli(p.conf, "follower", "check").returncode, 0)
+        wait_caught_up(p)
+        p.assert_equal(self)
+
+    def test_3_lock_excludes_the_daemon_and_copy_columns(self):
+        from qpg.follower import follower_lock
+        p = self.pair
+        with follower_lock(os.path.join(p.state_dir, "follower.lock")):
+            res = cli(p.conf, "follower", "copy-columns", "--table", "app.items", "--column", "label")
+            self.assertEqual(res.returncode, 5, res.stdout + res.stderr)
+            self.assertIn("locked", res.stderr)
+            res = cli(p.conf, "follower", "run", "--once")
+            self.assertIn("cycle skipped", res.stderr)
+
+    def test_4_row_security_refuses_instead_of_filtering(self):
+        p = self.pair
+        p.pub(APP).execute("ALTER TABLE app.items ENABLE ROW LEVEL SECURITY")
+        try:
+            res = cli(p.conf, "follower", "copy-columns", "--table", "app.items", "--column", "label")
+            self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+            self.assertIn("row-level security", res.stderr)
+            self.assertEqual(_subenabled(p), "true")
+        finally:
+            p.pub(APP).execute("ALTER TABLE app.items DISABLE ROW LEVEL SECURITY")
+
+
+class DropDefaultRewriteTest(unittest.TestCase):
+    """Fifth review 3: add-with-computed-default, a rewrite, then DROP DEFAULT still halts."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.pair = Pair("t_drop_default", web_dir="web-missrw-dropdefault")
+        cls.pair.setup()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.pair.teardown()
+
+    def test_halts(self):
+        p = self.pair
+        p.migrate_pub("p2")
+        res = p.follow(timeout=60)
+        self.assertEqual(res.returncode, 3, res.stdout + res.stderr)
+        reason = _halted_reason(p)
+        self.assertIn("computed default", reason)
+        self.assertIn("stamped", reason)
+
+
+class RelogTest(unittest.TestCase):
+    """Fifth review 4: a resumed replay re-installs its triggers by OID under current names.
+
+    The batch's first revision renames a table; the replay fails at the second.
+    The test then leaves the rename committed locally (as an autocommit block
+    in a real revision would) and removes the cause, so the resume must find
+    the renamed table by OID and skip the table that no longer exists.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.pair = Pair("t_relog", web_dir="web-relog")
+        cls.pair.setup()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.pair.teardown()
+
+    def test_resume_after_partial_replay(self):
+        p = self.pair
+        p.sub(APP).execute("CREATE TABLE app.q3 (id int PRIMARY KEY, note text)")  # the replay will fail here
+        p.migrate_pub("q3")
+        res = p.follow(timeout=60)
+        self.assertEqual(res.returncode, 3, res.stdout + res.stderr)
+        self.assertIn("local migration command failed", _halted_reason(p))
+        p.sub(APP).execute("ALTER TABLE app.settings RENAME TO settings_q; DROP TABLE app.q3")
+        self.assertEqual(cli(p.conf, "follower", "resume").returncode, 0)
+        res = p.follow(timeout=60)
+        self.assertEqual(res.returncode, 3, res.stdout + res.stderr)
+        self.assertIn("renamed or moved", _halted_reason(p))
+        res = cli(p.conf, "follower", "resolve", "--case", "rename", "--target", "app.settings_q")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        res = p.follow()
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        wait_caught_up(p)
+        p.assert_equal(self)
+
 class CoordLaneTest(unittest.TestCase):
     """A2: the coord lane under r16's fallback, with a fixture coord-migrate.
 

@@ -64,6 +64,8 @@ and raises an operator notice. A halted follower stays halted until
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -122,6 +124,30 @@ class Halt(RuntimeError):
         self.targets = targets or []
 
 
+class Locked(RuntimeError):
+    """Another follower process (the daemon, or copy-columns) holds the follower lock."""
+
+
+@contextlib.contextmanager
+def follower_lock(path: str):
+    """An exclusive, non-blocking lock shared by the daemon's cycle and copy-columns.
+
+    A file lock rather than a session advisory lock: every query here is its
+    own psql process, so no database session lives as long as a cycle. Both
+    holders run on this host as the postgres user.
+    """
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise Locked(f"{path} is held by another follower process") from exc
+        yield
+    finally:
+        os.close(fd)
+
+
 def resolve_cli(case: str, targets: list[str]) -> str:
     return "; ".join(f"`qontinui-pg follower resolve --case {case} --target {t}`" for t in targets)
 
@@ -142,6 +168,7 @@ class Follower:
         self.pub = cfg.publisher("qontinui-pg-follower")
         self.admin = cfg.sub_admin("qontinui-pg-follower")
         self.stall_fresh = cfg.getint("follower", "stall_fresh_seconds", 120)
+        self.lock_path = cfg.get("follower", "lock_file", fallback="/var/lib/qontinui-pg/follower.lock") or ""
         self.log_tail = cfg.getint("follower", "log_tail_bytes", 4 * 1024 * 1024)
 
     # ------------------------------------------------------------------ setup
@@ -316,10 +343,21 @@ class Follower:
         script = [f"INSERT INTO follower.resolutions (sub_oid, xid, kase, target) VALUES ({lit(sub)}, {lit(xid)}, "
                   f"{lit(kase)}, {lit(target)}) ON CONFLICT DO NOTHING;"]
         if kase in ("rewrite", "key-change"):
+            # The target is the regclass text the halt printed; resolve it to an
+            # OID through the live catalog rather than by splitting the text.
+            oid = self.admin.scalar(
+                "SELECT c.oid::text FROM pg_class c WHERE c.oid::regclass::text = "
+                f"{lit(target)} OR (SELECT n.nspname || '.' || c.relname FROM pg_namespace n "
+                f"WHERE n.oid = c.relnamespace) = {lit(target)} LIMIT 1")
+            if oid is None:
+                raise ConfigError(f"{target} does not name a table on the subscriber")
             ops = "'T', 'R'" if kase == "rewrite" else "'K'"
-            rel = f"to_regclass({lit(qualified(*target.split('.', 1)))})"
-            script.append(f"DELETE FROM follower.replay_log WHERE op IN ({ops}) AND (relid = {rel} OR relid IN "
-                          f"(SELECT relid FROM pg_partition_tree({rel})));")
+            script.append(f"DELETE FROM follower.replay_log WHERE op IN ({ops}) AND (relid = {oid} OR relid IN "
+                          f"(SELECT relid FROM pg_partition_tree({oid})));")
+        if kase in ("rewrite", "key-change", "missing-value"):
+            table, columns = (target.rsplit(".", 1) if kase == "missing-value" else (target, "*"))
+            script.append("INSERT INTO follower.owed (relation, columns, xid, kase) VALUES "
+                          f"({lit(table)}, {lit(columns)}, {lit(xid)}, {lit(kase)}) ON CONFLICT DO NOTHING;")
         self.admin.execute("\n".join(script))
         self.event("resolved", {"xid": xid, "case": kase, "target": target, "meaning": self.RESOLVABLE[kase]})
         remaining = [t for t in targets if not self._resolved(xid, kase, t)]
@@ -333,17 +371,51 @@ class Follower:
             f"SELECT count(*) FROM follower.resolutions WHERE sub_oid = {lit(self.sub_oid())} AND xid = {lit(xid)} "
             f"AND kase = {lit(kase)} AND target = {lit(target)}") != "0"
 
-    def copy_columns(self, table: str, columns: list[str] | None) -> dict:
+    def owed(self) -> list[dict]:
+        rows = self.admin.rows("SELECT relation, columns, kase, xid FROM follower.owed ORDER BY 1, 2")
+        return [{"table": r[0], "columns": r[1], "case": r[2], "xid": r[3]} for r in rows]
+
+    def _version_guard(self) -> str:
+        """A DO block for the publisher: raise unless its versions equal the subscriber's applied ones."""
+        checks = [(self.cfg.version_table, "version_num")]
+        if self.cfg.coord_lane:
+            checks += [(h.table, self.cfg.coord_version_column) for h in self.cfg.coord_history_tables
+                       if self._table_exists(self.admin, h.table)]
+        conds = []
+        for table, col in checks:
+            target = qualified(*table.split(".", 1))
+            v = f"{ident(col)}::text"
+            agg = f"(SELECT coalesce(string_agg({v}, ',' ORDER BY {v} COLLATE \"C\"), '') FROM {target})"
+            local = self.admin.scalar(f"SELECT {agg}") or ""
+            conds.append(f"{agg} IS DISTINCT FROM {lit(local)}")
+        return ("DO $$ BEGIN IF " + " OR ".join(conds) + " THEN RAISE EXCEPTION "
+                "'qontinui-follower copy-columns: the publisher has applied a migration the subscriber has not; "
+                "refusing to copy rows across it'; END IF; END $$;")
+
+    def copy_columns(self, table: str, columns: list[str] | None, allow_unmatched: int = 0) -> dict:
         """Overwrite existing rows' column values from the publisher, collision-free.
 
         The remedy the rewrite / key-change / missing-value halts name, run once
-        the migration has been carried through. With the subscription DISABLED,
-        it reads key + columns from the publisher (one bounded read of one table,
-        on the operator's request) and UPDATEs only rows that already exist
-        locally, in replica mode. It never inserts, so it cannot collide with a
-        row apply has yet to insert; a row the publisher changed again later is
-        replaced again, in order, by apply.
+        the migration has been carried through:
+
+        * it holds the follower lock, so the daemon's cycle cannot run meanwhile;
+        * it requires apply caught up (to the publisher's LSN read just before)
+          and then DISABLES the subscription itself;
+        * it reads key + columns from the publisher in ONE repeatable-read
+          snapshot that first checks the publisher's version tables equal the
+          subscriber's, with ``row_security = off``, so an unreplayed migration
+          or a row-level policy refuses the copy instead of shaping it;
+        * it UPDATEs only rows that already exist locally (by key, replica
+          mode) and never inserts, so it cannot collide with a row apply has yet
+          to insert; a row the publisher changed again later is replaced again,
+          in order, by apply;
+        * rows read but not matched locally (rows newer than the subscriber)
+          fail the run unless ``allow_unmatched`` covers them.
         """
+        with follower_lock(self.lock_path):
+            return self._copy_columns(table, columns, allow_unmatched)
+
+    def _copy_columns(self, table: str, columns: list[str] | None, allow_unmatched: int) -> dict:
         st = self.state()
         if st["status"] != "idle":
             raise Halt(f"copy-columns needs an idle follower (status {st['status']}); resolve the halt first")
@@ -366,23 +438,44 @@ class Follower:
         sel = ", ".join(ident(c) for c in key + cols)
         enabled = self.admin.scalar(
             f"SELECT subenabled::text FROM pg_subscription WHERE subname = {lit(self.cfg.subscription)}") == "true"
+        if not enabled:
+            raise Halt("copy-columns needs the subscription enabled and caught up; it disables it itself")
+        lsn = self.pub.scalar("SELECT pg_current_wal_lsn()::text")
+        deadline = time.monotonic() + self.cfg.getint("follower", "copy_catchup_seconds", 120)
+        while not self.caught_up(lsn):
+            if time.monotonic() > deadline:
+                raise Halt(f"copy-columns refused: apply did not catch up to the publisher's {lsn}")
+            time.sleep(0.5)
         self._disable()
         try:
-            data = self.pub.copy_out(f"SELECT {sel} FROM {target}")
+            data = self.pub.copy_out(
+                f"SELECT {sel} FROM {target}",
+                prelude="SET LOCAL row_security = off;\n" + self._version_guard(),
+                in_transaction="ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            read = data.count(b"\n")
             tmp = "qpg_copy_columns"
             sets = ", ".join(f"{ident(c)} = s.{ident(c)}" for c in cols)
             match = " AND ".join(f"t.{ident(k)} = s.{ident(k)}" for k in key)
-            self.admin.execute_with_copy(
+            out = self.admin.execute_with_copy(
                 "SET LOCAL session_replication_role = replica;\n"
                 f"CREATE TEMP TABLE {tmp} ON COMMIT DROP AS SELECT {sel} FROM {target} WITH NO DATA;",
                 f"COPY {tmp} ({sel}) FROM STDIN", data,
-                f"UPDATE {target} t SET {sets} FROM {tmp} s WHERE {match};")
+                f"WITH u AS (UPDATE {target} t SET {sets} FROM {tmp} s WHERE {match} RETURNING 1) "
+                "SELECT count(*) FROM u;\n"
+                + (f"DO $$ BEGIN IF (SELECT count(*) FROM {tmp} s WHERE NOT EXISTS (SELECT 1 FROM {target} t "
+                   f"WHERE {match})) > {int(allow_unmatched)} THEN RAISE EXCEPTION 'qontinui-follower copy-columns: "
+                   "rows read from the publisher do not exist locally (more than --allow-unmatched); nothing "
+                   "was updated'; END IF; END $$;"))
+            updated = int((out.strip().splitlines() or ["0"])[-1])
+            self.admin.execute(
+                f"DELETE FROM follower.owed WHERE relation = {lit(table)} AND (columns = '*' OR columns = ANY("
+                f"{text_array(cols)}))")
         finally:
-            if enabled:
-                self.admin.execute(f"ALTER SUBSCRIPTION {ident(self.cfg.subscription)} ENABLE",
-                                   single_transaction=False)
-        self.event("copied-columns", {"table": table, "columns": cols})
-        return {"table": table, "columns": cols, "subscription_reenabled": enabled}
+            self.admin.execute(f"ALTER SUBSCRIPTION {ident(self.cfg.subscription)} ENABLE", single_transaction=False)
+        result = {"table": table, "columns": cols, "rows_read": read, "rows_updated": updated,
+                  "subscription_reenabled": True}
+        self.event("copied-columns", result)
+        return result
 
     def _guard_a4(self) -> None:
         violations = self.cfg.a4_violations()
@@ -744,8 +837,12 @@ class Follower:
                 detail["step"] = "migrate"
             elif step == "relog":
                 # Resuming a migration that halted before its undo: the log so
-                # far is kept, the triggers come back, the migration re-runs.
-                self._install_log_triggers(detail["scope"])
+                # far is kept, the triggers come back on the tables the stored
+                # scope names BY OID, under their current names (a committed
+                # part of the replay may have renamed one; a dropped one is
+                # skipped), and the migration re-runs.
+                current = self.scope_snapshot()
+                self._install_log_triggers({oid: current[oid] for oid in detail["scope"] if oid in current})
                 detail["step"] = "migrate"
             elif step == "migrate":
                 self._migrate(detail["source"], detail["versions"])
@@ -846,15 +943,16 @@ class Follower:
             elif int(reason) & 2:
                 unsafe[table] = f"{name}: rewritten to fill a column with a volatile default"
             else:
+                # Any column the migration added to a table it then rewrote:
+                # the rewrite stores each side's own default value, and a later
+                # DROP DEFAULT leaves no trace of it in the catalog.
                 gained = self.admin.rows(
-                    "SELECT a.attname FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid "
-                    f"AND d.adnum = a.attnum WHERE a.attrelid = {oid} AND NOT a.attisdropped "
-                    f"AND a.attnum > {int(attnums_before.get(oid, 0))} AND (d.adbin::text LIKE '%{{FUNCEXPR%' "
-                    "OR d.adbin::text LIKE '%{SQLVALUEFUNCTION%')")
+                    f"SELECT a.attname FROM pg_attribute a WHERE a.attrelid = {oid} AND NOT a.attisdropped "
+                    f"AND a.attnum > {int(attnums_before.get(oid, 0))}")
                 if gained:
                     unsafe[table] = (f"{name}: rewritten after the migration added column(s) "
-                                     f"{[g[0] for g in gained]} with a computed default (the rewrite stores each "
-                                     "side's own value)")
+                                     f"{[g[0] for g in gained]}; the rewrite stores each side's own default value "
+                                     "(computed default)")
         if unsafe:
             targets = sorted(unsafe)
             raise Halt(
@@ -1069,9 +1167,13 @@ class Follower:
         failures = 0
         while True:
             try:
-                status = self.cycle()
+                with follower_lock(self.lock_path):
+                    status = self.cycle()
                 notified_step = None
                 failures = 0
+            except Locked as exc:
+                log("follower-skipped", f"cycle skipped: {exc} (copy-columns is running)")
+                status = "locked"
             except PgError as exc:
                 log("follower-cycle-error", str(exc))
                 status = "error"
@@ -1204,6 +1306,10 @@ class Follower:
             results.append((stream != "p", f"subscription streaming is not parallel (sequential apply) [{stream}]"))
         st = self.state()
         results.append((st["status"] != "halted", f"follower not halted [{st['status']}: {st['reason']}]"))
+        for o in self.owed():
+            results.append((False, f"copy-columns owed for {o['table']} columns {o['columns']} ({o['case']} halt "
+                                   f"resolved on transaction {o['xid']}): `qontinui-pg follower copy-columns --table "
+                                   f"{o['table']}{'' if o['columns'] == '*' else ' --column ' + o['columns']}`"))
         in_replay = st["status"] == "in_progress" and st["detail"].get("step") == "migrate"
         if not in_replay:
             leftover = self.admin.scalar(

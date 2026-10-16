@@ -61,6 +61,10 @@ phase8_complete = false
 stall_fresh_seconds = 120
 # A step failing this many times running halts the follower (subscription left disabled).
 max_step_failures = 5
+# Held by the daemon's cycle and by copy-columns, so they never run together.
+lock_file = /var/lib/qontinui-pg/follower.lock
+# copy-columns waits this long for apply to catch up before it disables the subscription.
+copy_catchup_seconds = 120
 # The follower REFUSES to run until this is true. Read "Known gaps" in
 # local/postgres/README.md first: they are shapes it cannot detect.
 acknowledge_known_gaps = false
