@@ -62,7 +62,7 @@ GB = 1024 ** 3
 @dataclass
 class Check:
     name: str
-    status: str  # OK | ALERT | UNKNOWN
+    status: str  # OK | INFO | ALERT | UNKNOWN (INFO is reported, never noticed, never fails the run)
     message: str
 
 
@@ -151,11 +151,17 @@ class Watchdog:
         # inactive), not an orphan. It still pins WAL, and with the
         # subscription disabled a table stuck in 'd'/'f' holds it indefinitely,
         # so it is reported as INFO with its retention, never left out.
-        syncing = {f"pg_{r[0]}_sync_{r[1]}_" for r in self.admin.rows(
+        # PG16 names it pg_<suboid>_sync_<relid>_<SUBSCRIBER system_identifier>:
+        # the sysid is part of the match, so a rebuilt subscriber that reuses an
+        # oid never claims the dead cluster's orphans as its own.
+        sysid = self.admin.scalar("SELECT system_identifier FROM pg_control_system()")
+        if not sysid:
+            raise ValueError("the subscriber's system_identifier read empty")
+        syncing = {f"pg_{r[0]}_sync_{r[1]}_{sysid}" for r in self.admin.rows(
             "SELECT s.oid::text, r.srrelid::text FROM pg_subscription s "
             "JOIN pg_subscription_rel r ON r.srsubid = s.oid "
             f"WHERE s.subname = {lit(self.cfg.subscription)} AND r.srsubstate NOT IN ('r', 's')")}
-        own = [o for o in found if any(o[0].startswith(p) for p in syncing)]
+        own = [o for o in found if o[0] in syncing]
         orphans = [o for o in found if o not in own]
         if not found:
             return Check("orphan_sync_slots", "OK", "no inactive tablesync slot on the publisher")

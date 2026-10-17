@@ -224,8 +224,16 @@ MUTATIONS = {
     # The own-subscription exclusion removed: a table still syncing reads as an orphan.
     "orphan-no-syncing-exclusion": (
         "lib/qpg/watchdog.py",
-        "own = [o for o in found if any(o[0].startswith(p) for p in syncing)]",
+        "own = [o for o in found if o[0] in syncing]",
         "own = []",
+        ["test_ops.WatchdogTest"],
+    ),
+    # The subscriber's system_identifier dropped from the own-slot match: a dead
+    # cluster's orphan with a reused subid/relid reads as INFO and is never noticed.
+    "orphan-match-ignores-sysid": (
+        "lib/qpg/watchdog.py",
+        "own = [o for o in found if o[0] in syncing]",
+        "own = [o for o in found if any(o[0].rsplit('_', 1)[0] == s.rsplit('_', 1)[0] for s in syncing)]",
         ["test_ops.WatchdogTest"],
     ),
     # The LIKE pattern unescaped: '_' becomes a wildcard and look-alike names match.

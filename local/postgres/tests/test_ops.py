@@ -218,24 +218,46 @@ class WatchdogTest(unittest.TestCase):
                             f"WHERE slot_name IN ({slot!r}, {lookalike!r})", single_transaction=False)
 
     def test_5_own_syncing_slot_is_info_not_orphan(self):
-        """This subscription's slot for a table still syncing is INFO with its WAL, never an orphan ALERT."""
+        """This subscription's slot for a table still syncing is INFO with its WAL, never an orphan ALERT.
+
+        The slot name carries the SUBSCRIBER's system_identifier; the same subid
+        and relid under a foreign sysid (a rebuilt subscriber's dead cluster) is
+        an orphan.
+        """
         p = self.pair
-        sysid = p.pub().scalar("SELECT system_identifier FROM pg_control_system()")
+        sysid = p.sub().scalar("SELECT system_identifier FROM pg_control_system()")
         subid = p.sub().scalar(f"SELECT oid FROM pg_subscription WHERE subname = {p.sub_name!r}")
         relid = p.sub().scalar("SELECT 'app.items'::regclass::oid")
+        foreign = "1234567890123456789"
+        self.assertNotEqual(sysid, foreign)
         slot = f"pg_{subid}_sync_{relid}_{sysid}"
-        # A table stuck in 'd' with the subscription disabled: no worker owns the slot.
-        p.sub().execute(f"ALTER SUBSCRIPTION {p.sub_name} DISABLE", single_transaction=False)
-        p.sub().execute(f"UPDATE pg_subscription_rel SET srsubstate = 'd' WHERE srsubid = {subid} AND srrelid = {relid}")
-        p.pub().execute(f"SELECT pg_create_logical_replication_slot({slot!r}, 'pgoutput')", single_transaction=False)
+        dead = f"pg_{subid}_sync_{relid}_{foreign}"
         try:
+            # A table stuck in 'd' with the subscription disabled: no worker owns the slot.
+            p.sub().execute(f"ALTER SUBSCRIPTION {p.sub_name} DISABLE", single_transaction=False)
+            p.sub().execute(f"UPDATE pg_subscription_rel SET srsubstate = 'd' "
+                            f"WHERE srsubid = {subid} AND srrelid = {relid}")
+            p.pub().execute(f"SELECT pg_create_logical_replication_slot({slot!r}, 'pgoutput')",
+                            single_transaction=False)
             res, lines = self.watchdog("--dry-run-notify")
             line = lines["orphan_sync_slots"]
             self.assertIn(slot, line, res.stdout)
             self.assertRegex(line, r"^INFO\s+orphan_sync_slots: no orphan; \d+ B of WAL held", res.stdout)
             self.assertNotIn("watchdog ALERT: orphan_sync_slots", res.stderr, "INFO is reported, never noticed")
+            self.assertEqual(res.returncode, 0, "a run whose only non-OK check is INFO exits 0\n" + res.stdout)
+
+            p.pub().execute(f"SELECT pg_create_logical_replication_slot({dead!r}, 'pgoutput')",
+                            single_transaction=False)
+            res, lines = self.watchdog("--dry-run-notify")
+            line = lines["orphan_sync_slots"]
+            self.assertTrue(line.startswith("ALERT"), res.stdout)
+            head, _, also = line.partition("Also INFO")
+            self.assertIn(dead, head, "a foreign sysid is a dead cluster's orphan, whatever its subid and relid")
+            self.assertIn(slot, also, "our own syncing slot stays INFO next to the alert")
+            self.assertEqual(res.returncode, 1, res.stdout)
         finally:
-            p.pub().execute(f"SELECT pg_drop_replication_slot({slot!r})", single_transaction=False)
+            p.pub().execute(f"SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots "
+                            f"WHERE slot_name IN ({slot!r}, {dead!r})", single_transaction=False)
             p.sub().execute(f"UPDATE pg_subscription_rel SET srsubstate = 'r' WHERE srsubid = {subid} "
                             f"AND srrelid = {relid}")
             p.sub().execute(f"ALTER SUBSCRIPTION {p.sub_name} ENABLE", single_transaction=False)
