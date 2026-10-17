@@ -98,14 +98,14 @@ module "postgres" {
   backup_retention_days = var.postgres_backup_retention_days
 
   # rds.logical_replication=1 and max_slot_wal_keep_size=8192 (MB), both
-  # pending-reboot, are staged in the module behind this flag. It stays FALSE
-  # until Phase 2 of plan 2026-10-15-coord-and-web-data-move-off-aws-by-logical-
-  # replication: changing the live parameter group is itself a production
-  # mutation, so an untargeted apply after this merge must not touch it. Phase 2
-  # flips this to true, then applies
-  # -target=module.postgres.aws_db_parameter_group.main and takes the announced
-  # 23:00 UTC reboot (operator gate 3fd552ff-f353-4b34-b1b7-b5e61106f39a).
-  logical_replication_enabled = false
+  # pending-reboot, are staged in the module behind this flag. Phase 2 of plan
+  # 2026-10-15-coord-and-web-data-move-off-aws-by-logical-replication turns it
+  # on. The values reach the parameter group through a targeted apply of
+  # module.postgres.aws_db_parameter_group.main and take effect only at the
+  # announced 23:00 UTC reboot; until then the group reads pending-reboot and
+  # wal_level stays `replica`. To revert, set this back to false, apply the
+  # same target, and reboot.
+  logical_replication_enabled = true
 }
 
 # ─── Redis ──────────────────────────────────────────────────────────────

@@ -48,9 +48,9 @@ variable "deletion_protection" {
 # Logical decoding for the off-AWS replica (plan
 # 2026-10-15-coord-and-web-data-move-off-aws-by-logical-replication, Phase 1b;
 # design D5 + D11). Default false so a composition that does not replicate keeps
-# a parameter group with neither parameter. aws/staging keeps it FALSE until
+# a parameter group with neither parameter. aws/staging kept it FALSE until
 # Phase 2, because changing the live parameter group is itself a production
-# mutation that an untargeted apply after merge must not perform. Phase 2 flips
+# mutation that an untargeted apply after merge must not perform. Phase 2 sets
 # it to true in aws/staging and runs
 #   terraform apply -target=module.postgres.aws_db_parameter_group.main
 # followed by the announced reboot.
