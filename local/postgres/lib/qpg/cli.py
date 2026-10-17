@@ -1,7 +1,7 @@
 """``qontinui-pg`` — the local/postgres operations CLI.
 
 Exit codes: 0 ok; 1 a check failed / a difference or alert was found;
-2 usage or configuration error; 3 the follower is halted; 4 timed out.
+2 usage or configuration error, or (partition-parity) a side could not be read; 3 the follower is halted; 4 timed out.
 """
 
 from __future__ import annotations
@@ -96,7 +96,7 @@ def cmd_watchdog(args, cfg) -> int:
     checks = Watchdog(cfg, Notifier(cfg, force_dry_run=args.dry_run_notify)).run()
     for c in checks:
         print(f"{c.status:7} {c.name}: {c.message}")
-    return 0 if all(c.status == "OK" for c in checks) else 1
+    return 0 if all(c.status in ("OK", "INFO") for c in checks) else 1
 
 
 def cmd_credential(args, _cfg) -> int:
@@ -130,7 +130,12 @@ def cmd_partitions(args, cfg) -> int:
 
 
 def cmd_partition_parity(args, cfg) -> int:
-    report = partitions.parity(cfg, args.parent or None)
+    try:
+        report = partitions.parity(cfg, args.parent or None)
+    except PgError as exc:
+        # No verdict: exit 2, never 1, which means the two sides' sets differ.
+        print(f"UNKNOWN: a side could not be read: {exc}", file=sys.stderr)
+        return 2
     print(json.dumps(report, indent=2))
     return 0 if report["equal"] else 1
 

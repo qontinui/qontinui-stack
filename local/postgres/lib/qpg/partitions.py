@@ -20,8 +20,9 @@ database.
 NAMES of every child partition under each published partitioned table on both
 sides (``pg_partition_tree``), never their counts: a publisher that dropped
 yesterday's child and created tomorrow's has the same count as a subscriber
-that still holds yesterday's and missed tomorrow's (Phase 0 measured exactly
-that, 16 = 16 as different sets).
+that still holds yesterday's and missed tomorrow's (measured: qontinui-dev-notes
+investigation-results/2026-10-17-off-aws-phase0-measured.md §4e, 16 children on
+each side as different sets).
 """
 
 from __future__ import annotations
@@ -99,7 +100,9 @@ def child_partitions(psql, parent: str) -> list[str] | None:
 def compare_children(parent: str, pub_children: list[str] | None, sub_children: list[str] | None) -> dict | None:
     """The difference for one parent, by NAME; None when both sides hold the same set."""
     if pub_children is None or sub_children is None:
-        return {"parent": parent, "absent_on": "publisher" if pub_children is None else "subscriber"}
+        absent = ("both" if pub_children is None and sub_children is None
+                  else "publisher" if pub_children is None else "subscriber")
+        return {"parent": parent, "absent_on": absent}
     if set(pub_children) != set(sub_children):
         return {"parent": parent,
                 "only_on_publisher": sorted(set(pub_children) - set(sub_children)),

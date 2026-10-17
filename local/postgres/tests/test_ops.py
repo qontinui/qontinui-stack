@@ -11,7 +11,7 @@ import configparser
 import threading
 import unittest
 
-from harness import APP, FIXTURES, REPL, SRC, Pair, cli, db, env
+from harness import APP, FIXTURES, REPL, SRC, Pair, cli, db, dsn, env
 from qpg import credential, partitions  # harness put the tree under test on sys.path
 from qpg.pg import Psql
 
@@ -194,22 +194,51 @@ class WatchdogTest(unittest.TestCase):
         """Phase 0 4g: a subscriber killed mid-copy leaves inactive pg_<subid>_sync_<relid>_<sysid> slots."""
         p = self.pair
         slot = "pg_999999_sync_424242_7000000000000000001"
-        p.pub().execute(f"SELECT pg_create_logical_replication_slot({slot!r}, 'pgoutput')", single_transaction=False)
+        # Matches 'pg_%_sync_%' only when '_' is a wildcard: the escaped pattern must leave it out.
+        lookalike = "pgx1ysync2z"
+        for name in (slot, lookalike):
+            p.pub().execute(f"SELECT pg_create_logical_replication_slot({name!r}, 'pgoutput')",
+                            single_transaction=False)
         try:
             res, lines = self.watchdog("--dry-run-notify")
             self.assertEqual(res.returncode, 1, res.stdout)
             line = lines["orphan_sync_slots"]
             self.assertTrue(line.startswith("ALERT"), res.stdout)
-            self.assertIn(slot, line)
             self.assertRegex(line, slot + r" \(db t_watchdog, retained \d+ B = ")
-            self.assertIn("orphan_sync_slots", res.stderr, "the alert is noticed through the notifier")
+            self.assertNotIn(lookalike, line, "only pg_<subid>_sync_<relid>_<sysid> names are tablesync slots")
+            self.assertIn("watchdog ALERT: orphan_sync_slots", res.stderr, "the alert goes through the notifier")
             self.assertEqual(p.pub().scalar(f"SELECT count(*) FROM pg_replication_slots WHERE slot_name = {slot!r}"),
                              "1", "the watchdog reports an orphan slot; it never drops one")
+            p.pub().execute(f"SELECT pg_drop_replication_slot({slot!r})", single_transaction=False)
+            res, lines = self.watchdog("--dry-run-notify")
+            self.assertNotIn(slot, lines["orphan_sync_slots"], res.stdout)
+            self.assertNotIn(lookalike, lines["orphan_sync_slots"], res.stdout)
+        finally:
+            p.pub().execute(f"SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots "
+                            f"WHERE slot_name IN ({slot!r}, {lookalike!r})", single_transaction=False)
+
+    def test_5_own_syncing_slot_is_info_not_orphan(self):
+        """This subscription's slot for a table still syncing is INFO with its WAL, never an orphan ALERT."""
+        p = self.pair
+        sysid = p.pub().scalar("SELECT system_identifier FROM pg_control_system()")
+        subid = p.sub().scalar(f"SELECT oid FROM pg_subscription WHERE subname = {p.sub_name!r}")
+        relid = p.sub().scalar("SELECT 'app.items'::regclass::oid")
+        slot = f"pg_{subid}_sync_{relid}_{sysid}"
+        # A table stuck in 'd' with the subscription disabled: no worker owns the slot.
+        p.sub().execute(f"ALTER SUBSCRIPTION {p.sub_name} DISABLE", single_transaction=False)
+        p.sub().execute(f"UPDATE pg_subscription_rel SET srsubstate = 'd' WHERE srsubid = {subid} AND srrelid = {relid}")
+        p.pub().execute(f"SELECT pg_create_logical_replication_slot({slot!r}, 'pgoutput')", single_transaction=False)
+        try:
+            res, lines = self.watchdog("--dry-run-notify")
+            line = lines["orphan_sync_slots"]
+            self.assertIn(slot, line, res.stdout)
+            self.assertRegex(line, r"^INFO\s+orphan_sync_slots: no orphan; \d+ B of WAL held", res.stdout)
+            self.assertNotIn("watchdog ALERT: orphan_sync_slots", res.stderr, "INFO is reported, never noticed")
         finally:
             p.pub().execute(f"SELECT pg_drop_replication_slot({slot!r})", single_transaction=False)
-        res, lines = self.watchdog("--dry-run-notify")
-        self.assertNotIn(slot, lines["orphan_sync_slots"], res.stdout)
-        self.assertNotIn(self.pair.sub_name, lines["orphan_sync_slots"], "the live subscription's slot is no orphan")
+            p.sub().execute(f"UPDATE pg_subscription_rel SET srsubstate = 'r' WHERE srsubid = {subid} "
+                            f"AND srrelid = {relid}")
+            p.sub().execute(f"ALTER SUBSCRIPTION {p.sub_name} ENABLE", single_transaction=False)
 
 
 class SeqSyncTest(unittest.TestCase):
@@ -391,10 +420,29 @@ class PartitionParityTest(unittest.TestCase):
             p.pub(APP).execute("DROP TABLE app_parts.tr_20260103; CREATE TABLE app_parts.tr_20260101 PARTITION OF "
                                "app.tr FOR VALUES FROM ('2026-01-01') TO ('2026-01-02')")
 
-    def test_3_parent_absent_on_one_side_is_red(self):
+    def test_3_parent_absent_is_red_and_says_where(self):
         res, report = self.parity("--parent", "app.no_such_parent")
         self.assertEqual(res.returncode, 1, res.stdout)
-        self.assertEqual(report["differences"], [{"parent": "app.no_such_parent", "absent_on": "publisher"}])
+        self.assertEqual(report["differences"], [{"parent": "app.no_such_parent", "absent_on": "both"}])
+        self.pair.pub(APP).execute("CREATE TABLE app.pub_only (d date) PARTITION BY RANGE (d)")
+        try:
+            res, report = self.parity("--parent", "app.pub_only")
+            self.assertEqual(res.returncode, 1, res.stdout)
+            self.assertEqual(report["differences"], [{"parent": "app.pub_only", "absent_on": "subscriber"}])
+        finally:
+            self.pair.pub(APP).execute("DROP TABLE app.pub_only")
+
+    def test_4_unreadable_side_is_unknown_not_a_difference(self):
+        conf = self.pair.conf + ".deadpub"
+        with open(self.pair.conf, encoding="utf-8") as fh:
+            text = fh.read()
+        pub_dsn = f"dsn = {dsn('PUB', self.pair.name, REPL)}"
+        self.assertIn(pub_dsn, text)
+        with open(conf, "w", encoding="utf-8") as fh:
+            fh.write(text.replace(pub_dsn, f"dsn = host=127.0.0.1 port=1 dbname={self.pair.name} user={REPL}"))
+        res = cli(conf, "partition-parity")
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+        self.assertIn("UNKNOWN", res.stderr)
 
 
 class CredentialTest(unittest.TestCase):

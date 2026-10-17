@@ -1,6 +1,6 @@
 """D11 watchdog: the slot, the lag, the follower, the host, the catalog.
 
-Runs once a minute (systemd timer). Every check yields OK, ALERT or UNKNOWN; an
+Runs once a minute (systemd timer). Every check yields OK, INFO, ALERT or UNKNOWN (INFO is reported, never noticed); an
 UNKNOWN is a check that could not read its signal and alerts like an ALERT —
 an unread signal never passes as healthy.
 
@@ -12,11 +12,12 @@ Checks:
 * ``orphan_sync_slots`` — inactive tablesync slots on the publisher
                       (``pg_<subid>_sync_<relid>_<sysid>``). A subscriber
                       killed mid-copy leaves them, ``DROP SUBSCRIPTION`` does
-                      not remove them, and they pin WAL like any slot (Phase 0
-                      measured two). Reported with each slot's retained WAL;
+                      not remove them, and they pin WAL like any slot
+                      (qontinui-dev-notes investigation-results/
+                      2026-10-17-off-aws-phase0-measured.md §4g). Reported with each slot's retained WAL;
                       never dropped here — dropping a slot is an operator act.
                       A slot of THIS subscription whose table is still syncing
-                      is not an orphan and is left out.
+                      is not an orphan; it is reported as INFO with its WAL.
 * ``apply_lag``     — no apply worker running, or ``now() - latest_end_time``
                       over ``lag_alert_seconds`` (30 min).
 * ``follower``      — halted, an in-progress step older than
@@ -87,6 +88,22 @@ def orphan_sync_slots(pub) -> list[tuple[str, str, int]]:
     return [(r[0], r[1], int(r[2])) for r in rows]
 
 
+def _describe(slots: list[tuple[str, str, int]]) -> str:
+    return ", ".join(f"{name} (db {db or '?'}, retained "
+                     f"{'UNKNOWN' if r < 0 else f'{r} B = {r / GB:.2f} GB'})" for name, db, r in slots)
+
+
+def _pinned(slots: list[tuple[str, str, int]]) -> str:
+    """Slots retain overlapping WAL, so the oldest sets what is pinned: the max, not a sum.
+
+    A slot whose retention reads UNKNOWN makes the known max a lower bound.
+    """
+    known = [r for _, _, r in slots if r >= 0]
+    if not known:
+        return "UNKNOWN bytes"
+    return f"{'at least ' if len(known) < len(slots) else ''}{max(known)} B"
+
+
 class Watchdog:
     def __init__(self, cfg: Config, notifier: Notifier | None = None):
         self.cfg = cfg
@@ -128,28 +145,32 @@ class Watchdog:
         return Check("slot", "OK", text)
 
     def check_orphan_sync_slots(self) -> Check:
-        orphans = orphan_sync_slots(self.pub)
+        found = orphan_sync_slots(self.pub)
         # A tablesync slot of our own subscription for a table that has not
         # reached 'r'/'s' is a sync in progress (between retries it is briefly
-        # inactive), not an orphan.
+        # inactive), not an orphan. It still pins WAL, and with the
+        # subscription disabled a table stuck in 'd'/'f' holds it indefinitely,
+        # so it is reported as INFO with its retention, never left out.
         syncing = {f"pg_{r[0]}_sync_{r[1]}_" for r in self.admin.rows(
             "SELECT s.oid::text, r.srrelid::text FROM pg_subscription s "
             "JOIN pg_subscription_rel r ON r.srsubid = s.oid "
             f"WHERE s.subname = {lit(self.cfg.subscription)} AND r.srsubstate NOT IN ('r', 's')")}
-        orphans = [o for o in orphans if not any(o[0].startswith(p) for p in syncing)]
-        if not orphans:
+        own = [o for o in found if any(o[0].startswith(p) for p in syncing)]
+        orphans = [o for o in found if o not in own]
+        if not found:
             return Check("orphan_sync_slots", "OK", "no inactive tablesync slot on the publisher")
-        parts = [f"{name} (db {db or '?'}, retained "
-                 f"{'UNKNOWN' if retained < 0 else f'{retained} B = {retained / GB:.2f} GB'})"
-                 for name, db, retained in orphans]
-        # Slots retain overlapping WAL, so the oldest one sets what is pinned: report the max, not a sum.
-        pinned = max(r for _, _, r in orphans)
-        return Check("orphan_sync_slots", "ALERT",
-                     f"{len(orphans)} inactive tablesync slot(s) on the publisher pin "
-                     f"{'UNKNOWN' if pinned < 0 else f'{pinned} B'} of WAL: " + ", ".join(parts) +
-                     " — left by a subscriber that died mid-copy; DROP SUBSCRIPTION does not remove them. "
-                     "Not dropped automatically: confirm no live subscription owns one, then "
-                     "pg_drop_replication_slot(<name>) on the publisher")
+        if not orphans:
+            return Check("orphan_sync_slots", "INFO",
+                         f"no orphan; {_pinned(own)} of WAL held by this subscription's own tablesync slot(s) for "
+                         "tables still syncing (stuck while the subscription is disabled): " + _describe(own))
+        text = (f"{len(orphans)} inactive tablesync slot(s) on the publisher pin {_pinned(orphans)} of WAL: "
+                + _describe(orphans) +
+                " — left by a subscriber that died mid-copy; DROP SUBSCRIPTION does not remove them. "
+                "Not dropped automatically: confirm no live subscription owns one, then "
+                "pg_drop_replication_slot(<name>) on the publisher")
+        if own:
+            text += f". Also INFO: this subscription's own syncing slot(s): {_describe(own)}"
+        return Check("orphan_sync_slots", "ALERT", text)
 
     def check_apply_lag(self) -> Check:
         rows = self.admin.rows(
@@ -296,7 +317,7 @@ class Watchdog:
         checks.append(rev)
         for c in checks:
             log("watchdog-check", f"{c.name} {c.status}", detail=c.message)
-        bad = [c for c in checks if c.status != "OK"]
+        bad = [c for c in checks if c.status in ("ALERT", "UNKNOWN")]
         state = self._state()
         sent = state.get("sent", {})
         renotify = self.cfg.getint("watchdog", "renotify_minutes", 60) * 60

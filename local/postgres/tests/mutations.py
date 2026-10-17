@@ -217,9 +217,30 @@ MUTATIONS = {
     # Orphaned tablesync slots: the watchdog stops reading them.
     "watchdog-no-orphan-sync-slots": (
         "lib/qpg/watchdog.py",
-        "orphans = orphan_sync_slots(self.pub)",
-        "orphans = []",
+        "found = orphan_sync_slots(self.pub)",
+        "found = []",
         ["test_ops.WatchdogTest"],
+    ),
+    # The own-subscription exclusion removed: a table still syncing reads as an orphan.
+    "orphan-no-syncing-exclusion": (
+        "lib/qpg/watchdog.py",
+        "own = [o for o in found if any(o[0].startswith(p) for p in syncing)]",
+        "own = []",
+        ["test_ops.WatchdogTest"],
+    ),
+    # The LIKE pattern unescaped: '_' becomes a wildcard and look-alike names match.
+    "orphan-pattern-unescaped": (
+        "lib/qpg/watchdog.py",
+        "LIKE 'pg\\\\_%\\\\_sync\\\\_%'",
+        "LIKE 'pg_%_sync_%'",
+        ["test_ops.WatchdogTest"],
+    ),
+    # partition-parity: an unreadable side reported as a difference (exit 1), not UNKNOWN.
+    "parity-unknown-is-difference": (
+        "lib/qpg/cli.py",
+        "could not be read: {exc}\", file=sys.stderr)\n        return 2\n",
+        "could not be read: {exc}\", file=sys.stderr)\n        return 1\n",
+        ["test_ops.PartitionParityTest"],
     ),
     # D9: the local lookahead drifts back from lane D's 14 days to 3.
     "partition-lookahead-3": (
