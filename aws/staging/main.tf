@@ -111,6 +111,26 @@ module "redis" {
   node_type        = var.redis_node_type
 }
 
+# ─── Replication tunnel, WireGuard on EC2 (off-AWS logical replica) ─────
+# D2(e) of plan 2026-10-15-coord-and-web-data-move-off-aws-by-logical-
+# replication, chosen by "OD1-OD4 resolved 2026-10-17" (OD3(ii)). DISABLED:
+# with enabled = false the module plans zero resources and makes no AWS reads.
+# Phase 3 turns it on with the subscriber's WireGuard PUBLIC key; see the module
+# header for the order. It sits next to Redis, not next to the D2(a) module, so
+# the two PRs touch different hunks.
+
+module "replication_tunnel_wireguard" {
+  source = "../modules/replication-tunnel-wireguard"
+
+  enabled = false
+
+  environment          = var.environment
+  vpc_id               = module.network.vpc_id
+  public_subnet_ids    = module.network.public_subnet_ids
+  db_security_group_id = module.network.data_plane_sg_id
+  db_endpoint_address  = module.postgres.address
+}
+
 # ─── Blob ───────────────────────────────────────────────────────────────
 
 module "blob" {
