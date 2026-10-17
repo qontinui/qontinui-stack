@@ -103,8 +103,12 @@ module "postgres" {
   # on. The values reach the parameter group through a targeted apply of
   # module.postgres.aws_db_parameter_group.main and take effect only at the
   # announced 23:00 UTC reboot; until then the group reads pending-reboot and
-  # wal_level stays `replica`. To revert, set this back to false, apply the
-  # same target, and reboot.
+  # wal_level stays `replica`. To revert: first drop every subscription that
+  # reads from this instance and every logical replication slot on it
+  # (pg_drop_replication_slot). PostgreSQL refuses to start when a logical slot
+  # exists but wal_level < logical, so a reboot with a slot left behind leaves
+  # the instance down. Then set this back to false, apply the same target, and
+  # reboot.
   logical_replication_enabled = true
 }
 
