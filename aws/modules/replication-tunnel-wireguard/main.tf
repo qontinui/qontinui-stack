@@ -29,6 +29,9 @@
 #   - No key pair, no SSH ingress, sshd disabled at first boot, no instance
 #     profile at all (so no SSM agent registration and no AWS credentials on the
 #     box), IMDSv2 required with a hop limit of 1.
+#   - Fail-closed at boot: a static base ruleset (nftables.service, ordered
+#     before wg-quick@wg0) drops all forwarding, and ip_forward stays 0 until
+#     the firewall script has loaded the peer-to-RDS ruleset.
 #   - Forwarding is filtered on the instance with nftables: the peer's tunnel
 #     address may reach the RDS /32 on tcp/5432 and nothing else; the host itself
 #     offers the peer nothing. The RDS address is re-resolved every 5 minutes,
@@ -57,6 +60,11 @@
 # Enabling (Phase 3):
 #   1. Generate the subscriber's key pair on the subscriber; set
 #      peer_public_key to its public half, and enabled = true. Targeted apply.
+#      NOTE: peer_public_key, db_endpoint_address, wg_port and tunnel_cidr are
+#      rendered into user_data, and user_data_replace_on_change is on, so
+#      changing ANY of them later REPLACES the instance, which generates a NEW
+#      server key pair (and, without the Elastic IP, a new public IP). Redo
+#      step 2 after every such apply.
 #   2. Read the instance's public key from the console (above) and its address
 #      from the public_ip output; write the subscriber's wg0.conf with
 #      Endpoint = <public_ip>:<wg_port>, AllowedIPs = <server_tunnel_address>/32
