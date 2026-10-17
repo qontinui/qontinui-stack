@@ -40,7 +40,8 @@ systemctl disable --now ssh.service ssh.socket 2>/dev/null || true
 # ─── Forwarding: OFF at boot; only the firewall script turns it on ──────
 # Not persisted as 1 on purpose: a boot where DNS or the firewall script fails
 # must not forward. qontinui-wg-firewall sets it to 1 only after its ruleset
-# loaded.
+# loaded. A later `sysctl --system` (e.g. a package hook) resets it to 0 until
+# the next 5-minute firewall run: that fails closed and heals itself.
 cat > /etc/sysctl.d/90-qontinui-wg.conf <<'EOF'
 net.ipv4.ip_forward = 0
 EOF
