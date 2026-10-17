@@ -1,0 +1,168 @@
+#!/bin/bash
+# First-boot setup of the WireGuard replication tunnel (D2(e)). Rendered by
+# templatefile() in main.tf; every value interpolated here is PUBLIC (a port, a
+# tunnel address, a hostname, the peer's public key). The instance's private key
+# is generated below, on the instance, and never leaves it.
+set -euo pipefail
+exec > >(tee -a /var/log/qontinui-wg-setup.log) 2>&1
+
+WG_PORT=${wg_port}
+WG_ADDR=${server_tunnel_address}
+WG_PREFIX=${tunnel_prefix_length}
+PEER_ADDR=${peer_tunnel_address}
+PEER_PUBKEY='${peer_public_key}'
+DB_HOST='${db_endpoint_address}'
+
+# ─── Packages: WireGuard userland, nftables, unattended security upgrades ───
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -q
+apt-get install -y -q wireguard-tools nftables unattended-upgrades bind9-dnsutils
+
+cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+# A kernel fix only takes effect after a reboot. The peer keeps the tunnel
+# alive and reconnects by itself, and every rule below is restored at boot.
+cat > /etc/apt/apt.conf.d/52qontinui-unattended <<'EOF'
+Unattended-Upgrade::Automatic-Reboot "true";
+Unattended-Upgrade::Automatic-Reboot-Time "04:30";
+EOF
+systemctl enable --now unattended-upgrades.service
+
+# No key pair is attached and the security group admits no TCP at all, but the
+# image ships sshd: turn it off so nothing listens that the tunnel does not need.
+systemctl disable --now ssh.service ssh.socket 2>/dev/null || true
+
+# ─── Forwarding ──────────────────────────────────────────────────────────
+cat > /etc/sysctl.d/90-qontinui-wg.conf <<'EOF'
+net.ipv4.ip_forward = 1
+EOF
+sysctl --system >/dev/null
+
+# ─── Keys: generated HERE, so no secret exists in Terraform state ────────
+install -d -m 0700 /etc/wireguard
+if [ ! -s /etc/wireguard/private.key ]; then
+  (umask 077 && wg genkey > /etc/wireguard/private.key)
+fi
+wg pubkey < /etc/wireguard/private.key > /etc/wireguard/public.key
+chmod 0644 /etc/wireguard/public.key
+
+# The private key stays in its own file; the config only points at it.
+cat > /etc/wireguard/wg0.conf <<EOF
+[Interface]
+Address = $WG_ADDR/$WG_PREFIX
+ListenPort = $WG_PORT
+PostUp = wg set %i private-key /etc/wireguard/private.key
+
+[Peer]
+# The local subscriber. It dials this instance and keeps the session alive, so
+# no Endpoint is set here and a changing home address does not matter.
+PublicKey = $PEER_PUBKEY
+AllowedIPs = $PEER_ADDR/32
+EOF
+chmod 0600 /etc/wireguard/wg0.conf
+
+# ─── Firewall: the peer reaches RDS :5432 and nothing else ───────────────
+# The peer connects to $WG_ADDR:5432, which is DNATed to the RDS endpoint's
+# CURRENT address (a /32) and masqueraded out of the VPC interface, so RDS sees
+# this instance's private address, which its security group admits. The RDS
+# address is re-resolved every 5 minutes because a single-AZ instance's private
+# IP moves on host replacement; the ruleset is swapped atomically.
+cat > /usr/local/sbin/qontinui-wg-firewall <<EOF
+#!/bin/bash
+set -euo pipefail
+DB_IP=\$(dig +short A '$DB_HOST' | grep -E '^[0-9.]+\$' | head -n1 || true)
+if [ -z "\$DB_IP" ]; then
+  echo "qontinui-wg-firewall: could not resolve $DB_HOST; keeping the current ruleset" >&2
+  exit 1
+fi
+UPLINK=\$(ip -4 route show default | awk '{print \$5; exit}')
+nft -f - <<NFT
+table inet qontinui_wg
+delete table inet qontinui_wg
+table inet qontinui_wg {
+  chain input {
+    type filter hook input priority filter; policy accept;
+    # Nothing on the host itself is offered to the peer.
+    iifname "wg0" ct state established,related accept
+    iifname "wg0" ip protocol icmp accept
+    iifname "wg0" drop
+  }
+  chain forward {
+    type filter hook forward priority filter; policy drop;
+    tcp flags syn tcp option maxseg size set rt mtu
+    ct state established,related accept
+    iifname "wg0" oifname "\$UPLINK" ip saddr $PEER_ADDR ip daddr \$DB_IP tcp dport 5432 ct status dnat accept
+  }
+  chain prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+    iifname "wg0" ip saddr $PEER_ADDR ip daddr $WG_ADDR tcp dport 5432 dnat ip to \$DB_IP:5432
+  }
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    oifname "\$UPLINK" ip saddr $PEER_ADDR ip daddr \$DB_IP tcp dport 5432 masquerade
+  }
+}
+NFT
+EOF
+chmod 0755 /usr/local/sbin/qontinui-wg-firewall
+
+# ─── Publishing the PUBLIC key: the EC2 console output ───────────────────
+# Readable with ec2:GetConsoleOutput and no secret:
+#   aws ec2 get-console-output --instance-id <id> --latest --output text \
+#     | grep QONTINUI_WG_PUBLIC_KEY
+# Re-printed hourly so it is always inside the latest console buffer.
+cat > /usr/local/sbin/qontinui-wg-publish-key <<'EOF'
+#!/bin/bash
+echo "QONTINUI_WG_PUBLIC_KEY=$(cat /etc/wireguard/public.key)" > /dev/console
+EOF
+chmod 0755 /usr/local/sbin/qontinui-wg-publish-key
+
+cat > /etc/systemd/system/qontinui-wg-firewall.service <<'EOF'
+[Unit]
+Description=Qontinui replication tunnel: peer-to-RDS NAT ruleset
+After=network-online.target wg-quick@wg0.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/qontinui-wg-firewall
+EOF
+cat > /etc/systemd/system/qontinui-wg-firewall.timer <<'EOF'
+[Unit]
+Description=Re-resolve the RDS address for the replication tunnel
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+EOF
+cat > /etc/systemd/system/qontinui-wg-publish-key.service <<'EOF'
+[Unit]
+Description=Print the replication tunnel's WireGuard public key to the console
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/qontinui-wg-publish-key
+EOF
+cat > /etc/systemd/system/qontinui-wg-publish-key.timer <<'EOF'
+[Unit]
+Description=Re-print the replication tunnel's public key hourly
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1h
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now wg-quick@wg0.service
+/usr/local/sbin/qontinui-wg-firewall || true
+systemctl enable --now qontinui-wg-firewall.timer qontinui-wg-publish-key.timer
+/usr/local/sbin/qontinui-wg-publish-key
+echo "qontinui-wg-setup: done"

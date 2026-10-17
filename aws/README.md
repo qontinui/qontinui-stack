@@ -49,6 +49,8 @@ aws/
    ├─ network/                       (VPC, subnets, SGs)
    ├─ postgres/                      (RDS + parameter group + secrets)
    ├─ redis/                         (ElastiCache replication group)
+   ├─ replication-tunnel-wireguard/  (WireGuard EC2 tunnel for the off-AWS
+   │                                  logical replica; disabled by default)
    ├─ blob/                          (S3 bucket + IAM policy)
    ├─ coord/                         (ECS Fargate service for qontinui-coord)
    ├─ replication-tunnel/            (Tailscale subnet router for the off-AWS
