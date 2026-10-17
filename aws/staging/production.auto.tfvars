@@ -17,3 +17,10 @@
 # startup — see aws/staging/variables.tf). An address, not a credential; it is
 # already committed verbatim in terraform.tfvars.example in this public repo.
 first_superuser_email = "josh@qontinui.io"
+
+# Phase 1c of plan 2026-10-15-coord-and-web-data-move-off-aws-by-logical-replication
+# (decision D13): bring the hand-built NATS JetStream stack under module.nats.
+# This is the committed flip that aws/staging/nats-imports.tf requires, and it
+# lands together with the gated targeted import apply. It must STAY true: false
+# would plan the destruction of the NATS stack (see nats-imports.tf).
+nats_under_code = true
