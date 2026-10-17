@@ -17,3 +17,10 @@
 # startup — see aws/staging/variables.tf). An address, not a credential; it is
 # already committed verbatim in terraform.tfvars.example in this public repo.
 first_superuser_email = "josh@qontinui.io"
+
+# The tenant that owns THIS account's bill (047719635665 is personal-jspinak's,
+# per policy aws-account-is-per-tenant): the only tenant qontinui-web's AWS Cost
+# Explorer task-role arm serves. A tenant id, not a credential. Copying this
+# root to a new environment? Change it — leaving it shows this account's bill to
+# this operator's tenant.
+spend_aws_task_role_tenant_id = "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a"

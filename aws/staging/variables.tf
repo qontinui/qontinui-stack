@@ -355,3 +355,13 @@ variable "session_output_cold_ttl_days" {
   type        = number
   default     = 90
 }
+
+variable "spend_aws_task_role_tenant_id" {
+  description = "The ONE qontinui tenant that owns THIS AWS account's bill, and so the only tenant the web backend's AWS Cost Explorer task-role arm serves (plan 2026-10-03-provider-reported-spend-collection-alerts-and-mobile Phase 8; policy aws-account-is-per-tenant). A tenant id, not a credential. DEFAULTLESS ON PURPOSE, for the same reason as first_superuser_email: a concrete default would hand a copy of this root's bill to this operator's tenant, and an empty one would silently disable the arm. Set in production.auto.tfvars."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", var.spend_aws_task_role_tenant_id))
+    error_message = "spend_aws_task_role_tenant_id must be a lowercase tenant UUID."
+  }
+}

@@ -115,6 +115,16 @@ variable "ses_from_email" {
   description = "Source address for transactional mail (the backend's SMTP_FROM_EMAIL). It MUST be an address under the domain of var.ses_sender_identity_arn: the grant is resource-scoped to that identity, so anything else is AccessDenied by IAM. The backend's own default (noreply@qontinui.com) is not a verified identity in this account, which is why leaving this unset is not an option."
 }
 
+variable "spend_aws_task_role_tenant_id" {
+  type        = string
+  description = "The ONE qontinui tenant the AWS Cost Explorer task-role arm serves (SPEND_AWS_TASK_ROLE_TENANT_ID). This account's bill belongs to that tenant alone (policy aws-account-is-per-tenant). A tenant id, not a credential. Empty disables the arm."
+
+  validation {
+    condition     = var.spend_aws_task_role_tenant_id == "" || can(regex("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", var.spend_aws_task_role_tenant_id))
+    error_message = "spend_aws_task_role_tenant_id must be a lowercase tenant UUID, or empty to disable the Cost Explorer task-role arm."
+  }
+}
+
 # Email address of the bootstrap superuser. qontinui-web's
 # backend/app/db/init_db.py seeds the FIRST superuser at app startup — but only
 # when FIRST_SUPERUSER_EMAIL is set; unset, the seed is inert and a deployed
@@ -427,6 +437,112 @@ resource "aws_iam_role_policy" "task_ecs_exec" {
   policy = data.aws_iam_policy_document.task_ecs_exec.json
 }
 
+# Provider-reported spend: the per-tenant credential vault (plan
+# 2026-10-03-provider-reported-spend-collection-alerts-and-mobile Phase 7).
+# The "Link account" form on /overview/financials validates a connector
+# credential with one live provider call and then stores it here, one secret
+# per tenant and connector, named
+#   qontinui/<environment>/web/spend/<tenant_id>/<connector>
+# (backend/app/spend/credentials.py). The backend never returns, logs or puts
+# a value in a database row; it reports only linked / not_linked / error.
+#
+# Named actions only, and the resource is restricted to that one path prefix,
+# so this grant can read or write NO other secret of this account — not the
+# database_url, coord_admin_secret or secret_key above. DeleteSecret is how
+# "Unlink" works (ForceDeleteWithoutRecovery, so a re-link can CreateSecret the
+# same name at once). No TagResource, no ListSecrets, no RestoreSecret: the
+# backend uses none of them. The secrets are encrypted with the account's
+# AWS-managed aws/secretsmanager key, whose key policy already admits use
+# through Secrets Manager by any principal Secrets Manager authorises, so no
+# kms: grant is needed.
+data "aws_caller_identity" "current" {}
+
+data "aws_iam_policy_document" "task_spend_secrets" {
+  statement {
+    sid = "SpendConnectorCredentialVault"
+    actions = [
+      "secretsmanager:GetSecretValue",
+      "secretsmanager:CreateSecret",
+      "secretsmanager:PutSecretValue",
+      "secretsmanager:DescribeSecret",
+      "secretsmanager:DeleteSecret",
+    ]
+    resources = [
+      "arn:aws:secretsmanager:${var.region}:${data.aws_caller_identity.current.account_id}:secret:qontinui/${var.environment}/web/spend/*",
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "task_spend_secrets" {
+  name   = "qontinui-${var.environment}-web-spend-secrets"
+  role   = aws_iam_role.task.id
+  policy = data.aws_iam_policy_document.task_spend_secrets.json
+}
+
+# Provider-reported spend: AWS Cost Explorer (same plan, Phase 8). The
+# aws_cost_explorer connector reads THIS account's daily cost, grouped by
+# service, with ce:GetCostAndUsage — and, for other tenants' own accounts,
+# assumes their qontinui-spend-* role (second statement).
+#
+# `resources = ["*"]` is the one unavoidable wildcard here: Cost Explorer
+# defines no resource types, so IAM accepts GetCostAndUsage only against "*".
+# The action list is what bounds it: a read of this account's own bill, no
+# budgets, no anomaly monitors, no reservations, no writes.
+#
+# Tenant pin: the backend serves this task-role arm ONLY to the tenant named by
+# SPEND_AWS_TASK_ROLE_TENANT_ID (the task definition's environment, below).
+# Any other tenant's aws_cost_explorer vendor is refused on this arm and must
+# link its own cross-account role (the AssumeTenantSpendReadRoles statement,
+# granted by ITS OWN account's trust policy) — policy aws-account-is-per-tenant.
+#
+# Each request is billed at $0.01; the backend pulls at most twice a day.
+data "aws_iam_policy_document" "task_cost_explorer" {
+  statement {
+    sid = "CostExplorerReadOwnAccountSpend"
+    actions = [
+      "ce:GetCostAndUsage",
+    ]
+    resources = ["*"]
+  }
+
+  # The cross-account arm: a tenant other than the pinned one links a role in
+  # ITS OWN account, and the backend assumes it to read that account's Cost
+  # Explorer. Scoped by NAME to roles called qontinui-spend-* (the backend
+  # refuses any other role ARN), with an ExternalId qontinui issues per tenant
+  # (a confused-deputy guard the tenant's trust policy must require). The
+  # backend also refuses a role in THIS account — the hosting bill is the
+  # pinned tenant's alone. Assuming a role still needs that account's own
+  # trust policy to name this task role.
+  statement {
+    sid = "AssumeTenantSpendReadRoles"
+    actions = [
+      "sts:AssumeRole",
+    ]
+    resources = ["arn:aws:iam::*:role/qontinui-spend-*"]
+
+    # Never a role in THIS account (the hosting bill is the pinned tenant's,
+    # read through the task role itself) — enforced here as well as in code.
+    condition {
+      test     = "StringNotEquals"
+      variable = "aws:ResourceAccount"
+      values   = [data.aws_caller_identity.current.account_id]
+    }
+
+    # Every assume carries an ExternalId (the one qontinui issues per tenant).
+    condition {
+      test     = "Null"
+      variable = "sts:ExternalId"
+      values   = ["false"]
+    }
+  }
+}
+
+resource "aws_iam_role_policy" "task_cost_explorer" {
+  name   = "qontinui-${var.environment}-web-cost-explorer"
+  role   = aws_iam_role.task.id
+  policy = data.aws_iam_policy_document.task_cost_explorer.json
+}
+
 # ─── Task definition ────────────────────────────────────────────────────
 
 resource "aws_ecs_task_definition" "web" {
@@ -488,6 +604,12 @@ resource "aws_ecs_task_definition" "web" {
         # app/main.py startup). Unset, the seed is a no-op. An email ADDRESS,
         # not a credential — deliberately plain `environment`, not `secrets`.
         { name = "FIRST_SUPERUSER_EMAIL", value = var.first_superuser_email },
+        # The ONE tenant the AWS Cost Explorer task-role arm serves (see
+        # task_cost_explorer above). A tenant id, not a credential. Unset or
+        # empty disables the arm. NOTE: the service ignore_changes its task
+        # definition (deploys clone the live def), so on an existing service
+        # this entry is parity only — the live def gains it at activation.
+        { name = "SPEND_AWS_TASK_ROLE_TENANT_ID", value = var.spend_aws_task_role_tenant_id },
       ]
 
       secrets = [
