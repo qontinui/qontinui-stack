@@ -9,6 +9,14 @@ Checks:
 * ``slot``          — the subscription's slot on the publisher: missing,
                       ``wal_status`` ``unreserved``/``lost``, or retained WAL
                       at or over ``retained_wal_alert_bytes`` (2 GB).
+* ``orphan_sync_slots`` — inactive tablesync slots on the publisher
+                      (``pg_<subid>_sync_<relid>_<sysid>``). A subscriber
+                      killed mid-copy leaves them, ``DROP SUBSCRIPTION`` does
+                      not remove them, and they pin WAL like any slot (Phase 0
+                      measured two). Reported with each slot's retained WAL;
+                      never dropped here — dropping a slot is an operator act.
+                      A slot of THIS subscription whose table is still syncing
+                      is not an orphan and is left out.
 * ``apply_lag``     — no apply worker running, or ``now() - latest_end_time``
                       over ``lag_alert_seconds`` (30 min).
 * ``follower``      — halted, an in-progress step older than
@@ -70,6 +78,15 @@ def replica_identity_offenders(pub, publication: str) -> list[str]:
     return [f"{r[0]} (relreplident={r[1]})" for r in rows]
 
 
+def orphan_sync_slots(pub) -> list[tuple[str, str, int]]:
+    """Inactive ``pg_%_sync_%`` slots on the publisher: (slot_name, database, retained WAL bytes or -1)."""
+    rows = pub.rows(
+        "SELECT slot_name, coalesce(database, ''), "
+        "coalesce(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), -1)::bigint::text "
+        "FROM pg_replication_slots WHERE slot_name LIKE 'pg\\_%\\_sync\\_%' AND NOT active ORDER BY 1")
+    return [(r[0], r[1], int(r[2])) for r in rows]
+
+
 class Watchdog:
     def __init__(self, cfg: Config, notifier: Notifier | None = None):
         self.cfg = cfg
@@ -109,6 +126,30 @@ class Watchdog:
         if retained_i >= threshold:
             return Check("slot", "ALERT", text + f" — at or over {threshold / GB:.1f} GB")
         return Check("slot", "OK", text)
+
+    def check_orphan_sync_slots(self) -> Check:
+        orphans = orphan_sync_slots(self.pub)
+        # A tablesync slot of our own subscription for a table that has not
+        # reached 'r'/'s' is a sync in progress (between retries it is briefly
+        # inactive), not an orphan.
+        syncing = {f"pg_{r[0]}_sync_{r[1]}_" for r in self.admin.rows(
+            "SELECT s.oid::text, r.srrelid::text FROM pg_subscription s "
+            "JOIN pg_subscription_rel r ON r.srsubid = s.oid "
+            f"WHERE s.subname = {lit(self.cfg.subscription)} AND r.srsubstate NOT IN ('r', 's')")}
+        orphans = [o for o in orphans if not any(o[0].startswith(p) for p in syncing)]
+        if not orphans:
+            return Check("orphan_sync_slots", "OK", "no inactive tablesync slot on the publisher")
+        parts = [f"{name} (db {db or '?'}, retained "
+                 f"{'UNKNOWN' if retained < 0 else f'{retained} B = {retained / GB:.2f} GB'})"
+                 for name, db, retained in orphans]
+        # Slots retain overlapping WAL, so the oldest one sets what is pinned: report the max, not a sum.
+        pinned = max(r for _, _, r in orphans)
+        return Check("orphan_sync_slots", "ALERT",
+                     f"{len(orphans)} inactive tablesync slot(s) on the publisher pin "
+                     f"{'UNKNOWN' if pinned < 0 else f'{pinned} B'} of WAL: " + ", ".join(parts) +
+                     " — left by a subscriber that died mid-copy; DROP SUBSCRIPTION does not remove them. "
+                     "Not dropped automatically: confirm no live subscription owns one, then "
+                     "pg_drop_replication_slot(<name>) on the publisher")
 
     def check_apply_lag(self) -> Check:
         rows = self.admin.rows(
@@ -244,6 +285,7 @@ class Watchdog:
     def run(self) -> list[Check]:
         checks = [
             self._guard("slot", self.check_slot),
+            self._guard("orphan_sync_slots", self.check_orphan_sync_slots),
             self._guard("apply_lag", self.check_apply_lag),
             self._guard("follower", self.check_follower),
             self._guard("free_space", self.check_free_space),

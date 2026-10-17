@@ -129,6 +129,12 @@ def cmd_partitions(args, cfg) -> int:
     return 0
 
 
+def cmd_partition_parity(args, cfg) -> int:
+    report = partitions.parity(cfg, args.parent or None)
+    print(json.dumps(report, indent=2))
+    return 0 if report["equal"] else 1
+
+
 def cmd_host(args, cfg) -> int:
     if args.action == "render":
         for m in hostcfg.render(cfg, allow_placeholders=args.allow_placeholders):
@@ -225,6 +231,12 @@ def build_parser() -> argparse.ArgumentParser:
     t = sub.add_parser("partitions", help="D9 partition maintenance")
     t.add_argument("action", choices=["run"])
     t.set_defaults(fn=cmd_partitions)
+
+    pp = sub.add_parser("partition-parity",
+                        help="Phase 3 / D9: child partition NAMES per published partitioned table, both sides")
+    pp.add_argument("--parent", action="append", default=[],
+                    help="<schema>.<table>; default: every partitioned root the publication carries")
+    pp.set_defaults(fn=cmd_partition_parity)
 
     h = sub.add_parser("host", help="installer support: render/check managed host files")
     h.add_argument("action", choices=["render", "check", "list", "check-hba-live"])

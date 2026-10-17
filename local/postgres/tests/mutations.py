@@ -214,6 +214,27 @@ MUTATIONS = {
         "offenders = []",
         ["test_ops.WatchdogTest"],
     ),
+    # Orphaned tablesync slots: the watchdog stops reading them.
+    "watchdog-no-orphan-sync-slots": (
+        "lib/qpg/watchdog.py",
+        "orphans = orphan_sync_slots(self.pub)",
+        "orphans = []",
+        ["test_ops.WatchdogTest"],
+    ),
+    # D9: the local lookahead drifts back from lane D's 14 days to 3.
+    "partition-lookahead-3": (
+        "lib/qpg/partitions.py",
+        "DEFAULT_LOOKAHEAD_DAYS = 14",
+        "DEFAULT_LOOKAHEAD_DAYS = 3",
+        ["test_ops.PartitionsTest"],
+    ),
+    # Phase 3 parity: children compared by count instead of by name.
+    "partition-parity-by-count": (
+        "lib/qpg/partitions.py",
+        "    if set(pub_children) != set(sub_children):",
+        "    if len(pub_children) != len(sub_children):",
+        ["test_ops.PartitionParityTest"],
+    ),
     # D4: --check stops asserting who may log in without TLS.
     "hba-check-accepts-any-non-tls": (
         "lib/qpg/hostcfg.py",

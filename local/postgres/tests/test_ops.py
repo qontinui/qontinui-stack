@@ -7,11 +7,12 @@ import http.server
 import json
 import os
 import tempfile
+import configparser
 import threading
 import unittest
 
-from harness import APP, FIXTURES, REPL, Pair, cli, db, env
-from qpg import credential  # harness put the tree under test on sys.path
+from harness import APP, FIXTURES, REPL, SRC, Pair, cli, db, env
+from qpg import credential, partitions  # harness put the tree under test on sys.path
 from qpg.pg import Psql
 
 COORDRLS = os.path.join(FIXTURES, "coordrls_fixture.py")
@@ -189,6 +190,27 @@ class WatchdogTest(unittest.TestCase):
         finally:
             p.pub(APP).execute("DROP TABLE app.no_identity2")
 
+    def test_4_orphan_tablesync_slot_is_reported_never_dropped(self):
+        """Phase 0 4g: a subscriber killed mid-copy leaves inactive pg_<subid>_sync_<relid>_<sysid> slots."""
+        p = self.pair
+        slot = "pg_999999_sync_424242_7000000000000000001"
+        p.pub().execute(f"SELECT pg_create_logical_replication_slot({slot!r}, 'pgoutput')", single_transaction=False)
+        try:
+            res, lines = self.watchdog("--dry-run-notify")
+            self.assertEqual(res.returncode, 1, res.stdout)
+            line = lines["orphan_sync_slots"]
+            self.assertTrue(line.startswith("ALERT"), res.stdout)
+            self.assertIn(slot, line)
+            self.assertRegex(line, slot + r" \(db t_watchdog, retained \d+ B = ")
+            self.assertIn("orphan_sync_slots", res.stderr, "the alert is noticed through the notifier")
+            self.assertEqual(p.pub().scalar(f"SELECT count(*) FROM pg_replication_slots WHERE slot_name = {slot!r}"),
+                             "1", "the watchdog reports an orphan slot; it never drops one")
+        finally:
+            p.pub().execute(f"SELECT pg_drop_replication_slot({slot!r})", single_transaction=False)
+        res, lines = self.watchdog("--dry-run-notify")
+        self.assertNotIn(slot, lines["orphan_sync_slots"], res.stdout)
+        self.assertNotIn(self.pair.sub_name, lines["orphan_sync_slots"], "the live subscription's slot is no orphan")
+
 
 class SeqSyncTest(unittest.TestCase):
     """D6: per-sequence margin, never backwards, and a NULL read is an error."""
@@ -298,6 +320,81 @@ class PartitionsTest(unittest.TestCase):
         self.assertEqual(owners, [[APP]], "children must be owned by the application role (B2)")
         count = p.sub().scalar("SELECT count(*) FROM pg_inherits WHERE inhparent = 'app.parts'::regclass")
         self.assertEqual(count, "3")
+
+    def test_3_default_lookahead_is_lane_ds(self):
+        """D9 "same arguments": unset, the timer passes lane D's 14-day lookahead, not 3 (Phase 0 4e)."""
+        self.assertEqual(partitions.DEFAULT_LOOKAHEAD_DAYS, 14)
+        self.assertEqual(partitions.DEFAULT_RETENTION_DAYS, 14)
+        example = configparser.ConfigParser(interpolation=None)
+        example.read(os.path.join(SRC, "qontinui-pg.conf.example"))
+        self.assertEqual(example.getint("partitions", "lookahead_days"), 14)
+        self.assertEqual(example.getint("partitions", "retention_days"), 14)
+        conf = self.pair.conf + ".nolookahead"
+        with open(self.pair.conf, encoding="utf-8") as fh:
+            text = fh.read().replace("lookahead_days = 2\n", "")
+        with open(conf, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        res = cli(conf, "partitions", "run")
+        self.assertEqual(res.stdout.strip(), "ran", res.stderr)
+        self.assertIn('"lookahead_days": 14', res.stderr)
+        count = self.pair.sub().scalar("SELECT count(*) FROM pg_inherits WHERE inhparent = 'app.parts'::regclass")
+        self.assertEqual(count, "15", "today plus 14 days ahead")
+
+
+class PartitionParityTest(unittest.TestCase):
+    """D9 / Phase 3: partition parity compares child NAMES, so equal counts over different sets are RED."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.pair = Pair("t_partparity")
+        cls.pair.setup()
+        ddl = """
+            CREATE SCHEMA app_parts;
+            CREATE TABLE app.tr (day date NOT NULL, v int) PARTITION BY RANGE (day);
+            CREATE TABLE app_parts.tr_20260101 PARTITION OF app.tr FOR VALUES FROM ('2026-01-01') TO ('2026-01-02');
+            CREATE TABLE app_parts.tr_20260102 PARTITION OF app.tr FOR VALUES FROM ('2026-01-02') TO ('2026-01-03');
+        """
+        cls.pair.pub(APP).execute(ddl)
+        cls.pair.sub(APP).execute(ddl)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.pair.teardown()
+
+    def parity(self, *args):
+        res = cli(self.pair.conf, "partition-parity", *args)
+        return res, json.loads(res.stdout or "{}")
+
+    def test_1_same_children_is_equal(self):
+        res, report = self.parity()
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        parents = {c["parent"] for c in report["checked"]}
+        self.assertEqual(parents, {"app.events", "app.tr"}, "every published partitioned root is checked")
+
+    def test_2_equal_counts_different_names_is_red(self):
+        p = self.pair
+        # The publisher's sweep dropped the oldest child and made the next one;
+        # neither DDL replicates, so the subscriber still holds the old set.
+        p.pub(APP).execute("DROP TABLE app_parts.tr_20260101; CREATE TABLE app_parts.tr_20260103 PARTITION OF app.tr "
+                           "FOR VALUES FROM ('2026-01-03') TO ('2026-01-04')")
+        try:
+            res, report = self.parity()
+            self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+            diff = [d for d in report["differences"] if d["parent"] == "app.tr"]
+            self.assertEqual(len(diff), 1, res.stdout)
+            self.assertEqual(diff[0]["count_publisher"], diff[0]["count_subscriber"])
+            self.assertEqual(diff[0]["only_on_publisher"], ["app_parts.tr_20260103"])
+            self.assertEqual(diff[0]["only_on_subscriber"], ["app_parts.tr_20260101"])
+            res, report = self.parity("--parent", "app.events")
+            self.assertEqual(res.returncode, 0, "an explicit --parent narrows the check")
+        finally:
+            p.pub(APP).execute("DROP TABLE app_parts.tr_20260103; CREATE TABLE app_parts.tr_20260101 PARTITION OF "
+                               "app.tr FOR VALUES FROM ('2026-01-01') TO ('2026-01-02')")
+
+    def test_3_parent_absent_on_one_side_is_red(self):
+        res, report = self.parity("--parent", "app.no_such_parent")
+        self.assertEqual(res.returncode, 1, res.stdout)
+        self.assertEqual(report["differences"], [{"parent": "app.no_such_parent", "absent_on": "publisher"}])
 
 
 class CredentialTest(unittest.TestCase):

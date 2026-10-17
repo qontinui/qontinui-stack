@@ -99,8 +99,10 @@ reverse_subscription =
 # D9: on once lane D's conversion has replayed here; off again at cutover.
 enabled = false
 function = coord.test_results_partition_maintenance
+# Both must equal coord's own sweep (D9 "same arguments"): COORD_TEST_RESULTS_RETENTION_DAYS and
+# COORD_TEST_RESULTS_PARTITION_LOOKAHEAD_DAYS, 14 and 14 unless that coord overrides them.
 retention_days = 14
-lookahead_days = 3
+lookahead_days = 14
 on_calendar = hourly
 require_function = false
 
