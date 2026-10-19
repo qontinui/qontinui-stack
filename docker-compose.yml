@@ -161,6 +161,11 @@ services:
       - 1gb
       - --maxmemory-policy
       - allkeys-lru
+      # Parity with AWS (module.redis parameter group): coord's
+      # claims_expiry_watcher subscribes to __keyevent@0__:expired, which
+      # needs expired-event notifications ("Ex").
+      - --notify-keyspace-events
+      - Ex
       - --requirepass
       - ${REDIS_PASSWORD:-qontinui_dev_redis}
     healthcheck:
