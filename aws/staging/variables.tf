@@ -205,6 +205,14 @@ variable "budget_monthly_limit" {
   default     = "100"
 }
 
+# ─── Operator pager ─────────────────────────────────────────────────────
+
+variable "operator_pager_enabled" {
+  description = "Off-switch for the operator pager: false removes the relay's subscription to qontinui-<env>-operator-pager, so nothing published there reaches the operator. Publishers, alarms and rules stay in place."
+  type        = bool
+  default     = true
+}
+
 
 # ─── Postgres ───────────────────────────────────────────────────────────
 

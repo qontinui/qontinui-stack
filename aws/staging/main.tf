@@ -384,6 +384,8 @@ module "cost_control" {
   environment   = var.environment
   monthly_limit = var.budget_monthly_limit
   alert_email   = data.aws_ssm_parameter.budget_alert_email.insecure_value
+
+  operator_pager_relay_role_arn = module.operator_pager.relay_role_arn
 }
 
 # ─── Observability (CloudWatch alarms for coord) ────────────────────────
@@ -398,6 +400,33 @@ module "observability" {
   coord_cluster_name   = module.coord.cluster_name
   coord_service_name   = module.coord.service_name
   coord_log_group_name = module.coord.log_group_name
+
+  postgres_instance_identifier = module.postgres.identifier
+}
+
+# ─── Operator pager (five conditions, one AWS-native path) ───────────────
+# One SNS topic every pager source publishes to (CloudWatch composites,
+# EventBridge rules, coord's task role, coord's deploy role) and one relay
+# Lambda, its only subscriber. Pages reach the email topic under a [PAGE]
+# prefix until the operator's vendor decision (plan
+# 2026-10-14-coord-pages-the-operator-for-five-conditions-and-names-the-agent-
+# fixing-each, Phases 1-2). Off-switch: operator_pager_enabled = false removes
+# the relay's subscription.
+
+module "operator_pager" {
+  source = "../modules/operator-pager"
+
+  environment     = var.environment
+  enabled         = var.operator_pager_enabled
+  email_topic_arn = module.cost_control.sns_topic_arn
+
+  coord_task_role_arn = module.coord.task_role_arn
+  coord_cluster_name  = module.coord.cluster_name
+  coord_cluster_arn   = module.coord.cluster_arn
+  coord_service_name  = module.coord.service_name
+  web_service_name    = module.web.service_name
+  alb_arn_suffix      = module.tunnel.alb_arn_suffix
+  coord_tg_arn_suffix = module.coord.target_group_arn_suffix
 
   postgres_instance_identifier = module.postgres.identifier
 }

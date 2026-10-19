@@ -33,6 +33,11 @@ variable "alert_threshold_percent" {
   type    = number
   default = 80
 }
+variable "operator_pager_relay_role_arn" {
+  type        = string
+  default     = null
+  description = "The operator pager relay's execution role (modules/operator-pager). When set, the topic policy below admits it as a fourth publisher: its sns_forward adapter and vendor fallback deliver pages to this email topic. null omits the statement. From module.operator_pager.relay_role_arn."
+}
 
 resource "aws_sns_topic" "budget" {
   name = "qontinui-${var.environment}-budget-alerts"
@@ -51,7 +56,8 @@ data "aws_caller_identity" "current" {}
 data "aws_region" "current" {}
 data "aws_partition" "current" {}
 
-# This topic carries THREE publishers, so the policy needs THREE statements.
+# This topic carries THREE publishers, so the policy needs THREE statements
+# (a fourth, the operator pager relay, when operator_pager_relay_role_arn is set).
 # Setting an explicit aws_sns_topic_policy REPLACES SNS's default policy
 # (which would otherwise allow same-account principals to publish), so every
 # publisher must be granted EXPLICITLY here or its publish is silently denied.
@@ -123,6 +129,26 @@ data "aws_iam_policy_document" "budget_sns" {
       test     = "ArnLike"
       variable = "aws:SourceArn"
       values   = ["arn:${data.aws_partition.current.partition}:rds:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:db:*"]
+    }
+  }
+
+  #   4. The operator pager relay (modules/operator-pager). Its sns_forward
+  #      adapter forwards every page here under a [PAGE] subject prefix, and a
+  #      failed vendor adapter falls back here (plan
+  #      2026-10-14-coord-pages-the-operator-for-five-conditions-and-names-the-
+  #      agent-fixing-each, D2). Without this statement the role's own
+  #      sns:Publish grant is not enough: this policy replaced SNS's default.
+  dynamic "statement" {
+    for_each = var.operator_pager_relay_role_arn == null ? [] : [var.operator_pager_relay_role_arn]
+    content {
+      sid       = "AllowOperatorPagerRelayPublish"
+      actions   = ["SNS:Publish"]
+      effect    = "Allow"
+      resources = [aws_sns_topic.budget.arn]
+      principals {
+        type        = "AWS"
+        identifiers = [statement.value]
+      }
     }
   }
 }
