@@ -2,7 +2,7 @@
 #
 # Three pager alarms carry actions, and only these three:
 #   * pager-coord-crash-loop  — composite (plan D11)
-#   * pager-rds-free-storage  — metric alarm (plan D10)
+#   * pager-rds-free-storage  — composite (plan D10)
 #   * pager-rds-saturation    — composite (plan D9)
 # Every CHILD alarm carries NO actions, so one episode produces one page: the
 # composite notifies, its children do not.
@@ -14,8 +14,16 @@
 # on a metric nothing ever publishes, `treat_missing_data = notBreaching`, so its
 # real state is OK. A drill sets that child to ALARM ("DRILL <id>"); it returns
 # to OK within seconds and the composite follows. The relay reads the triggering
-# child from the composite's notification to tell a drill from a real page.
-# pager-rds-free-storage is a metric alarm and is drilled directly.
+# child from the composite's notification to tell a drill from a real page, and
+# the drill id from that child's history. It suppresses the composite's return
+# to OK at the end of a drill.
+#
+# pager-rds-free-storage is a composite too, a deliberate departure from the
+# plan's "metric alarm, drilled directly". A metric alarm set to ALARM returns
+# to OK with CloudWatch's own threshold reason. Its OK action then sends a
+# "Resolved: Database storage or IOPS is at risk" page that is indistinguishable
+# from a real recovery. Wrapping it like the others gives one drill mechanism
+# for all three and keeps the paged name (the signal Phase 7 counts) unchanged.
 #
 # Missing data renders UNKNOWN, never ALARM (verification-and-evidence
 # an-unknown-input-must-not-fire-a-detector): every metric child watching a
@@ -136,9 +144,9 @@ resource "aws_cloudwatch_composite_alarm" "coord_crash_loop" {
 # The pager copy of observability's rds-free-storage-low: < 5 GB for 3 x 5 min.
 # Never below 5 GB in 30 days; at ~1.56 GB/day, 5 GB is ~3 days of runway.
 
-resource "aws_cloudwatch_metric_alarm" "rds_free_storage" {
-  alarm_name          = local.alarm_free_storage
-  alarm_description   = "PAGER (storage_or_iops): coord RDS FreeStorageSpace < 5 GB (Minimum) for 15 min — storage autoscaling did not rescue it. RDS storage autoscaling grows the volume up to its maximum; agent dispatch follows from coord."
+resource "aws_cloudwatch_metric_alarm" "rds_free_storage_low" {
+  alarm_name          = "${local.pager_name_prefix}rds-free-storage-low"
+  alarm_description   = "Child of ${local.alarm_free_storage} (no actions): coord RDS FreeStorageSpace < 5 GB (Minimum) for 15 min."
   namespace           = "AWS/RDS"
   metric_name         = "FreeStorageSpace"
   statistic           = "Minimum"
@@ -148,8 +156,30 @@ resource "aws_cloudwatch_metric_alarm" "rds_free_storage" {
   comparison_operator = "LessThanThreshold"
   treat_missing_data  = "missing"
   dimensions          = { DBInstanceIdentifier = var.postgres_instance_identifier }
-  alarm_actions       = [aws_sns_topic_policy.pager.arn]
-  ok_actions          = [aws_sns_topic_policy.pager.arn]
+}
+
+resource "aws_cloudwatch_metric_alarm" "rds_free_storage_drill" {
+  alarm_name          = local.alarm_free_storage_drill
+  alarm_description   = "Drill child of ${local.alarm_free_storage} (no actions). Watches a metric nothing publishes, so its real state is OK. scripts/operator-pager-drill.sh sets it to ALARM with reason 'DRILL <id>'; never set-alarm-state the composite itself."
+  namespace           = local.drill_metric_namespace
+  metric_name         = local.drill_metric_name
+  statistic           = "Maximum"
+  period              = 60
+  evaluation_periods  = 1
+  threshold           = 1
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+}
+
+resource "aws_cloudwatch_composite_alarm" "rds_free_storage" {
+  alarm_name        = local.alarm_free_storage
+  alarm_description = "PAGER (storage_or_iops): coord RDS FreeStorageSpace < 5 GB (Minimum) for 15 min — storage autoscaling did not rescue it. RDS storage autoscaling grows the volume up to its maximum; agent dispatch follows from coord."
+  alarm_rule = join(" OR ", [
+    "ALARM(\"${aws_cloudwatch_metric_alarm.rds_free_storage_low.alarm_name}\")",
+    "ALARM(\"${aws_cloudwatch_metric_alarm.rds_free_storage_drill.alarm_name}\")",
+  ])
+  alarm_actions = [aws_sns_topic_policy.pager.arn]
+  ok_actions    = [aws_sns_topic_policy.pager.arn]
 }
 
 # ─── pager-rds-saturation (plan D9) ─────────────────────────────────────

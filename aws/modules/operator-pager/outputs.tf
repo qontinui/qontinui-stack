@@ -12,7 +12,7 @@ output "relay_function_name" { value = aws_lambda_function.relay.function_name }
 output "pager_alarm_names" {
   value = [
     aws_cloudwatch_composite_alarm.coord_crash_loop.alarm_name,
-    aws_cloudwatch_metric_alarm.rds_free_storage.alarm_name,
+    aws_cloudwatch_composite_alarm.rds_free_storage.alarm_name,
     aws_cloudwatch_composite_alarm.rds_saturation.alarm_name,
   ]
 }

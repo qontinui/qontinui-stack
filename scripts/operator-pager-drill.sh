@@ -13,12 +13,14 @@
 #   relay   (Phase 1) publish one `drill` message per condition straight to
 #           qontinui-<env>-operator-pager, then read the relay's records for the
 #           drill id. Exercises topic -> relay -> adapter.
-#   alarms  (Phase 2) set the two `-drill` CHILD alarms and pager-rds-free-storage
-#           to ALARM with reason "DRILL <id>". NEVER a composite: SetAlarmState on
-#           a composite "is not guaranteed to return to its actual state", and a
-#           composite left in ALARM sends no action for a real incident (D16).
-#           Then read the relay records and wait until every pager alarm,
-#           composites included, is back in the state it had before the drill.
+#   alarms  (Phase 2) set the three `-drill` CHILD alarms to ALARM with reason
+#           "DRILL <id>". NEVER a composite: SetAlarmState on a composite "is
+#           not guaranteed to return to its actual state", and a composite left
+#           in ALARM sends no action for a real incident (D16). The relay reads
+#           <id> from the drill child's history, so the records are matched on
+#           THIS drill's id, never on "any drill". Then wait until every pager
+#           alarm, composites included, is back in its pre-drill state; each
+#           composite's return to OK is suppressed by the relay (no page).
 #   rules   (Phase 2) put `qontinui.drill` events matching the deploy-failed and
 #           RDS-storage rules (relay records expected), and ONE task-exit event
 #           matching the crash-loop rule (it must land in the task-exits log
@@ -76,9 +78,8 @@ PREFIX="qontinui-${ENVIRONMENT}"
 PAGER="${PREFIX}-pager-"
 RELAY_LOG="/aws/lambda/${PREFIX}-operator-pager-relay"
 EXITS_LOG="/aws/events/${PREFIX}-coord-task-exits"
-COMPOSITES=("${PAGER}coord-crash-loop" "${PAGER}rds-saturation")
-DRILL_CHILDREN=("${PAGER}coord-crash-loop-drill" "${PAGER}rds-saturation-drill")
-FREE_STORAGE="${PAGER}rds-free-storage"
+COMPOSITES=("${PAGER}coord-crash-loop" "${PAGER}rds-free-storage" "${PAGER}rds-saturation")
+DRILL_CHILDREN=("${PAGER}coord-crash-loop-drill" "${PAGER}rds-free-storage-drill" "${PAGER}rds-saturation-drill")
 
 aws_() { aws --region "$REGION" --output json "$@"; }
 
@@ -102,6 +103,16 @@ fi
 TOPIC_ARN="arn:aws:sns:${REGION}:${ACCOUNT}:${PREFIX}-operator-pager"
 CLUSTER_ARN="arn:aws:ecs:${REGION}:${ACCOUNT}:cluster/${PREFIX}"
 COORD_SERVICE_ARN="arn:aws:ecs:${REGION}:${ACCOUNT}:service/${PREFIX}/coord"
+if [ "$DRY_RUN" = 0 ]; then
+  # Read the real ARNs rather than trusting the naming convention: a drill event
+  # that does not match the rule's clusterArn/resources would read as a broken
+  # rule. Read-only.
+  CLUSTER_ARN="$(aws_ ecs describe-clusters --clusters "$PREFIX" --query 'clusters[0].clusterArn' --output text)"
+  COORD_SERVICE_ARN="$(aws_ ecs describe-services --cluster "$PREFIX" --services coord --query 'services[0].serviceArn' --output text)"
+  case "$CLUSTER_ARN$COORD_SERVICE_ARN" in
+    *None*|"") echo "could not resolve the coord cluster/service ARNs" >&2; exit 1 ;;
+  esac
+fi
 START_MS="$(( $(date -u +%s) * 1000 ))"
 echo "drill ${DRILL_ID}: target=${TARGET} env=${ENVIRONMENT} account=${ACCOUNT} region=${REGION}"
 
@@ -177,17 +188,17 @@ alarm_states() {
 }
 
 drill_alarms() {
-  echo "== alarms: drill children + ${FREE_STORAGE} (never a composite)"
+  echo "== alarms: the three drill children (never a composite)"
   local before=""
   if [ "$DRY_RUN" = 0 ]; then before="$(alarm_states | sort)"; echo "pre-drill states:"; echo "$before"; fi
-  for a in "${DRILL_CHILDREN[@]}" "$FREE_STORAGE"; do
+  for a in "${DRILL_CHILDREN[@]}"; do
     run aws_ cloudwatch set-alarm-state --alarm-name "$a" --state-value ALARM --state-reason "DRILL $DRILL_ID"
   done
   local names
-  names="$(printf '"%s",' "${COMPOSITES[@]}" "$FREE_STORAGE")"
-  if wait_for_records "{ \$.drill IS TRUE && \$.kind = \"drill\" }" \
+  names="$(printf '"%s",' "${COMPOSITES[@]}")"
+  if wait_for_records "{ \$.drill_id = \"$DRILL_ID\" && \$.kind = \"drill\" && \$.origin = \"cloudwatch\" }" \
     "{r[\"signal\"] for r in recs if r.get(\"outcome\") == \"accepted\"} >= {${names%,}}" \
-    "relay accepted a drill page from both composites and the free-storage alarm"; then
+    "relay accepted a drill page carrying this drill's id from all three composites"; then
     DRILLED_CONDITIONS+=(leader_crash_loop storage_or_iops)
   else
     FAILED=1
@@ -207,7 +218,7 @@ drill_alarms() {
     sleep 15
   done
   echo "alarm history since the drill (ALARM -> OK transitions):"
-  for a in "${DRILL_CHILDREN[@]}" "$FREE_STORAGE" "${COMPOSITES[@]}"; do
+  for a in "${DRILL_CHILDREN[@]}" "${COMPOSITES[@]}"; do
     aws_ cloudwatch describe-alarm-history --alarm-name "$a" --history-item-type StateUpdate \
       --start-date "$(date -u -d "@$(( START_MS / 1000 ))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT00:00:00Z)" \
       --query 'AlarmHistoryItems[].[AlarmName,Timestamp,HistorySummary]' --output text || true

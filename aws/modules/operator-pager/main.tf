@@ -55,17 +55,22 @@ locals {
 
   # Alarm names, as locals so the relay's map does not depend on the alarm
   # resources (alarms.tf references these same names).
-  alarm_crash_loop       = "${local.pager_name_prefix}coord-crash-loop"
-  alarm_crash_loop_drill = "${local.pager_name_prefix}coord-crash-loop-drill"
-  alarm_free_storage     = "${local.pager_name_prefix}rds-free-storage"
-  alarm_saturation       = "${local.pager_name_prefix}rds-saturation"
-  alarm_saturation_drill = "${local.pager_name_prefix}rds-saturation-drill"
+  alarm_crash_loop         = "${local.pager_name_prefix}coord-crash-loop"
+  alarm_crash_loop_drill   = "${local.pager_name_prefix}coord-crash-loop-drill"
+  alarm_free_storage       = "${local.pager_name_prefix}rds-free-storage"
+  alarm_free_storage_drill = "${local.pager_name_prefix}rds-free-storage-drill"
+  alarm_saturation         = "${local.pager_name_prefix}rds-saturation"
+  alarm_saturation_drill   = "${local.pager_name_prefix}rds-saturation-drill"
+
+  # The three drill children: the only alarms a drill ever sets, and the only
+  # ones the relay may read history from.
+  drill_children = [local.alarm_crash_loop_drill, local.alarm_free_storage_drill, local.alarm_saturation_drill]
 
   # The relay's alarm → condition map (handler.py PAGER_ALARM_MAP). Only the
-  # alarms that carry ACTIONS are here: the two composites and the free-storage
-  # metric alarm (child alarms carry no actions, so they never notify). An alarm
-  # missing from this map is DROPPED by the relay. `drill_child` marks a
-  # composite and names its dedicated drill child (plan D16).
+  # alarms that carry ACTIONS are here, and all three are composites (child
+  # alarms carry no actions, so they never notify). An alarm missing from this
+  # map is DROPPED by the relay. `drill_child` names each composite's dedicated
+  # drill child (plan D16).
   pager_alarm_map = {
     (local.alarm_crash_loop) = {
       condition   = "leader_crash_loop"
@@ -75,6 +80,7 @@ locals {
     (local.alarm_free_storage) = {
       condition   = "storage_or_iops"
       remediation = "RDS storage autoscaling grows the volume up to its maximum allocated storage"
+      drill_child = local.alarm_free_storage_drill
     }
     (local.alarm_saturation) = {
       condition   = "storage_or_iops"
@@ -235,9 +241,12 @@ resource "aws_iam_role_policy_attachment" "relay_logs" {
 #     principals through SSM (plan D4). A customer-managed key would need a
 #     Decrypt grant conditioned on kms:EncryptionContext:PARAMETER_ARN;
 #   * write to the dead-letter queue.
-# No cloudwatch:DescribeAlarms: composite notifications name their triggering
-# child, which is how the relay tells a drill from a real page (plan D16). Add
-# it only if the captured real notification does not.
+#   * read the state history of the three DRILL CHILDREN only
+#     (cloudwatch:DescribeAlarmHistory). A composite's notification names the
+#     child that moved it, but the drill id lives only in that child's own state
+#     reason ("DRILL <id>"). The same read decides drill-or-real when a
+#     notification names no child, and it is what lets the relay suppress the
+#     composite's return to OK at the end of a drill.
 data "aws_iam_policy_document" "relay" {
   statement {
     sid       = "ForwardToEmailTopic"
@@ -249,6 +258,12 @@ data "aws_iam_policy_document" "relay" {
     sid       = "ReadOperatorStagedVendorKey"
     actions   = ["ssm:GetParameter"]
     resources = ["arn:${local.part}:ssm:${var.operator_pager_ssm_region}:${local.account}:parameter/qontinui/ops/operator-pager/*"]
+  }
+
+  statement {
+    sid       = "ReadDrillChildHistory"
+    actions   = ["cloudwatch:DescribeAlarmHistory"]
+    resources = [for n in local.drill_children : "arn:${local.part}:cloudwatch:${local.region}:${local.account}:alarm:${n}"]
   }
 
   statement {
@@ -278,8 +293,11 @@ resource "aws_lambda_function" "relay" {
   runtime       = "python3.12"
   handler       = "handler.handler"
   # A 5xx is retried once after >= 5 s, then the fallback publishes: well
-  # inside 30 s even with both SNS calls at their 10 s read timeout.
-  timeout     = 30
+  # Worst case, every AWS call at its 3 s connect + 7 s read timeout: one
+  # drill-history read, the adapter call, its one retry after 5 s, and the
+  # fallback = 45 s (handler.py boto_config). 90 s leaves room for a cold start
+  # and is pinned by test_lambda_timeout_covers_the_worst_case_delivery.
+  timeout     = 90
   memory_size = 128
 
   filename         = data.archive_file.relay.output_path
@@ -303,6 +321,16 @@ resource "aws_lambda_function" "relay" {
     aws_iam_role_policy.relay,
     aws_cloudwatch_log_group.relay,
   ]
+}
+
+# SNS invokes the relay ASYNCHRONOUSLY, and Lambda retries a failed async
+# invocation twice by default. The relay has its own retry rule (4xx never, 5xx
+# once), so Lambda's would multiply it: a 4xx sent 3 times, a 5xx tried 6, and
+# three records for one message. Off: a failed invocation goes straight to the
+# dead-letter queue (dead_letter_config above) and counts as a Lambda error.
+resource "aws_lambda_function_event_invoke_config" "relay" {
+  function_name          = aws_lambda_function.relay.function_name
+  maximum_retry_attempts = 0
 }
 
 resource "aws_lambda_permission" "sns_invoke" {
@@ -332,7 +360,7 @@ resource "aws_sns_topic_subscription" "relay" {
 
 resource "aws_cloudwatch_metric_alarm" "relay_errors" {
   alarm_name          = "${local.prefix}-operator-pager-relay-errors"
-  alarm_description   = "Operator pager relay Lambda errored (>= 1 in 5 min). A page may not have been delivered; Lambda retries async invocations twice, then the message lands in the operator-pager DLQ. Read the relay log group for the record."
+  alarm_description   = "Operator pager relay Lambda errored (>= 1 in 5 min). A page may not have been delivered: Lambda's async retries are off (maximum_retry_attempts = 0), so the message is already in the operator-pager DLQ. Read the relay log group for the record."
   namespace           = "AWS/Lambda"
   metric_name         = "Errors"
   statistic           = "Sum"
@@ -375,6 +403,7 @@ resource "aws_cloudwatch_metric_alarm" "relay_dropped" {
   treat_missing_data  = "notBreaching"
   dimensions          = { Environment = var.environment }
   alarm_actions       = [var.email_topic_arn]
+  ok_actions          = [var.email_topic_arn]
 }
 
 resource "aws_cloudwatch_metric_alarm" "relay_fallback" {
@@ -390,4 +419,5 @@ resource "aws_cloudwatch_metric_alarm" "relay_fallback" {
   treat_missing_data  = "notBreaching"
   dimensions          = { Environment = var.environment }
   alarm_actions       = [var.email_topic_arn]
+  ok_actions          = [var.email_topic_arn]
 }

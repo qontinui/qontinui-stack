@@ -18,10 +18,12 @@ What it does, per SNS record:
    :data:`CONDITIONS` is DROPPED. A new condition pages only after a deliberate
    edit of that tuple (plan D7).
 
-3. **Decide drill or real** (plan D16): a metric alarm whose reason starts with
-   ``DRILL <id>``; a composite alarm whose triggering child is its ``-drill``
-   child; an EventBridge event with ``source = qontinui.drill``; or a
-   ``page_version`` message whose kind is ``drill``/``drill_summary``.
+3. **Decide drill or real** (plan D16): a composite alarm whose triggering
+   child is its ``-drill`` child (the drill id is read from that child's
+   history, and the composite's return to OK at the end of a drill is
+   suppressed, never paged); an EventBridge event with
+   ``source = qontinui.drill``; or a ``page_version`` message whose kind is
+   ``drill``/``drill_summary``. Every pager alarm is a composite.
 
 4. **Render** one title (<= 250 chars) and body (<= 1,024 chars) that says what
    happened and which remediation is in force, and ends with
@@ -52,7 +54,7 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Optional
 
 # ─── The closed set ──────────────────────────────────────────────────────
@@ -95,6 +97,7 @@ METRIC_NAMES: tuple[str, ...] = (
 
 AWS_AGENT_LINE = "Agent dispatch follows from coord; the agent state is not known yet."
 WITHHELD_SOURCE_TEXT = "(source text withheld: it was worded as a request)"
+WITHHELD_FIELD = "(withheld)"
 
 # A page informs; it never asks (plan D16, decision_record
 # operational-work-is-autonomous). Word-bounded so "responder" and
@@ -151,7 +154,13 @@ class Page:
 
 @dataclass
 class Drop:
-    """A message the relay refuses to deliver, and why."""
+    """A message the relay does not deliver, and why.
+
+    ``suppressed`` marks the one expected non-delivery: a composite returning to
+    OK because its drill child did. It is not an error, so it emits no
+    ``Dropped`` metric; every other Drop is something that should not have
+    reached the pager.
+    """
 
     reason: str
     condition: Optional[str] = None
@@ -161,6 +170,13 @@ class Drop:
     signal: str = ""
     drill_id: Optional[str] = None
     alert_ids: list[str] = field(default_factory=list)
+    suppressed: bool = False
+
+
+# Returns the recent state-history items of one alarm (DescribeAlarmHistory's
+# `AlarmHistoryItems` shape) around a state-change time, or None when the read
+# failed.
+DrillHistory = Callable[[str, str], Optional[list]]
 
 
 def load_alarm_map(raw: Optional[str]) -> dict[str, dict[str, Any]]:
@@ -179,7 +195,11 @@ def load_alarm_map(raw: Optional[str]) -> dict[str, dict[str, Any]]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def parse_message(message: str, alarm_map: dict[str, dict[str, Any]]) -> "Page | Drop":
+def parse_message(
+    message: str,
+    alarm_map: dict[str, dict[str, Any]],
+    drill_history: Optional[DrillHistory] = None,
+) -> "Page | Drop":
     """Turn one SNS ``Message`` string into a :class:`Page` or a :class:`Drop`."""
     try:
         doc = json.loads(message)
@@ -188,7 +208,7 @@ def parse_message(message: str, alarm_map: dict[str, dict[str, Any]]) -> "Page |
     if not isinstance(doc, dict):
         return Drop(reason="unparseable")
     if "AlarmName" in doc and "NewStateValue" in doc:
-        return parse_alarm(doc, alarm_map)
+        return parse_alarm(doc, alarm_map, drill_history)
     if doc.get("page_version") == 1:
         return parse_page_v1(doc)
     return Drop(reason="unparseable")
@@ -218,7 +238,39 @@ def triggering_children(doc: dict[str, Any]) -> list[str]:
     return names
 
 
-def parse_alarm(doc: dict[str, Any], alarm_map: dict[str, dict[str, Any]]) -> "Page | Drop":
+def drill_id_from_history(items: Optional[list]) -> Optional[str]:
+    """The drill id of the newest ``ALARM`` transition whose reason is ``DRILL <id>``.
+
+    ``items`` is DescribeAlarmHistory's ``AlarmHistoryItems`` for a drill child,
+    already windowed around the composite's state change. ``HistoryData`` is a
+    JSON string whose ``newState.stateReason`` carries the reason the drill
+    script set.
+    """
+    best: Optional[tuple[str, str]] = None
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            data = json.loads(item.get("HistoryData") or "{}")
+        except (TypeError, ValueError):
+            continue
+        new = data.get("newState") if isinstance(data, dict) else None
+        if not isinstance(new, dict) or new.get("stateValue") != "ALARM":
+            continue
+        m = _DRILL_REASON.match(str(new.get("stateReason") or ""))
+        if not m:
+            continue
+        stamp = str(item.get("Timestamp") or "")
+        if best is None or stamp > best[0]:
+            best = (stamp, m.group(1))
+    return best[1] if best else None
+
+
+def parse_alarm(
+    doc: dict[str, Any],
+    alarm_map: dict[str, dict[str, Any]],
+    drill_history: Optional[DrillHistory] = None,
+) -> "Page | Drop":
     name = str(doc.get("AlarmName", ""))
     entry = alarm_map.get(name)
     if not isinstance(entry, dict):
@@ -247,23 +299,46 @@ def parse_alarm(doc: dict[str, Any], alarm_map: dict[str, dict[str, Any]]) -> "P
             signal=name,
         )
 
+    # Every pager alarm is a composite with a dedicated `-drill` child (plan
+    # D16): it is a drill iff the child that moved the composite is that drill
+    # child. The notification names the child (TriggeringChildren, or the
+    # reason). The drill ID lives only in the drill child's own state reason,
+    # so it is read from that child's recent history. A composite naming no
+    # child is decided from the same history read; if that read failed too it
+    # pages as REAL, because a parser gap must never silence a real page.
     drill = False
     drill_id: Optional[str] = None
     drill_child = entry.get("drill_child")
-    if drill_child:
-        # Composite: drill iff the triggering child is its `-drill` child.
-        children = triggering_children(doc)
-        if not children:
-            detection = "composite_child_unnamed"
-        else:
-            detection = "composite_child"
-            drill = any(c == drill_child or c.endswith("-drill") for c in children)
+    history: Optional[list] = None
+    if drill_child and drill_history is not None:
+        history = drill_history(str(drill_child), str(doc.get("StateChangeTime") or ""))
+    hist_id = drill_id_from_history(history)
+    children = triggering_children(doc)
+    if not drill_child:
+        detection = "no_drill_child"
+    elif children:
+        detection = "composite_child"
+        drill = any(c == drill_child or c.endswith("-drill") for c in children)
+        drill_id = hist_id if drill else None
+    elif history is not None:
+        detection = "composite_history"
+        drill = hist_id is not None
+        drill_id = hist_id
     else:
-        detection = "metric_reason"
-        m = _DRILL_REASON.match(reason)
-        if m:
-            drill = True
-            drill_id = m.group(1)
+        detection = "composite_child_unnamed"
+    if drill and state == "OK":
+        # The drill child returned to OK and the composite followed: the end of
+        # a drill, not a resolution. Deliver nothing.
+        return Drop(
+            reason="drill_returned_to_ok",
+            condition=condition,
+            kind="drill",
+            origin="cloudwatch",
+            source="aws.cloudwatch",
+            signal=name,
+            drill_id=drill_id,
+            suppressed=True,
+        )
     if drill:
         kind = "drill"
 
@@ -473,8 +548,21 @@ def render(page: Page) -> Rendered:
     title, body = _assemble(page, page.what)
     withheld = False
     if contains_asking_words(title + "\n" + body):
+        # Withhold EVERY field that came from outside the relay, not only
+        # `what`: a page_version 1 publisher also supplies remediation,
+        # remediation_state, agents, signal and drill_id. If the page still
+        # asks after this, the handler drops it (reason "asks").
         withheld = True
-        title, body = _assemble(page, WITHHELD_SOURCE_TEXT)
+        page = replace(
+            page,
+            what=WITHHELD_SOURCE_TEXT,
+            remediation=WITHHELD_FIELD if page.remediation else "",
+            remediation_state="",
+            agents=WITHHELD_FIELD if page.agents else "",
+            signal=WITHHELD_FIELD,
+            drill_id=None,
+        )
+        title, body = _assemble(page, page.what)
     asks = bool(contains_asking_words(title + "\n" + body))
     return Rendered(title=title, body=body, asks=asks, source_text_withheld=withheld)
 
@@ -497,6 +585,65 @@ class AdapterResponse:
     ref: Optional[str] = None
 
 
+CONNECT_TIMEOUT_SECS = 3
+READ_TIMEOUT_SECS = 7
+
+
+def boto_config() -> Any:
+    """One attempt per AWS call, with short timeouts.
+
+    The relay's own retry rule (4xx never; 5xx once, after at least 5 s) is
+    the only retry policy. Worst case per message, every call at its timeout:
+    one history read, two adapter calls and one fallback, each at most 3 + 7
+    s, plus the 5 s sleep. That is 45 s, well inside the Lambda's 90 s
+    timeout, so the message's one record is always written.
+    """
+    from botocore.config import Config
+
+    return Config(
+        retries={"max_attempts": 1, "mode": "standard"},
+        connect_timeout=CONNECT_TIMEOUT_SECS,
+        read_timeout=READ_TIMEOUT_SECS,
+    )
+
+
+class CloudWatchDrillHistory:
+    """Read a drill child's recent state history (cloudwatch:DescribeAlarmHistory).
+
+    The window runs from 10 minutes before the composite's state change to 1
+    minute after it. Any failure returns None, which the parser reads as
+    "unknown", never as "not a drill".
+    """
+
+    def __init__(self, client: Any = None):
+        self._client = client
+
+    def __call__(self, alarm_name: str, change_time: str) -> Optional[list]:
+        import datetime as dt
+
+        try:
+            if self._client is None:
+                import boto3
+
+                self._client = boto3.client("cloudwatch", config=boto_config())
+            try:
+                at = dt.datetime.strptime(change_time, "%Y-%m-%dT%H:%M:%S.%f%z")
+            except ValueError:
+                at = dt.datetime.now(dt.timezone.utc)
+            resp = self._client.describe_alarm_history(
+                AlarmName=alarm_name,
+                HistoryItemType="StateUpdate",
+                StartDate=at - dt.timedelta(minutes=10),
+                EndDate=at + dt.timedelta(minutes=1),
+                MaxRecords=20,
+                ScanBy="TimestampDescending",
+            )
+            items = resp.get("AlarmHistoryItems")
+            return items if isinstance(items, list) else None
+        except Exception:  # noqa: BLE001 — UNKNOWN, never "not a drill"
+            return None
+
+
 class SnsForwardAdapter:
     """Publish the page to an SNS topic (the existing email topic).
 
@@ -512,14 +659,8 @@ class SnsForwardAdapter:
     def _sns(self) -> Any:
         if self._client is None:
             import boto3  # lazy: keeps the pure functions stdlib-testable
-            from botocore.config import Config
 
-            # One attempt per call: the relay's own retry rule (4xx never,
-            # 5xx once after >= 5 s) is the only retry policy.
-            self._client = boto3.client(
-                "sns",
-                config=Config(retries={"max_attempts": 1, "mode": "standard"}, connect_timeout=5, read_timeout=10),
-            )
+            self._client = boto3.client("sns", config=boto_config())
         return self._client
 
     def send(self, rendered: Rendered, page: Page) -> AdapterResponse:
@@ -602,8 +743,9 @@ def outcome_record(
     """Build the record. Fixed fields only: no body, no secret, no exception text."""
     metrics = dict.fromkeys(METRIC_NAMES, 0)
     if drop is not None:
-        outcome = "dropped"
-        metrics["Dropped"] = 1
+        outcome = "suppressed" if drop.suppressed else "dropped"
+        if not drop.suppressed:
+            metrics["Dropped"] = 1
         src: Any = drop
     else:
         assert page is not None and delivery is not None
@@ -671,8 +813,13 @@ def outcome_record(
 
 
 class DeliveryFailed(RuntimeError):
-    """Raised after logging when nothing accepted the page, so Lambda's async
-    retry runs and an exhausted message lands in the dead-letter queue."""
+    """Raised after logging when nothing accepted the page.
+
+    The invocation then counts as a Lambda error (the relay-errors alarm on the
+    email topic) and the message goes straight to the dead-letter queue.
+    Lambda's own async retries are OFF (aws_lambda_function_event_invoke_config
+    maximum_retry_attempts = 0): a retry would re-send a page a channel may
+    already have taken, and write a second record for one message."""
 
 
 def _default_adapter(name: str, email_topic_arn: str) -> Any:
@@ -690,6 +837,7 @@ def handler(
     sleep: Callable[[float], None] = time.sleep,
     emit: Callable[[str], None] = print,
     now_ms: Optional[Callable[[], int]] = None,
+    drill_history: Optional[DrillHistory] = None,
 ) -> dict[str, Any]:
     """Lambda entry point (``handler.handler``). Keyword args are test seams."""
     environment = os.environ.get("ENVIRONMENT", "unknown")
@@ -700,13 +848,28 @@ def handler(
     if fallback is None:
         fallback = SnsForwardAdapter(email_topic_arn)
     clock = now_ms or (lambda: int(time.time() * 1000))
+    if drill_history is None:
+        drill_history = CloudWatchDrillHistory()
 
     results: list[dict[str, Any]] = []
     failed = False
     for rec in event.get("Records", []) or []:
         sns = rec.get("Sns", {}) if isinstance(rec, dict) else {}
         message_id = sns.get("MessageId")
-        parsed = parse_message(sns.get("Message", ""), alarm_map)
+        parsed = parse_message(sns.get("Message", ""), alarm_map, drill_history)
+        rendered = render(parsed) if isinstance(parsed, Page) else None
+        if isinstance(parsed, Page) and rendered is not None and rendered.asks:
+            # Even with every source field withheld the page would ask: never send it.
+            parsed = Drop(
+                reason="asks",
+                condition=parsed.condition,
+                kind=parsed.kind,
+                origin=parsed.origin,
+                source=parsed.source,
+                signal=parsed.signal,
+                drill_id=parsed.drill_id,
+                alert_ids=parsed.alert_ids,
+            )
         if isinstance(parsed, Drop):
             record = outcome_record(
                 environment=environment,
@@ -718,7 +881,7 @@ def handler(
                 now_ms=clock(),
             )
         else:
-            rendered = render(parsed)
+            assert rendered is not None
             delivery = deliver(rendered, parsed, adapter, fallback, sleep=sleep)
             record = outcome_record(
                 environment=environment,

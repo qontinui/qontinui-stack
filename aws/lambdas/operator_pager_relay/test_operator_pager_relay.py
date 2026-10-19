@@ -39,7 +39,11 @@ ALARM_MAP = {
         "remediation": "ECS replaces stopped coord tasks and the leader lease fails over",
         "drill_child": CRASH_DRILL,
     },
-    FREE: {"condition": "storage_or_iops", "remediation": "RDS storage autoscaling up to the maximum"},
+    FREE: {
+        "condition": "storage_or_iops",
+        "remediation": "RDS storage autoscaling up to the maximum",
+        "drill_child": f"{FREE}-drill",
+    },
     SAT: {
         "condition": "storage_or_iops",
         "remediation": "none automatic; chronic saturation is agent work",
@@ -91,7 +95,32 @@ def sns_event(message):
     return {"Records": [{"Sns": {"MessageId": "mid-1", "Message": message, "TopicArn": "arn:x"}}]}
 
 
-def run(message, *, adapter=None, fallback=None, sleep=None):
+def no_history(_name, _when):
+    """The history read failed (or there is none): UNKNOWN."""
+    return None
+
+
+def history_with(*reasons, state="ALARM"):
+    """A DescribeAlarmHistory fake returning one StateUpdate per reason."""
+    calls = []
+
+    def read(name, when):
+        calls.append((name, when))
+        return [
+            {
+                "AlarmName": name,
+                "Timestamp": f"2026-10-19T09:5{i}:00Z",
+                "HistoryItemType": "StateUpdate",
+                "HistoryData": json.dumps({"newState": {"stateValue": state, "stateReason": r}}),
+            }
+            for i, r in enumerate(reasons)
+        ]
+
+    read.calls = calls
+    return read
+
+
+def run(message, *, adapter=None, fallback=None, sleep=None, drill_history=no_history):
     lines = []
     adapter = adapter or FakeAdapter("sns_forward", [200])
     fallback = fallback or FakeAdapter("sns_forward", [200])
@@ -103,6 +132,7 @@ def run(message, *, adapter=None, fallback=None, sleep=None):
         sleep=sleep or Sleeps(),
         emit=lines.append,
         now_ms=lambda: 1_700_000_000_000,
+        drill_history=drill_history,
     )
     assert len(lines) == 1, "exactly one record per message"
     return result, json.loads(lines[0]), adapter, fallback
@@ -249,6 +279,28 @@ def test_source_text_that_asks_is_withheld():
     assert "Please" not in rendered.body and "approve" not in rendered.body
     assert relay.WITHHELD_SOURCE_TEXT in rendered.body
     assert rec["asks"] is False and rec["source_text_withheld"] is True
+
+
+def test_asking_text_in_any_source_field_is_withheld():
+    msg = v1(
+        condition="deploy_failed",
+        what="Deploy failed.",
+        remediation="Please approve the rollback",
+        remediation_state="needs your call",
+        agents="could you check",
+        signal="please-ack",
+    )
+    _, rec, adapter, _ = run(msg)
+    rendered = adapter.calls[0][0]
+    assert relay.contains_asking_words(rendered.title + "\n" + rendered.body) == []
+    assert rec["outcome"] == "accepted" and rec["asks"] is False and rec["source_text_withheld"] is True
+
+
+def test_a_page_that_still_asks_after_withholding_is_dropped(monkeypatch):
+    monkeypatch.setitem(relay.CONDITION_LABELS, "deploy_failed", "Please confirm the deploy")
+    _, rec, adapter, _ = run(v1(condition="deploy_failed"))
+    assert rec["outcome"] == "dropped" and rec["drop_reason"] == "asks"
+    assert adapter.calls == []
 
 
 def test_long_text_is_clipped_but_keeps_closing_line():
@@ -403,18 +455,96 @@ def test_sns_forward_adapter_maps_client_error_status():
 # ─── Drill or real (plan D16) ────────────────────────────────────────────
 
 
-def test_metric_alarm_drill_reason_is_a_drill():
-    _, rec, adapter, _ = run(alarm(FREE, reason="DRILL d-42 operator-pager drill"))
+def _child_arn(name):
+    return f"arn:aws:cloudwatch:us-east-1:047719635665:alarm:{name}"
+
+
+def test_free_storage_drill_carries_the_drill_id_from_the_drill_childs_history():
+    hist = history_with("Threshold Crossed: no datapoints", "DRILL d-42")
+    doc = alarm(FREE, reason="x", TriggeringChildren=[{"Arn": _child_arn(f"{FREE}-drill")}])
+    _, rec, adapter, _ = run(doc, drill_history=hist)
     assert rec["kind"] == "drill" and rec["drill"] is True and rec["drill_id"] == "d-42"
-    assert rec["drill_detection"] == "metric_reason"
+    assert rec["drill_detection"] == "composite_child"
+    assert hist.calls == [(f"{FREE}-drill", "2026-10-19T10:00:00.000+0000")]
     assert adapter.calls[0][0].title.startswith("DRILL d-42")
 
 
-def test_metric_alarm_real_reason_is_a_page():
-    _, rec, _, _ = run(alarm(FREE))
-    assert rec["kind"] == "page" and rec["drill"] is False
+def test_free_storage_real_child_is_a_page():
+    doc = alarm(FREE, TriggeringChildren=[{"Arn": _child_arn(f"{FREE}-low")}])
+    _, rec, _, _ = run(doc, drill_history=history_with("DRILL old-drill"))
+    assert rec["kind"] == "page" and rec["drill"] is False and rec["drill_id"] is None
     assert rec["condition"] == "storage_or_iops"
     assert rec["remediation_named"] == "RDS storage autoscaling up to the maximum"
+
+
+def test_ok_after_a_drill_delivers_nothing():
+    # The drill child returns to OK and the composite follows. A "Resolved:"
+    # page here would read as a real recovery, so nothing is delivered and no
+    # Dropped metric fires (it is expected, not an error).
+    for name in (FREE, CRASH, SAT):
+        child = f"{name}-drill"
+        doc = alarm(name, state="OK", reason="y", TriggeringChildren=[{"Arn": _child_arn(child)}])
+        _, rec, adapter, fallback = run(doc, drill_history=history_with("DRILL d-5"))
+        assert rec["outcome"] == "suppressed", name
+        assert rec["drop_reason"] == "drill_returned_to_ok"
+        assert rec["drill_id"] == "d-5"
+        assert rec["Dropped"] == 0 and rec["VendorAccepted"] == 0
+        assert adapter.calls == [] and fallback.calls == []
+
+
+def test_ok_after_a_drill_with_no_named_child_is_decided_from_history():
+    _, rec, adapter, _ = run(alarm(FREE, state="OK", reason="y"), drill_history=history_with("DRILL d-6"))
+    assert rec["outcome"] == "suppressed" and adapter.calls == []
+
+
+def test_real_ok_is_resolved_not_suppressed():
+    doc = alarm(FREE, state="OK", reason="y", TriggeringChildren=[{"Arn": _child_arn(f"{FREE}-low")}])
+    _, rec, adapter, _ = run(doc, drill_history=history_with("DRILL d-7"))
+    assert rec["kind"] == "resolved" and rec["outcome"] == "accepted"
+    assert adapter.calls[0][0].title.startswith("Resolved:")
+
+
+def test_unnamed_child_with_no_drill_in_history_is_real():
+    _, rec, _, _ = run(alarm(CRASH, reason="composite changed"), drill_history=history_with("Threshold Crossed"))
+    assert rec["kind"] == "page" and rec["drill_detection"] == "composite_history"
+
+
+def test_drill_id_from_history_reads_only_alarm_transitions_with_a_drill_reason():
+    items = [
+        {"Timestamp": "2026-10-19T09:50:00Z", "HistoryData": json.dumps({"newState": {"stateValue": "ALARM", "stateReason": "DRILL a"}})},
+        {"Timestamp": "2026-10-19T09:55:00Z", "HistoryData": json.dumps({"newState": {"stateValue": "ALARM", "stateReason": "DRILL b"}})},
+        {"Timestamp": "2026-10-19T09:58:00Z", "HistoryData": json.dumps({"newState": {"stateValue": "OK", "stateReason": "DRILL c"}})},
+        {"Timestamp": "2026-10-19T09:59:00Z", "HistoryData": "not json"},
+    ]
+    assert relay.drill_id_from_history(items) == "b"
+    assert relay.drill_id_from_history([]) is None
+    assert relay.drill_id_from_history(None) is None
+
+
+def test_cloudwatch_drill_history_windows_the_read_and_reads_failure_as_unknown():
+    import datetime as dt
+
+    class FakeCw:
+        def __init__(self):
+            self.kwargs = None
+
+        def describe_alarm_history(self, **kwargs):
+            self.kwargs = kwargs
+            return {"AlarmHistoryItems": [{"x": 1}]}
+
+    cw = FakeCw()
+    items = relay.CloudWatchDrillHistory(client=cw)("a-drill", "2026-10-19T10:00:00.000+0000")
+    assert items == [{"x": 1}]
+    at = dt.datetime(2026, 10, 19, 10, 0, tzinfo=dt.timezone.utc)
+    assert cw.kwargs["AlarmName"] == "a-drill" and cw.kwargs["HistoryItemType"] == "StateUpdate"
+    assert cw.kwargs["StartDate"] == at - dt.timedelta(minutes=10)
+    assert cw.kwargs["EndDate"] == at + dt.timedelta(minutes=1)
+
+    class Broken:
+        def describe_alarm_history(self, **kwargs):
+            raise RuntimeError("denied")
+
+    assert relay.CloudWatchDrillHistory(client=Broken())("a-drill", "x") is None
 
 
 def test_composite_triggered_by_drill_child_is_a_drill():
@@ -587,6 +717,46 @@ def test_eventbridge_templates_render_pages_the_relay_accepts():
     )
     assert isinstance(drill, relay.Page), drill
     assert drill.condition == "storage_or_iops" and drill.kind == "drill" and drill.drill_id == "d-9"
+
+
+def _tf(name):
+    return (_MODULE / name).read_text(encoding="utf-8")
+
+
+def test_lambda_async_retries_are_off():
+    # SNS invokes the relay asynchronously; Lambda's default of two retries
+    # would re-send a 4xx three times and a 5xx six, and duplicate records.
+    import re
+
+    block = re.search(r'resource "aws_lambda_function_event_invoke_config" "relay" \{(.*?)\n\}', _tf("main.tf"), re.S)
+    assert block, "the relay must carry an event invoke config"
+    assert re.search(r"maximum_retry_attempts\s*=\s*0\b", block.group(1))
+    assert "aws_lambda_function.relay.function_name" in block.group(1)
+
+
+def test_lambda_timeout_covers_the_worst_case_delivery():
+    import re
+
+    fn = re.search(r'resource "aws_lambda_function" "relay" \{(.*?)\n\}', _tf("main.tf"), re.S).group(1)
+    timeout = int(re.search(r"\btimeout\s*=\s*(\d+)", fn).group(1))
+    per_call = relay.CONNECT_TIMEOUT_SECS + relay.READ_TIMEOUT_SECS
+    # one history read + primary + retry + fallback, plus the retry sleep
+    assert timeout >= 4 * per_call + relay.RETRY_DELAY_SECS + 10, timeout
+
+
+def test_every_pager_alarm_with_actions_is_a_composite_with_a_drill_child():
+    # A drilled metric alarm returns to OK with CloudWatch's own reason and
+    # sends a real-looking "Resolved" page; only composites with a drill child
+    # can be drilled state-neutrally (plan D16).
+    import re
+
+    alarms = _tf("alarms.tf")
+    for m in re.finditer(r'resource "aws_cloudwatch_metric_alarm" "(\w+)" \{(.*?)\n\}', alarms, re.S):
+        assert "alarm_actions" not in m.group(2) and "ok_actions" not in m.group(2), m.group(1)
+    composites = re.findall(r'resource "aws_cloudwatch_composite_alarm" "(\w+)" \{(.*?)\n\}', alarms, re.S)
+    assert len(composites) == 3
+    for name, body in composites:
+        assert "_drill.alarm_name" in body, name
 
 
 def test_every_condition_named_in_terraform_is_one_of_the_five():
