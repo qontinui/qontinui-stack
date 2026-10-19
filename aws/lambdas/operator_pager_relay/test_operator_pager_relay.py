@@ -492,9 +492,63 @@ def test_ok_after_a_drill_delivers_nothing():
         assert adapter.calls == [] and fallback.calls == []
 
 
+def steps(*items):
+    """A DescribeAlarmHistory fake from (timestamp, old, new, reason) steps."""
+
+    def read(name, when):
+        return [
+            {
+                "AlarmName": name,
+                "Timestamp": ts,
+                "HistoryItemType": "StateUpdate",
+                "HistoryData": json.dumps(
+                    {"oldState": {"stateValue": old}, "newState": {"stateValue": new, "stateReason": reason}}
+                ),
+            }
+            for ts, old, new, reason in items
+        ]
+
+    return read
+
+
+# The composite's StateChangeTime in alarm() is 2026-10-19T10:00:00.000+0000.
+DRILL_JUST_NOW = steps(
+    ("2026-10-19T09:59:55Z", "OK", "ALARM", "DRILL d-6"),
+    ("2026-10-19T09:59:58Z", "ALARM", "OK", "Threshold Crossed: no datapoints"),
+)
+DRILL_8_MIN_AGO = steps(
+    ("2026-10-19T09:52:00Z", "OK", "ALARM", "DRILL d-8"),
+    ("2026-10-19T09:52:05Z", "ALARM", "OK", "Threshold Crossed: no datapoints"),
+)
+
+
 def test_ok_after_a_drill_with_no_named_child_is_decided_from_history():
-    _, rec, adapter, _ = run(alarm(FREE, state="OK", reason="y"), drill_history=history_with("DRILL d-6"))
-    assert rec["outcome"] == "suppressed" and adapter.calls == []
+    _, rec, adapter, _ = run(alarm(FREE, state="OK", reason="y"), drill_history=DRILL_JUST_NOW)
+    assert rec["outcome"] == "suppressed" and rec["drill_id"] == "d-6" and adapter.calls == []
+
+
+def test_alarm_with_no_named_child_is_a_drill_only_while_the_drill_child_is_the_newest_step():
+    in_alarm = steps(("2026-10-19T09:59:57Z", "OK", "ALARM", "DRILL d-9"))
+    _, rec, _, _ = run(alarm(FREE, reason="y"), drill_history=in_alarm)
+    assert rec["kind"] == "drill" and rec["drill_id"] == "d-9"
+    assert rec["drill_detection"] == "composite_history"
+
+
+def test_drill_8_min_earlier_then_a_real_alarm_with_no_named_child_is_a_real_page():
+    _, rec, adapter, _ = run(alarm(FREE, reason="y"), drill_history=DRILL_8_MIN_AGO)
+    assert rec["kind"] == "page" and rec["drill"] is False and rec["drill_id"] is None
+    assert adapter.calls[0][0].title == relay.CONDITION_LABELS["storage_or_iops"]
+
+
+def test_real_ok_8_min_after_a_drill_with_no_named_child_is_resolved():
+    _, rec, adapter, _ = run(alarm(FREE, state="OK", reason="y"), drill_history=DRILL_8_MIN_AGO)
+    assert rec["kind"] == "resolved" and rec["outcome"] == "accepted"
+
+
+def test_history_after_the_change_time_is_ignored():
+    later = steps(("2026-10-19T10:00:40Z", "OK", "ALARM", "DRILL d-10"))
+    assert relay.drill_from_history(later("x", ""), "2026-10-19T10:00:00.000+0000", "ALARM") == (False, None)
+    assert relay.drill_from_history(later("x", ""), "not a time", "ALARM") == (False, None)
 
 
 def test_real_ok_is_resolved_not_suppressed():

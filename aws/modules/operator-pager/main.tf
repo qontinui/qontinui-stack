@@ -292,7 +292,6 @@ resource "aws_lambda_function" "relay" {
   role          = aws_iam_role.relay.arn
   runtime       = "python3.12"
   handler       = "handler.handler"
-  # A 5xx is retried once after >= 5 s, then the fallback publishes: well
   # Worst case, every AWS call at its 3 s connect + 7 s read timeout: one
   # drill-history read, the adapter call, its one retry after 5 s, and the
   # fallback = 45 s (handler.py boto_config). 90 s leaves room for a cold start

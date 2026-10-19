@@ -266,6 +266,88 @@ def drill_id_from_history(items: Optional[list]) -> Optional[str]:
     return best[1] if best else None
 
 
+# How long after the drill child's own ALARM -> OK step a composite OK may
+# arrive and still be read as that drill's end. Metric alarms return "often
+# within seconds"; the composite follows.
+DRILL_OK_FOLLOW_SECS = 120
+# Clock skew allowed between a child's history stamp and the composite's
+# StateChangeTime when picking the child's newest step "at or before" it.
+HISTORY_SKEW_SECS = 5
+
+
+def _parse_ts(value: Any) -> Any:
+    """A history Timestamp (boto3 datetime or ISO string) or a StateChangeTime."""
+    import datetime as dt
+
+    if isinstance(value, dt.datetime):
+        return value if value.tzinfo else value.replace(tzinfo=dt.timezone.utc)
+    if not isinstance(value, str) or not value:
+        return None
+    text = value.strip().replace("Z", "+00:00")
+    text = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", text)  # +0000 -> +00:00
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
+
+
+def _steps(items: Optional[list]) -> list[tuple[Any, str, str, str]]:
+    """(timestamp, old state, new state, new reason) per readable StateUpdate, oldest first."""
+    out = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        at = _parse_ts(item.get("Timestamp"))
+        try:
+            data = json.loads(item.get("HistoryData") or "{}")
+        except (TypeError, ValueError):
+            continue
+        if at is None or not isinstance(data, dict):
+            continue
+        old = data.get("oldState") if isinstance(data.get("oldState"), dict) else {}
+        new = data.get("newState") if isinstance(data.get("newState"), dict) else {}
+        out.append((at, str(old.get("stateValue") or ""), str(new.get("stateValue") or ""), str(new.get("stateReason") or "")))
+    out.sort(key=lambda s: s[0])
+    return out
+
+
+def drill_from_history(items: Optional[list], change_time: str, state: str) -> tuple[bool, Optional[str]]:
+    """Decide drill-or-real for a composite whose notification names no child.
+
+    Only the drill child's NEWEST step at or before the composite's state
+    change counts, so a drill some minutes earlier cannot claim a later real
+    alarm or its real recovery:
+      * composite ALARM is a drill iff that newest step is -> ALARM with a
+        ``DRILL <id>`` reason;
+      * composite OK is a drill's end iff that newest step is ALARM -> OK,
+        no more than DRILL_OK_FOLLOW_SECS before the composite's change, and
+        the step before it is the -> ALARM ``DRILL <id>`` it ends.
+    An unreadable change time decides nothing: (False, None).
+    """
+    import datetime as dt
+
+    at = _parse_ts(change_time)
+    if at is None:
+        return False, None
+    steps = [s for s in _steps(items) if s[0] <= at + dt.timedelta(seconds=HISTORY_SKEW_SECS)]
+    if not steps:
+        return False, None
+    when, old, new, reason = steps[-1]
+    if state == "ALARM":
+        m = _DRILL_REASON.match(reason)
+        return (True, m.group(1)) if new == "ALARM" and m else (False, None)
+    if state == "OK":
+        if new != "OK" or old != "ALARM" or at - when > dt.timedelta(seconds=DRILL_OK_FOLLOW_SECS):
+            return False, None
+        if len(steps) < 2:
+            return False, None
+        _, _, prev_new, prev_reason = steps[-2]
+        m = _DRILL_REASON.match(prev_reason)
+        return (True, m.group(1)) if prev_new == "ALARM" and m else (False, None)
+    return False, None
+
+
 def parse_alarm(
     doc: dict[str, Any],
     alarm_map: dict[str, dict[str, Any]],
@@ -322,8 +404,7 @@ def parse_alarm(
         drill_id = hist_id if drill else None
     elif history is not None:
         detection = "composite_history"
-        drill = hist_id is not None
-        drill_id = hist_id
+        drill, drill_id = drill_from_history(history, str(doc.get("StateChangeTime") or ""), str(state))
     else:
         detection = "composite_child_unnamed"
     if drill and state == "OK":
