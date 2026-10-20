@@ -124,7 +124,10 @@ jobs:
         with:
           python-version: "3.12"
       - name: install pytest
-        run: python -m pip install --quiet pytest
+        # boto3: cognito_presignup_autolink/handler.py imports it at module
+        # level (its tests stub the CLIENT, not the import). The operator pager
+        # relay imports it lazily and needs none of it.
+        run: python -m pip install --quiet pytest boto3
       # The WHOLE scripts/tests/ directory, not just the drift classifier: the
       # `noop` placeholder this job replaced meant test_plan_graph.py,
       # test_resolve_plan_deps.py and test_symbol_claims_by_machine.py had never
@@ -137,7 +140,8 @@ jobs:
       # conditions-and-names-the-agent-fixing-each, Phase 1): before this, no job
       # ran cognito_presignup_autolink/test_handler.py at all, and the operator
       # pager relay's tests are the gate for its cap, wording and retry rules.
-      # Both are stdlib + pytest; boto3 is stubbed or imported lazily, so no AWS
-      # credential is involved. pytest's summary line is the count of tests run.
+      # Neither makes an AWS call: the presignup tests stub the boto3 client
+      # (boto3 itself is installed above, for its module-level import) and the
+      # relay imports boto3 lazily. pytest's summary line is the count of tests run.
       - name: pytest
         run: python -m pytest scripts/tests/ aws/lambdas/ -q
