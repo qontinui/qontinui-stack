@@ -57,9 +57,11 @@
 #     minimum 0% / maximum 100%, which stops the old task before starting a new
 #     one. Two tasks sharing one SSM state would fight over the same node key.
 #
-# Enabling, in order (Phase 3; the operator holds the tailnet-side steps):
-#   1. enabled = true, running = false; set cloud_map_namespace_id (Phase 1c
-#      imports the namespace) and forward_target_host. Apply: creates the empty
+# Enabling, in order (the D2(a) upgrade path: OD3(ii) made D2(e), the WireGuard
+# module, the Phase 3 tunnel; the operator holds the tailnet-side steps):
+#   1. enabled = true, running = false; set forward_target_host
+#      (cloud_map_namespace_id comes from aws/staging's module.nats, which needs
+#      nats_under_code = true). Apply: creates the empty
 #      secret, the groups and rules, roles, log group, Cloud Map service, task
 #      definition, and the ECS service at desired_count 0.
 #   2. Operator pastes the auth key into the secret (OD3).
@@ -112,7 +114,7 @@ variable "db_subnet_ids" {
 }
 
 variable "cloud_map_namespace_id" {
-  description = "Id of the EXISTING private DNS namespace the forwarder registers in (qontinui-<env>, which already serves NATS). Not created here; Phase 1c imports it. Required when enabled."
+  description = "Id of the EXISTING private DNS namespace the forwarder registers in (qontinui-<env>, which already serves NATS). Not created here; aws/staging passes module.nats's namespace, imported in Phase 1c. Required when enabled."
   type        = string
   default     = null
 }
@@ -196,7 +198,7 @@ data "aws_caller_identity" "current" {
   lifecycle {
     precondition {
       condition     = var.cloud_map_namespace_id != null && var.cloud_map_namespace_id != ""
-      error_message = "cloud_map_namespace_id is required when the replication tunnel is enabled (the existing qontinui-<env> namespace; Phase 1c imports it)."
+      error_message = "cloud_map_namespace_id is required when the replication tunnel is enabled (the existing qontinui-<env> namespace; in aws/staging it comes from module.nats, so nats_under_code must be true)."
     }
     precondition {
       condition     = var.forward_target_host != null && var.forward_target_host != ""
