@@ -69,6 +69,21 @@ output "budget_sns_topic_arn" {
   value       = module.cost_control.sns_topic_arn
 }
 
+output "operator_pager_topic_arn" {
+  description = "The operator pager topic (qontinui-<env>-operator-pager). qontinui-coord's task definition carries it as QONTINUI_COORD_OPERATOR_PAGER_TOPIC_ARN, and its deploy role's PublishOperatorPage statement scopes sns:Publish to it."
+  value       = module.operator_pager.pager_topic_arn
+}
+
+output "operator_pager_relay_log_group_name" {
+  description = "The pager relay's log group: one JSON record per message. qontinui-coord's task definition carries it as QONTINUI_COORD_OPERATOR_PAGER_RELAY_LOG_GROUP, and scripts/operator-pager-drill.sh reads its records back."
+  value       = module.operator_pager.relay_log_group_name
+}
+
+output "operator_pager_alarm_names" {
+  description = "The three pager composites, the only pager alarms that carry actions. scripts/operator-pager-drill.sh --target routing checks each routes to the pager topic."
+  value       = module.operator_pager.pager_alarm_names
+}
+
 output "rds_endpoint" {
   description = "RDS endpoint (host:port). Internal — not for direct profile use."
   value       = module.postgres.endpoint

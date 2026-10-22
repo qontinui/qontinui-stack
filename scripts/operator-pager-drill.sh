@@ -2,7 +2,7 @@
 # Drill the operator pager end to end, state-neutrally, and read the result back.
 #
 # Usage:
-#   scripts/operator-pager-drill.sh --target relay|alarms|rules|all
+#   scripts/operator-pager-drill.sh --target routing|relay|alarms|rules|all
 #                                   [--env staging] [--region us-east-1]
 #                                   [--drill-id <id>] [--wait-secs 300] [--dry-run]
 #
@@ -10,6 +10,11 @@
 # conditions-and-names-the-agent-fixing-each.md, Phases 1 and 2 (D16).
 #
 # Targets:
+#   routing (Phase 2, read-only, sends nothing) the plan's routing check: each
+#           composite's AlarmActions AND OKActions name the pager topic, no
+#           other pager alarm carries any action (one episode, one page), the
+#           deploy-failed and RDS-storage rules target the topic, and the
+#           task-exit rule targets its log group.
 #   relay   (Phase 1) publish one `drill` message per condition straight to
 #           qontinui-<env>-operator-pager, then read the relay's records for the
 #           drill id. Exercises topic -> relay -> adapter.
@@ -25,14 +30,15 @@
 #           RDS-storage rules (relay records expected), and ONE task-exit event
 #           matching the crash-loop rule (it must land in the task-exits log
 #           group while the abnormal-exits metric does not move).
-#   all     relay, then alarms, then rules.
-# Every target ends with one `drill_summary` page.
+#   all     routing, then relay, then alarms, then rules.
+# Every target but routing ends with one `drill_summary` page.
 #
 # Exit codes: 0 every drilled signal read `accepted` (and, for alarms, every
-# alarm is back in its pre-drill state); 1 a drill did not read back; 2 usage;
-# 3 wrong AWS account.
+# alarm is back in its pre-drill state; for routing, every action and target
+# reads as above); 1 a drill or check did not read back; 2 usage; 3 wrong AWS
+# account.
 #
-# SAFETY. Each drill sends the operator email (five `[PAGE] DRILL` emails for
+# SAFETY. Each drill except routing sends the operator email (five `[PAGE] DRILL` emails for
 # `relay`), so announce it first through an `operator-notify` finding. The
 # account check runs before any AWS call that writes (production-and-cost
 # aws-account-is-per-tenant). --dry-run makes no AWS call at all and prints
@@ -68,7 +74,7 @@ while [ $# -gt 0 ]; do
     *) echo "unknown argument: $1" >&2; usage ;;
   esac
 done
-case "$TARGET" in relay|alarms|rules|all) ;; *) usage ;; esac
+case "$TARGET" in routing|relay|alarms|rules|all) ;; *) usage ;; esac
 
 PY="$(command -v python3 || command -v python || true)"
 [ -n "$PY" ] || { echo "python3 is required to build and read JSON" >&2; exit 2; }
@@ -159,6 +165,62 @@ sys.exit(0 if ok else 1)
 # the relay requires; every other value a string).
 json_msg() {
   "$PY" -c 'import json,sys; d=dict(a.split("=",1) for a in sys.argv[1:]); d["page_version"]=int(d.get("page_version","1")); print(json.dumps(d))' "$@"
+}
+
+# ─── routing ────────────────────────────────────────────────────────────
+# Read-only: describe-alarms and list-targets-by-rule, nothing written or sent.
+check_routing() {
+  echo "== routing: alarm actions and rule targets (read-only)"
+  if [ "$DRY_RUN" = 1 ]; then
+    echo "DRY-RUN: would read ${PAGER}* alarm actions and the targets of ${PAGER}{deploy-failed,rds-storage-events,coord-task-exits}"
+    return
+  fi
+  local alarms deploy rds exits
+  # A failed read (a missing rule, a denied call) is a routing FAIL, not an
+  # abort under set -e that would also skip the targets after it in `all`.
+  if ! alarms="$(aws_ cloudwatch describe-alarms --alarm-name-prefix "$PAGER" --alarm-types CompositeAlarm MetricAlarm)" ||
+     ! deploy="$(aws_ events list-targets-by-rule --rule "${PAGER}deploy-failed")" ||
+     ! rds="$(aws_ events list-targets-by-rule --rule "${PAGER}rds-storage-events")" ||
+     ! exits="$(aws_ events list-targets-by-rule --rule "${PAGER}coord-task-exits")"; then
+    echo "FAIL: pager routing (could not read the alarms or a rule's targets)" >&2; FAILED=1; return
+  fi
+  if ! printf '%s' "$alarms" | "$PY" -c '
+import json, sys
+topic, exits_log, composites = sys.argv[1], sys.argv[2], sys.argv[3].split(",")
+rule_targets = {name: json.loads(doc).get("Targets", []) for name, doc in
+                zip(("deploy-failed", "rds-storage-events", "coord-task-exits"), sys.argv[4:7])}
+doc = json.load(sys.stdin)
+fail = []
+by_name = {a["AlarmName"]: a for a in doc.get("CompositeAlarms", []) + doc.get("MetricAlarms", [])}
+for c in composites:
+    a = by_name.get(c)
+    if a is None:
+        fail.append(f"{c}: missing")
+        continue
+    for key in ("AlarmActions", "OKActions"):
+        if topic not in a.get(key, []):
+            fail.append(f"{c}: {key} {a.get(key, [])} does not name {topic}")
+for name, a in sorted(by_name.items()):
+    if name in composites:
+        continue
+    acts = a.get("AlarmActions", []) + a.get("OKActions", []) + a.get("InsufficientDataActions", [])
+    if acts:
+        fail.append(f"{name}: a child alarm carries actions {acts} (only the composites may page)")
+for rule in ("deploy-failed", "rds-storage-events"):
+    arns = [t.get("Arn") for t in rule_targets[rule]]
+    if topic not in arns:
+        fail.append(f"rule {rule}: targets {arns} do not include {topic}")
+arns = [t.get("Arn", "").removesuffix(":*") for t in rule_targets["coord-task-exits"]]
+if not any(a.endswith(f":log-group:{exits_log}") for a in arns):
+    fail.append(f"rule coord-task-exits: targets {arns} do not include log group {exits_log}")
+print(f"  checked {len(composites)} composites, {len(by_name) - len(composites)} other pager alarms, 3 rules", file=sys.stderr)
+for f in fail:
+    print("  " + f, file=sys.stderr)
+sys.exit(1 if fail else 0)
+' "$TOPIC_ARN" "$EXITS_LOG" "$(IFS=,; echo "${COMPOSITES[*]}")" "$deploy" "$rds" "$exits"; then
+    echo "FAIL: pager routing" >&2; FAILED=1; return
+  fi
+  echo "OK: composites route ALARM and OK to the pager topic; no child alarm pages; rules target topic and log group"
 }
 
 # ─── relay ──────────────────────────────────────────────────────────────
@@ -277,10 +339,11 @@ PYEOF
 }
 
 case "$TARGET" in
+  routing) check_routing ;;
   relay) drill_relay ;;
   alarms) drill_alarms ;;
   rules) drill_rules ;;
-  all) drill_relay; drill_alarms; drill_rules ;;
+  all) check_routing; drill_relay; drill_alarms; drill_rules ;;
 esac
 
 # ─── summary ────────────────────────────────────────────────────────────
