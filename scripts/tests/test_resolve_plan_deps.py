@@ -503,8 +503,52 @@ class TestStampShapesThroughTheOwner(unittest.TestCase):
             self.assertEqual(res.depends_on[0].status, "MISSING")
 
 
+class TestSummaryText(unittest.TestCase):
+    def test_summary_stops_at_the_first_blank_blockquote_line(self) -> None:
+        text = (
+            "# P\n\n> **Status: SHIPPED 2026-05-21.** Landed in #12.\n>\n"
+            "> History: VETTED 2026-05-01, Depends-On: 2026-01-01-x-y\n"
+        )
+        word, summary, deps = rpd.read_plan_stamp(text)
+        self.assertEqual((word, summary), ("SHIPPED", "Landed in #12."))
+        self.assertEqual(deps, ["2026-01-01-x-y"])
+
+    def test_underscore_token_is_dropped_from_the_summary(self) -> None:
+        word, summary, _ = rpd.read_plan_stamp("# P\n\nStatus: IN_PROGRESS 2026-05-21. Phase 2.\n")
+        self.assertEqual((word, summary), ("IN PROGRESS", "Phase 2."))
+
+    def test_short_word_is_not_matched_inside_the_key(self) -> None:
+        word, summary, _ = rpd.read_plan_stamp("# P\n\n**Status:** a stub\n")
+        self.assertEqual((word, summary), ("A", "stub"))
+
+    def test_block_keeps_physical_lines_so_depends_on_does_not_bleed(self) -> None:
+        text = (
+            "# P\n\n> **Status: VETTED 2026-05-21.** Depends-On: 2026-05-20-foo-plan\n"
+            "> Later line names 2026-05-22-bar-plan.\n"
+        )
+        block = rpd.find_status_block(text)
+        assert block is not None
+        self.assertEqual(rpd.parse_depends_on(block), ["2026-05-20-foo-plan"])
+
+
 class TestVendoredOwnerParity(unittest.TestCase):
-    """The vendored copy is byte-identical to the owner when the owner is here."""
+    """The vendored copy is the blob plan_stamp.SOURCE names, and (when the
+    owner checkout is beside this one) byte-identical to it."""
+
+    def test_copy_is_the_blob_its_source_file_names(self) -> None:
+        import hashlib
+
+        copy = _SCRIPTS_DIR / "lib" / "plan_stamp.py"
+        data = copy.read_bytes()
+        blob = hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+        source = (_SCRIPTS_DIR / "lib" / "plan_stamp.SOURCE").read_text(encoding="utf-8")
+        recorded = [ln.split(":", 1)[1].strip() for ln in source.splitlines() if ln.startswith("blob:")]
+        self.assertEqual(
+            recorded,
+            [blob],
+            "scripts/lib/plan_stamp.py is not the blob plan_stamp.SOURCE records; "
+            "re-copy it from the owner and update the SOURCE file",
+        )
 
     def test_copy_matches_owner_when_sibling_checkout_present(self) -> None:
         copy = _SCRIPTS_DIR / "lib" / "plan_stamp.py"
