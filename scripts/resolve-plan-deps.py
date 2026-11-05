@@ -218,7 +218,7 @@ def _summary(text: str, word: str | None) -> str | None:
     first = first.strip()
     if word:
         pattern = r"[\s_]+".join(re.escape(part) for part in word.split())
-        first = re.sub(r"^(?:" + pattern + r")\b", "", first, count=1, flags=re.IGNORECASE)
+        first = re.sub(r"^(?:" + pattern + r")(?!\w)", "", first, count=1, flags=re.IGNORECASE)
     parts = [first]
     for line in lines[1:]:
         stripped = plan_stamp.strip_markers(line).strip()
