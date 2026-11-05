@@ -64,6 +64,15 @@ _PLAN_STAMP_PATH = Path(__file__).resolve().parent / "lib" / "plan_stamp.py"
 
 
 def _load_plan_stamp():
+    # Deliberately NO fallback: a resolver that cannot read stamps must not
+    # guess one (a guessed SHIPPED would dispatch over an unmet dependency).
+    # A missing copy is a broken checkout, reported by path and exit 2.
+    if not _PLAN_STAMP_PATH.is_file():
+        sys.stderr.write(
+            f"resolve-plan-deps: the stamp parse owner is missing at {_PLAN_STAMP_PATH} "
+            "(a broken qontinui-stack checkout)\n"
+        )
+        raise SystemExit(2)
     spec = importlib.util.spec_from_file_location("plan_stamp", _PLAN_STAMP_PATH)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load the stamp parse owner at {_PLAN_STAMP_PATH}")
