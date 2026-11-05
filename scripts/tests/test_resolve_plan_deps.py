@@ -138,7 +138,7 @@ class TestFindStatusBlock(unittest.TestCase):
 
 class TestParseDependsOn(unittest.TestCase):
     # Dep references must be date-prefixed plan-stem-shaped tokens
-    # (``_STEM_RE``) — bare words like ``foo`` are deliberately rejected.
+    # (``DEPENDS_ON_STEM_RE`` in scripts/lib/plan_stamp.py) — bare words like ``foo`` are deliberately rejected.
 
     def test_no_field(self) -> None:
         block = "**Status: SHIPPED 2026-05-21.** Plain summary."
@@ -450,6 +450,79 @@ class TestDirectoryResolution(unittest.TestCase):
             None,
         )
         self.assertTrue(result.all_satisfied)
+
+
+# ---------------------------------------------------------------------------
+# Plan 2026-10-30-four-stamp-readers-left-out-of-scope-still-miss-plain-stamps
+# Phase 3: every stamp shape the parse owner reads, reads the same here.
+# ---------------------------------------------------------------------------
+
+
+class TestStampShapesThroughTheOwner(unittest.TestCase):
+    def _resolve_with_dep(self, dep_body: str) -> rpd.Resolution:
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / "2026-01-01-the-dep.md").write_text(dep_body, encoding="utf-8")
+            (d / "2026-01-02-the-plan.md").write_text(
+                "# P\n\n> **Status: VETTED 2026-01-02.** Depends-On: 2026-01-01-the-dep.\n",
+                encoding="utf-8",
+            )
+            return rpd.resolve_plan(d / "2026-01-02-the-plan.md", d, None)
+
+    def test_plain_shipped_dependency_reads_shipped(self) -> None:
+        res = self._resolve_with_dep("# Dep\n\n**Status:** SHIPPED 2026-01-01\n\n## Body\n")
+        self.assertEqual(res.depends_on[0].status, "SHIPPED")
+        self.assertTrue(res.all_satisfied)
+
+    def test_list_form_shipped_dependency_reads_shipped(self) -> None:
+        res = self._resolve_with_dep("# Dep\n\n- **Status**: SHIPPED 2026-01-01\n\n## Body\n")
+        self.assertEqual(res.depends_on[0].status, "SHIPPED")
+
+    def test_lower_case_obsolete_reads_obsolete(self) -> None:
+        res = self._resolve_with_dep(
+            "# Dep\n\n> **Status: obsolete 2026-01-01.** Consumed. It once SHIPPED a brief.\n"
+        )
+        self.assertEqual(res.depends_on[0].status, "OBSOLETE")
+        self.assertEqual(res.unsatisfied, [{"stem": "2026-01-01-the-dep", "reason": "terminal_blocker"}])
+
+    def test_stamp_word_is_not_searched_for_in_later_lines(self) -> None:
+        res = self._resolve_with_dep(
+            "# Dep\n\n> **Status: COMPLETE 2026-01-01.** Done.\n> Earlier: IN PROGRESS 2025-12-01.\n"
+        )
+        self.assertEqual(res.depends_on[0].status, "COMPLETE")
+
+    def test_plain_stamp_depends_on_edge_is_read(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / "2026-01-02-the-plan.md").write_text(
+                "# P\n\n**Status:** VETTED 2026-01-02\nDepends-On: 2026-01-01-the-dep\n\n## Body\n",
+                encoding="utf-8",
+            )
+            res = rpd.resolve_plan(d / "2026-01-02-the-plan.md", d, None)
+            self.assertEqual([x.stem for x in res.depends_on], ["2026-01-01-the-dep"])
+            self.assertEqual(res.depends_on[0].status, "MISSING")
+
+
+class TestVendoredOwnerParity(unittest.TestCase):
+    """The vendored copy is byte-identical to the owner when the owner is here."""
+
+    def test_copy_matches_owner_when_sibling_checkout_present(self) -> None:
+        copy = _SCRIPTS_DIR / "lib" / "plan_stamp.py"
+        self.assertTrue(copy.is_file())
+        candidates = [
+            _SCRIPTS_DIR.parent.parent / "qontinui-claude-config" / "scripts" / "lib" / "plan_stamp.py",
+        ]
+        owner = next((c for c in candidates if c.is_file()), None)
+        if owner is None:
+            self.skipTest(
+                "no qontinui-claude-config checkout beside this one; parity is UNKNOWN here "
+                "(see scripts/lib/plan_stamp.SOURCE for the commit the copy was taken from)"
+            )
+        self.assertEqual(
+            copy.read_bytes(),
+            owner.read_bytes(),
+            f"scripts/lib/plan_stamp.py differs from the owner at {owner}; re-copy it and update plan_stamp.SOURCE",
+        )
 
 
 if __name__ == "__main__":

@@ -48,7 +48,7 @@ pg = _load_module()
 # ---------------------------------------------------------------------------
 
 # Depends-On references must be date-prefixed plan-stem-shaped tokens —
-# ``_STEM_RE`` in resolve-plan-deps.py deliberately rejects bare words — so
+# ``DEPENDS_ON_STEM_RE`` in the vendored scripts/lib/plan_stamp.py deliberately rejects bare words — so
 # any fixture stem that appears as a dep carries a date prefix. Dates are
 # chosen so lexicographic order matches the a < b < c < d naming.
 STEM_A = "2026-01-01-fixture-a"
@@ -313,6 +313,25 @@ class TestCycle(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+class TestPlainStampShapes(unittest.TestCase):
+    """Plan 2026-10-30-four-stamp-readers-left-out-of-scope-still-miss-plain-stamps Phase 3."""
+
+    def test_plain_shipped_node_and_its_edge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / f"{STEM_A}.md").write_text(
+                "# A\n\n**Status:** SHIPPED 2026-01-01\n\n## Body\n", encoding="utf-8"
+            )
+            (d / f"{STEM_B}.md").write_text(
+                f"# B\n\n- **Status**: VETTED 2026-01-02\n- **Depends-On**: {STEM_A}\n\n## Body\n",
+                encoding="utf-8",
+            )
+            graph = pg.build_graph(d, None)
+            self.assertEqual(graph.nodes[STEM_A].status, "SHIPPED")
+            self.assertEqual(graph.nodes[STEM_B].status, "VETTED")
+            self.assertIn(STEM_A, graph.edges[STEM_B])
+
+
 class TestMissing(unittest.TestCase):
     def test_missing_dep_flagged(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -435,10 +454,13 @@ class TestEdgeCases(unittest.TestCase):
             d = Path(tmp)
             # malformed=True writes a plan with no status blockquote at all
             # → DRAFT per resolve-plan-deps convention. To get a literal
-            # "?", we need a block that's present but lacks a lifecycle.
+            # "?", we need a stamp that's present but says nothing after its
+            # key: the parse owner reads ANY first word as the token (a
+            # "No lifecycle word here." stamp reads as NO), so only an empty
+            # remainder carries no lifecycle.
             path = d / "malformed.md"
             path.write_text(
-                "# Plan\n\n> **Status:** No lifecycle word here.\n",
+                "# Plan\n\n> **Status:**\n",
                 encoding="utf-8",
             )
             graph = pg.build_graph(d, d)
