@@ -178,12 +178,16 @@ def _read_text(path: Path) -> str:
 def find_status_block(text: str) -> str | None:
     """The plan's status block as the parse owner locates it, or ``None``.
 
-    Marker-stripped and space-joined (``plan_stamp.status_block``). Any stamp
-    shape the owner reads counts -- a plain ``**Status:** SHIPPED`` stamp is a
-    block here too, where the old ``> **Status:``-only scan returned ``None``
-    and the plan read as DRAFT.
+    The located block's physical lines, markers stripped, joined by NEWLINE so
+    each line stays a line (``parse_depends_on`` reads one physical line per
+    ``Depends-On:``). Any stamp shape the owner reads counts -- a plain
+    ``**Status:** SHIPPED`` stamp is a block here too, where the old
+    ``> **Status:``-only scan returned ``None`` and the plan read as DRAFT.
     """
-    return plan_stamp.status_block(text, body_first=True)
+    lines = plan_stamp.status_block_lines(text, body_first=True)
+    if lines is None:
+        return None
+    return "\n".join(plan_stamp.strip_markers(line).strip() for line in lines)
 
 
 def parse_depends_on(status_block: str) -> list[str]:
@@ -198,15 +202,34 @@ def parse_depends_on(status_block: str) -> list[str]:
     return plan_stamp.depends_on_from_lines(status_block.splitlines())
 
 
-def _summary_after(block: str, word: str) -> str | None:
-    idx = block.upper().find(word.upper()) if word else -1
-    after = block[idx + len(word):] if idx >= 0 else block
-    summary = " ".join(after.split())
+def _summary(text: str, word: str | None) -> str | None:
+    """The stamp's first paragraph after its lifecycle word, or ``None``.
+
+    Read from the owner's located stamp LINE: the text after the key, with the
+    word dropped by its own shape (case- and ``_``/space-insensitive, anchored
+    at the start, never searched for elsewhere), then the block's following
+    lines up to the first blank one -- a later ``History:`` paragraph is not
+    the summary.
+    """
+    lines = plan_stamp.status_block_lines(text, body_first=True)
+    if not lines:
+        return None
+    first = plan_stamp.stamp_remainder(lines[0]) or ""
+    first = first.strip()
+    if word:
+        pattern = r"[\s_]+".join(re.escape(part) for part in word.split())
+        first = re.sub(r"^(?:" + pattern + r")\b", "", first, count=1, flags=re.IGNORECASE)
+    parts = [first]
+    for line in lines[1:]:
+        stripped = plan_stamp.strip_markers(line).strip()
+        if not stripped:
+            break
+        parts.append(stripped)
+    summary = " ".join(" ".join(parts).split())
     # Remove a leading date stamp like "2026-05-21." that often follows the
-    # lifecycle word, then the bold close and punctuation noise.
+    # lifecycle word, then punctuation noise.
     summary = re.sub(r"^\d{4}-\d{2}-\d{2}\.?\s*", "", summary)
-    summary = re.sub(r"^\*+\s*", "", summary)
-    summary = summary.lstrip(".:- ").strip()
+    summary = summary.lstrip(".:-—– ").strip()
     return summary or None
 
 
@@ -224,7 +247,7 @@ def extract_lifecycle(status_block: str) -> tuple[str | None, str | None]:
     if stamp is None or not stamp[0]:
         return None, None
     word = stamp[0].upper()
-    return word, _summary_after(stamp[1], word)
+    return word, _summary(status_block, word)
 
 
 def read_plan_stamp(text: str) -> tuple[str | None, str | None, list[str]] | None:
@@ -238,7 +261,7 @@ def read_plan_stamp(text: str) -> tuple[str | None, str | None, list[str]] | Non
         return None
     word = stamp[0].upper() or None
     deps = plan_stamp.read_depends_on(text) or []
-    return word, (_summary_after(stamp[1], word) if word else None), deps
+    return word, (_summary(text, word) if word else None), deps
 
 
 # ---------------------------------------------------------------------------
