@@ -138,7 +138,7 @@ class TestFindStatusBlock(unittest.TestCase):
 
 class TestParseDependsOn(unittest.TestCase):
     # Dep references must be date-prefixed plan-stem-shaped tokens
-    # (``_STEM_RE``) — bare words like ``foo`` are deliberately rejected.
+    # (``DEPENDS_ON_STEM_RE`` in scripts/lib/plan_stamp.py) — bare words like ``foo`` are deliberately rejected.
 
     def test_no_field(self) -> None:
         block = "**Status: SHIPPED 2026-05-21.** Plain summary."
@@ -451,6 +451,128 @@ class TestDirectoryResolution(unittest.TestCase):
         )
         self.assertTrue(result.all_satisfied)
 
+
+# ---------------------------------------------------------------------------
+# Plan 2026-10-30-four-stamp-readers-left-out-of-scope-still-miss-plain-stamps
+# Phase 3: every stamp shape the parse owner reads, reads the same here.
+# ---------------------------------------------------------------------------
+
+
+class TestStampShapesThroughTheOwner(unittest.TestCase):
+    def _resolve_with_dep(self, dep_body: str) -> rpd.Resolution:
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / "2026-01-01-the-dep.md").write_text(dep_body, encoding="utf-8")
+            (d / "2026-01-02-the-plan.md").write_text(
+                "# P\n\n> **Status: VETTED 2026-01-02.** Depends-On: 2026-01-01-the-dep.\n",
+                encoding="utf-8",
+            )
+            return rpd.resolve_plan(d / "2026-01-02-the-plan.md", d, None)
+
+    def test_plain_shipped_dependency_reads_shipped(self) -> None:
+        res = self._resolve_with_dep("# Dep\n\n**Status:** SHIPPED 2026-01-01\n\n## Body\n")
+        self.assertEqual(res.depends_on[0].status, "SHIPPED")
+        self.assertTrue(res.all_satisfied)
+
+    def test_list_form_shipped_dependency_reads_shipped(self) -> None:
+        res = self._resolve_with_dep("# Dep\n\n- **Status**: SHIPPED 2026-01-01\n\n## Body\n")
+        self.assertEqual(res.depends_on[0].status, "SHIPPED")
+
+    def test_lower_case_obsolete_reads_obsolete(self) -> None:
+        res = self._resolve_with_dep(
+            "# Dep\n\n> **Status: obsolete 2026-01-01.** Consumed. It once SHIPPED a brief.\n"
+        )
+        self.assertEqual(res.depends_on[0].status, "OBSOLETE")
+        self.assertEqual(res.unsatisfied, [{"stem": "2026-01-01-the-dep", "reason": "terminal_blocker"}])
+
+    def test_stamp_word_is_not_searched_for_in_later_lines(self) -> None:
+        res = self._resolve_with_dep(
+            "# Dep\n\n> **Status: COMPLETE 2026-01-01.** Done.\n> Earlier: IN PROGRESS 2025-12-01.\n"
+        )
+        self.assertEqual(res.depends_on[0].status, "COMPLETE")
+
+    def test_plain_stamp_depends_on_edge_is_read(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / "2026-01-02-the-plan.md").write_text(
+                "# P\n\n**Status:** VETTED 2026-01-02\nDepends-On: 2026-01-01-the-dep\n\n## Body\n",
+                encoding="utf-8",
+            )
+            res = rpd.resolve_plan(d / "2026-01-02-the-plan.md", d, None)
+            self.assertEqual([x.stem for x in res.depends_on], ["2026-01-01-the-dep"])
+            self.assertEqual(res.depends_on[0].status, "MISSING")
+
+
+class TestSummaryText(unittest.TestCase):
+    def test_summary_stops_at_the_first_blank_blockquote_line(self) -> None:
+        text = (
+            "# P\n\n> **Status: SHIPPED 2026-05-21.** Landed in #12.\n>\n"
+            "> History: VETTED 2026-05-01, Depends-On: 2026-01-01-x-y\n"
+        )
+        word, summary, deps = rpd.read_plan_stamp(text)
+        self.assertEqual((word, summary), ("SHIPPED", "Landed in #12."))
+        self.assertEqual(deps, ["2026-01-01-x-y"])
+
+    def test_underscore_token_is_dropped_from_the_summary(self) -> None:
+        word, summary, _ = rpd.read_plan_stamp("# P\n\nStatus: IN_PROGRESS 2026-05-21. Phase 2.\n")
+        self.assertEqual((word, summary), ("IN PROGRESS", "Phase 2."))
+
+    def test_short_word_is_not_matched_inside_the_key(self) -> None:
+        word, summary, _ = rpd.read_plan_stamp("# P\n\n**Status:** a stub\n")
+        self.assertEqual((word, summary), ("A", "stub"))
+
+    def test_block_keeps_physical_lines_so_depends_on_does_not_bleed(self) -> None:
+        text = (
+            "# P\n\n> **Status: VETTED 2026-05-21.** Depends-On: 2026-05-20-foo-plan\n"
+            "> Later line names 2026-05-22-bar-plan.\n"
+        )
+        block = rpd.find_status_block(text)
+        assert block is not None
+        self.assertEqual(rpd.parse_depends_on(block), ["2026-05-20-foo-plan"])
+
+
+class TestVendoredOwnerParity(unittest.TestCase):
+    """The vendored copy is the blob plan_stamp.SOURCE names, and (when the
+    owner checkout is beside this one) byte-identical to it."""
+
+    def test_copy_is_the_blob_its_source_file_names(self) -> None:
+        import hashlib
+
+        copy = _SCRIPTS_DIR / "lib" / "plan_stamp.py"
+        data = copy.read_bytes()
+        blob = hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+        source = (_SCRIPTS_DIR / "lib" / "plan_stamp.SOURCE").read_text(encoding="utf-8")
+        recorded = [ln.split(":", 1)[1].strip() for ln in source.splitlines() if ln.startswith("blob:")]
+        self.assertEqual(
+            recorded,
+            [blob],
+            "scripts/lib/plan_stamp.py is not the blob plan_stamp.SOURCE records; "
+            "re-copy it from the owner and update the SOURCE file",
+        )
+
+    def test_copy_matches_owner_main_when_sibling_checkout_present(self) -> None:
+        copy = _SCRIPTS_DIR / "lib" / "plan_stamp.py"
+        sibling = _SCRIPTS_DIR.parent.parent / "qontinui-claude-config"
+        if not (sibling / ".git").exists():
+            self.skipTest(
+                "no qontinui-claude-config checkout beside this one; drift against the owner's "
+                "main is UNKNOWN here (the blob test above still pins the copy)"
+            )
+        # The owner's committed main, never the sibling's working tree, which a
+        # peer may have on any branch or mid-edit.
+        proc = subprocess.run(
+            ["git", "-C", str(sibling), "cat-file", "-p", "origin/main:scripts/lib/plan_stamp.py"],
+            capture_output=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            self.skipTest("the sibling has no readable origin/main:scripts/lib/plan_stamp.py; drift is UNKNOWN")
+        self.assertEqual(
+            copy.read_bytes(),
+            proc.stdout,
+            "scripts/lib/plan_stamp.py differs from qontinui-claude-config origin/main; "
+            "re-copy it and update plan_stamp.SOURCE",
+        )
 
 if __name__ == "__main__":
     unittest.main()
