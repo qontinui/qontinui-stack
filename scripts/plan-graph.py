@@ -43,8 +43,8 @@ Environment overrides (shared with ``resolve-plan-deps.py``):
                                 destination for archived plans; unset means
                                 single-directory layout (no default)
 
-Re-uses parser primitives (``find_status_block``, ``parse_depends_on``,
-``extract_lifecycle``) from ``resolve-plan-deps.py`` (Phase 3.2) via direct
+Re-uses the stamp reader (``read_plan_stamp``, backed by the vendored parse
+owner ``scripts/lib/plan_stamp.py``) from ``resolve-plan-deps.py`` via direct
 spec-from-file-location import — the sibling script lives in the same dir.
 """
 
@@ -104,9 +104,7 @@ def _load_rpd():
 
 
 _rpd = _load_rpd()
-find_status_block = _rpd.find_status_block
-parse_depends_on = _rpd.parse_depends_on
-extract_lifecycle = _rpd.extract_lifecycle
+read_plan_stamp = _rpd.read_plan_stamp
 resolve_plans_dir = _rpd.resolve_plans_dir
 resolve_archive_dir = _rpd.resolve_archive_dir
 InputError = _rpd.InputError
@@ -188,14 +186,13 @@ def _parse_plan(path: Path) -> tuple[str, str, list[str]]:
         text = path.read_text(encoding="utf-8")
     except OSError:
         return stem, UNKNOWN_STATUS, []
-    block = find_status_block(text)
-    if block is None:
+    stamp = read_plan_stamp(text)
+    if stamp is None:
         # No status block at all — treat as DRAFT-equivalent. Matches the
         # resolve-plan-deps.py convention.
         return stem, "DRAFT", []
-    lifecycle, _summary = extract_lifecycle(block)
+    lifecycle, _summary, deps = stamp
     status = lifecycle or UNKNOWN_STATUS
-    deps = parse_depends_on(block)
     return stem, status, deps
 
 

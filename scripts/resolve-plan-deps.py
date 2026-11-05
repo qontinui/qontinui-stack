@@ -31,6 +31,7 @@ Environment overrides:
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import re
@@ -50,34 +51,28 @@ from typing import Iterable
 WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PLANS_DIR = WORKSPACE_ROOT / "plans"
 
-# Lifecycle words recognised inside the status blockquote, in match order.
-# Multi-word entries MUST come before any prefix that would shadow them.
-LIFECYCLE_WORDS: tuple[str, ...] = (
-    "IN PROGRESS",
-    "NOT STARTED",
-    "SHIPPED",
-    "VETTED",
-    "DRAFT",
-    "PARTIAL",
-    "SUPERSEDED",
-    "OBSOLETE",
-)
+# The stamp parse owner. A byte-identical copy of qontinui-claude-config
+# ``scripts/lib/plan_stamp.py`` sits in ``scripts/lib/`` beside this file (its
+# provenance is ``scripts/lib/plan_stamp.SOURCE``; ``tests/test_resolve_plan_deps.py``
+# compares the bytes when the sibling checkout is present). Vendored rather than
+# imported across repos because ``/plan-graph`` runs this file from a
+# qontinui-stack checkout that may have no qontinui-claude-config beside it.
+# Plan 2026-10-30-four-stamp-readers-left-out-of-scope-still-miss-plain-stamps
+# Phase 3: every stamp shape the owner reads (blockquote, plain, list-form,
+# run-on, lower-case) reads the same here.
+_PLAN_STAMP_PATH = Path(__file__).resolve().parent / "lib" / "plan_stamp.py"
 
-# Compiled regex that finds the first lifecycle word — order matters because
-# we want "IN PROGRESS" to win over a hypothetical "IN" prefix etc. The
-# alternation order maps to leftmost-then-longest semantics in Python's
-# default ``re`` engine, so we list two-word forms first.
-_LIFECYCLE_RE = re.compile(
-    r"\b(" + "|".join(re.escape(w) for w in LIFECYCLE_WORDS) + r")\b"
-)
 
-# A plan stem is a date-prefixed kebab-case slug, e.g.
-# ``2026-06-02-ui-bridge-value-action-focus-lifecycle-plan``. Used to extract
-# Depends-On stems while rejecting prose tokens that happen to sit to the
-# right of a ``Depends-On:`` marker. The leading date alone (``2026-05-21.``)
-# does NOT match — a stem requires at least one ``-word`` segment after the
-# date, so bare dates mentioned in prose are not mistaken for deps.
-_STEM_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}-[a-z0-9]+(?:-[a-z0-9]+)*\b")
+def _load_plan_stamp():
+    spec = importlib.util.spec_from_file_location("plan_stamp", _PLAN_STAMP_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load the stamp parse owner at {_PLAN_STAMP_PATH}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+plan_stamp = _load_plan_stamp()
 
 UNSATISFIED_NOT_SHIPPED: frozenset[str] = frozenset(
     {"DRAFT", "VETTED", "IN PROGRESS", "PARTIAL", "NOT STARTED"}
@@ -181,114 +176,69 @@ def _read_text(path: Path) -> str:
 
 
 def find_status_block(text: str) -> str | None:
-    """Return the joined text of the first ``> **Status:`` blockquote.
+    """The plan's status block as the parse owner locates it, or ``None``.
 
-    The blockquote is the contiguous run of ``> ``-prefixed lines starting at
-    the line that contains ``**Status:``. The H1 (if any) is ignored — we
-    just need the first matching block in the document. Returns the joined
-    block text with the ``> `` prefixes stripped, or ``None`` if no status
-    block is found.
+    Marker-stripped and space-joined (``plan_stamp.status_block``). Any stamp
+    shape the owner reads counts -- a plain ``**Status:** SHIPPED`` stamp is a
+    block here too, where the old ``> **Status:``-only scan returned ``None``
+    and the plan read as DRAFT.
     """
-    lines = text.splitlines()
-    block_start: int | None = None
-    for i, line in enumerate(lines):
-        if line.startswith(">") and "**Status:" in line:
-            block_start = i
-            break
-    if block_start is None:
-        return None
-
-    block_lines: list[str] = []
-    for line in lines[block_start:]:
-        if line.startswith(">"):
-            # Strip the leading "> " (or just ">") prefix.
-            stripped = line[1:]
-            if stripped.startswith(" "):
-                stripped = stripped[1:]
-            block_lines.append(stripped)
-        else:
-            break
-    return "\n".join(block_lines)
+    return plan_stamp.status_block(text, body_first=True)
 
 
 def parse_depends_on(status_block: str) -> list[str]:
-    """Pull the Depends-On stems out of a status block.
+    """``Depends-On:`` stems on the physical lines of ``status_block``.
 
-    Refines the loose rule from ``implement-plan.md`` Step 0.4
-    (case-sensitive ``Depends-On:`` → split-on-commas) to be robust against
-    two real-world shapes that the naive split mis-handled:
-
-    * **Multiple ``Depends-On:`` occurrences.** A status blockquote often
-      carries one in the headline sentence and another in a trailing
-      ``History:`` / re-vet line. The naive ``str.find`` took only the first
-      and then swept everything to its right — including the second marker's
-      surrounding prose. We scan *every* occurrence and return the
-      order-preserving union (deduped).
-    * **Prose to the right of the marker.** Only the remainder of the *same
-      physical line* as each marker is considered (never the next blockquote
-      paragraph, which may discuss unrelated plans), and within it only
-      date-prefixed plan-stem-shaped tokens (``_STEM_RE``) are kept. So
-      ``Depends-On: 2026-06-02-foo-plan. This plan widens ^0.8.4 to ...``
-      yields exactly ``[2026-06-02-foo-plan]`` instead of comma-splitting the
-      trailing sentence into bogus stems.
-
-    Well-formed inputs (a single marker with comma-separated stems on one
-    line) resolve identically to the old behavior; malformed-but-real inputs
-    no longer produce phantom deps.
+    The shared rule (``plan_stamp.depends_on_from_lines``): every
+    ``Depends-On:`` occurrence, only the rest of its own physical line, only
+    date-prefixed stem tokens, unioned in order. A whole plan is read with
+    ``read_plan_stamp`` instead, which also covers a ``Depends-On:`` line
+    below the stamp's own block.
     """
-    marker = "Depends-On:"
-    stems: list[str] = []
-    seen: set[str] = set()
-    search_from = 0
-    while True:
-        idx = status_block.find(marker, search_from)
-        if idx < 0:
-            break
-        search_from = idx + len(marker)
-        # Restrict to the rest of THIS physical line — never bleed into the
-        # next blockquote paragraph (unrelated plan stems may be named there).
-        tail = status_block[search_from:]
-        line = tail.splitlines()[0] if tail else ""
-        for match in _STEM_RE.finditer(line):
-            stem = match.group(0)
-            if stem not in seen:
-                seen.add(stem)
-                stems.append(stem)
-    return stems
+    return plan_stamp.depends_on_from_lines(status_block.splitlines())
+
+
+def _summary_after(block: str, word: str) -> str | None:
+    idx = block.upper().find(word.upper()) if word else -1
+    after = block[idx + len(word):] if idx >= 0 else block
+    summary = " ".join(after.split())
+    # Remove a leading date stamp like "2026-05-21." that often follows the
+    # lifecycle word, then the bold close and punctuation noise.
+    summary = re.sub(r"^\d{4}-\d{2}-\d{2}\.?\s*", "", summary)
+    summary = re.sub(r"^\*+\s*", "", summary)
+    summary = summary.lstrip(".:- ").strip()
+    return summary or None
 
 
 def extract_lifecycle(status_block: str) -> tuple[str | None, str | None]:
-    """Return ``(lifecycle_word, summary)``.
+    """Return ``(lifecycle_word, summary)`` for a status block.
 
-    ``lifecycle_word`` is the first match of ``_LIFECYCLE_RE`` inside the
-    block (case-sensitive). ``summary`` is the text after the lifecycle
-    word up to the next ``> `` boundary or end-of-block, trimmed and with
-    common surrounding punctuation removed.
-
-    Both may be ``None`` if the block doesn't conform.
+    The word is the parse owner's TOKEN, upper-cased (``SHIPPED``,
+    ``IN PROGRESS``, ``OBSOLETE`` for a lower-case ``obsolete`` stamp,
+    ``COMPLETE`` for a ``COMPLETE`` stamp). It is read from the stamp line
+    itself, never searched for anywhere in the block: the old vocabulary
+    search returned a later ``IN PROGRESS`` history line for a ``COMPLETE``
+    stamp. ``None`` when the block holds no stamp the owner reads.
     """
-    match = _LIFECYCLE_RE.search(status_block)
-    if not match:
+    stamp = plan_stamp.read_stamp(status_block)
+    if stamp is None or not stamp[0]:
         return None, None
-    lifecycle = match.group(1)
+    word = stamp[0].upper()
+    return word, _summary_after(stamp[1], word)
 
-    # Summary = text after the lifecycle word up to the first blank line
-    # (which separates blockquote "paragraphs") or end of block.
-    after = status_block[match.end() :]
-    # The block has already had ``> `` prefixes stripped, so blank
-    # original-blockquote lines appear as "" lines here. Split on those.
-    paragraphs = re.split(r"\n\s*\n", after, maxsplit=1)
-    summary_raw = paragraphs[0]
-    # Collapse whitespace.
-    summary = " ".join(summary_raw.split())
-    # Remove a leading date stamp like "2026-05-21." that often follows
-    # the lifecycle word.
-    summary = re.sub(r"^\d{4}-\d{2}-\d{2}\.?\s*", "", summary)
-    # Strip the markdown bold close (``**``) that usually follows
-    # ``**Status: SHIPPED 2026-05-21.``, plus leading punctuation noise.
-    summary = re.sub(r"^\*+\s*", "", summary)
-    summary = summary.lstrip(".:- ").strip()
-    return lifecycle, (summary or None)
+
+def read_plan_stamp(text: str) -> tuple[str | None, str | None, list[str]] | None:
+    """``(lifecycle_word, summary, depends_on)`` for a whole plan, or ``None``.
+
+    ``None`` means the owner found no stamp in its window. ``lifecycle_word``
+    is ``None`` when a stamp line carries no word after its key.
+    """
+    stamp = plan_stamp.read_stamp(text)
+    if stamp is None:
+        return None
+    word = stamp[0].upper() or None
+    deps = plan_stamp.read_depends_on(text) or []
+    return word, (_summary_after(stamp[1], word) if word else None), deps
 
 
 # ---------------------------------------------------------------------------
@@ -331,8 +281,8 @@ def resolve_dep(
                     location=str(candidate).replace("\\", "/"),
                     summary=None,
                 )
-            block = find_status_block(text)
-            if block is None:
+            stamp = read_plan_stamp(text)
+            if stamp is None:
                 # Per skill spec: "A plan with no status blockquote at all
                 # is treated as DRAFT."
                 return DepResolution(
@@ -341,7 +291,7 @@ def resolve_dep(
                     location=str(candidate).replace("\\", "/"),
                     summary=None,
                 )
-            lifecycle, summary = extract_lifecycle(block)
+            lifecycle, summary, _deps = stamp
             return DepResolution(
                 stem=stem,
                 status=lifecycle or "DRAFT",
@@ -367,10 +317,10 @@ def resolve_plan(
         raise InputError(f"not a file: {plan_path}")
 
     text = _read_text(plan_path)
-    block = find_status_block(text)
+    stamp = read_plan_stamp(text)
     plan_stem = plan_path.stem
 
-    if block is None:
+    if stamp is None:
         # An input plan with no status block is malformed for the purposes
         # of dependency resolution — but we should still tolerate plans
         # that legitimately have no status (e.g. design notes). Treat as
@@ -378,7 +328,7 @@ def resolve_plan(
         # enforce status-block presence separately.
         return Resolution(plan_stem=plan_stem)
 
-    stems = parse_depends_on(block)
+    stems = stamp[2]
     resolution = Resolution(plan_stem=plan_stem)
     if not stems:
         return resolution
