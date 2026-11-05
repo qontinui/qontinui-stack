@@ -550,24 +550,29 @@ class TestVendoredOwnerParity(unittest.TestCase):
             "re-copy it from the owner and update the SOURCE file",
         )
 
-    def test_copy_matches_owner_when_sibling_checkout_present(self) -> None:
+    def test_copy_matches_owner_main_when_sibling_checkout_present(self) -> None:
         copy = _SCRIPTS_DIR / "lib" / "plan_stamp.py"
-        self.assertTrue(copy.is_file())
-        candidates = [
-            _SCRIPTS_DIR.parent.parent / "qontinui-claude-config" / "scripts" / "lib" / "plan_stamp.py",
-        ]
-        owner = next((c for c in candidates if c.is_file()), None)
-        if owner is None:
+        sibling = _SCRIPTS_DIR.parent.parent / "qontinui-claude-config"
+        if not (sibling / ".git").exists():
             self.skipTest(
-                "no qontinui-claude-config checkout beside this one; parity is UNKNOWN here "
-                "(see scripts/lib/plan_stamp.SOURCE for the commit the copy was taken from)"
+                "no qontinui-claude-config checkout beside this one; drift against the owner's "
+                "main is UNKNOWN here (the blob test above still pins the copy)"
             )
+        # The owner's committed main, never the sibling's working tree, which a
+        # peer may have on any branch or mid-edit.
+        proc = subprocess.run(
+            ["git", "-C", str(sibling), "cat-file", "-p", "origin/main:scripts/lib/plan_stamp.py"],
+            capture_output=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            self.skipTest("the sibling has no readable origin/main:scripts/lib/plan_stamp.py; drift is UNKNOWN")
         self.assertEqual(
             copy.read_bytes(),
-            owner.read_bytes(),
-            f"scripts/lib/plan_stamp.py differs from the owner at {owner}; re-copy it and update plan_stamp.SOURCE",
+            proc.stdout,
+            "scripts/lib/plan_stamp.py differs from qontinui-claude-config origin/main; "
+            "re-copy it and update plan_stamp.SOURCE",
         )
-
 
 if __name__ == "__main__":
     unittest.main()
