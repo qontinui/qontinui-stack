@@ -258,9 +258,18 @@ variable "postgres_max_allocated_storage_gb" {
     *.tfvars can still override this default, so check that file before
     applying. Neither tracked tfvars file sets it. Plan:
     2026-09-24-coord-rds-storage-has-fifteen-gb-headroom-and-no-autoscaling.
+
+    Raised 200 -> 300 on the live instance by AWS CLI at 2026-11-19T22:20Z
+    (ModifyDBInstance --max-allocated-storage 300 --apply-immediately; read
+    back MaxAllocatedStorage = 300). Allocated storage had reached the 200 GiB
+    ceiling on 2026-11-04; 22.98 GB were free at 2026-11-18T01:04Z, falling
+    2-4 GB/day (41.3 GB free at the raise). The operator approved the spend
+    on 2026-11-19 (coord finding c6d616ad), 300 and no larger. The same rule
+    as above holds: never lower this below live allocated storage. Plan:
+    2026-10-22-coord-rds-storage-ceiling-raise-before-it-fills.
   EOT
   type        = number
-  default     = 200
+  default     = 300
 }
 
 variable "postgres_username" {
