@@ -342,8 +342,8 @@ resource "aws_cloudwatch_metric_alarm" "coord_worker_panic" {
 #
 # Why 5 GB and not 10: storage autoscaling (the postgres module's
 # max_allocated_storage) grows the disk once free space is <=10% of allocated
-# storage for >=5 min — 10 GiB at today's 100 GiB — so free space dipping to
-# ~10 GB is the ROUTINE autoscale trigger, and a 10 GB alarm would page on every
+# storage for >=5 min — ~20 GiB at the 200 GiB allocated on 2026-11-19 — so free space dipping to
+# ~10% of allocated is the ROUTINE autoscale trigger, and a 10 GB alarm would page on every
 # normal growth step. Below 5 GB for 3 x 5 min means autoscaling did NOT rescue
 # it: the ceiling was reached, or growth outran the wait before the next storage
 # modification (6 h, or until storage optimization finishes, whichever is
