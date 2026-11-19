@@ -253,7 +253,7 @@ variable "postgres_max_allocated_storage_gb" {
     about 15 GB was free, falling ~1.5-2 GB/day.
 
     This default matches live, so an apply does not lower the ceiling. Lowering
-    it back to 100, where allocated storage already sits, would at best fail
+    it back to 100, where allocated storage sat as of 2026-09-24, would at best fail
     the apply and at worst re-arm the storage-full trap. A gitignored operator
     *.tfvars can still override this default, so check that file before
     applying. Neither tracked tfvars file sets it. Plan:
@@ -262,8 +262,11 @@ variable "postgres_max_allocated_storage_gb" {
     Raised 200 -> 300 on the live instance by AWS CLI at 2026-11-19T22:20Z
     (ModifyDBInstance --max-allocated-storage 300 --apply-immediately; read
     back MaxAllocatedStorage = 300). Allocated storage had reached the 200 GiB
-    ceiling on 2026-11-04; 22.98 GB were free at 2026-11-18T01:04Z, falling
-    2-4 GB/day (41.3 GB free at the raise). The operator approved the spend
+    ceiling on 2026-11-04. FreeStorageSpace read 22.98 GB at 2026-11-18T01:04Z
+    after falling 2-4 GB/day, and 41.3 GB at the raise (CloudWatch minimum,
+    hour from 2026-11-19T21:20Z); the rise with storage pinned at the
+    ceiling means space was freed in between, cause not established here, so
+    do not read it as growth having stopped. The operator approved the spend
     on 2026-11-19 (coord finding c6d616ad), 300 and no larger. The same rule
     as above holds: never lower this below live allocated storage. Plan:
     2026-10-22-coord-rds-storage-ceiling-raise-before-it-fills.
