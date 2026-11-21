@@ -63,8 +63,14 @@ SERVER_ARGS=(-c wal_level=logical -c max_replication_slots=20 -c max_wal_senders
 # shellcheck disable=SC2054  # the comma is inside one postgres setting value
 SUB_LOG_ARGS=(-c logging_collector=on -c "log_destination=stderr,jsonlog")
 
-if docker network create "$ID" >/dev/null 2>&1; then
+if docker network create --label qontinui.owner=test:stack-postgres-tests "$ID" >/dev/null 2>&1; then
   NET="$ID"
+  # Cleanup class 18 attributes ad-hoc networks by this label; assert it stuck.
+  got_owner="$(docker network inspect -f '{{index .Labels "qontinui.owner"}}' "$ID" 2>/dev/null || true)"
+  if [ "$got_owner" != "test:stack-postgres-tests" ]; then
+    echo "FAIL: network $ID label qontinui.owner='$got_owner', expected 'test:stack-postgres-tests'" >&2
+    exit 1
+  fi
   echo "==> network mode: docker network $NET"
   docker run -d --name "$ID-pub" --network "$NET" --network-alias pub --tmpfs /var/lib/postgresql/data:rw \
     -e POSTGRES_PASSWORD="$SUPER_PW" "$PG_IMAGE" "${SERVER_ARGS[@]}" >/dev/null
