@@ -25,7 +25,8 @@
 #   S3_ACCESS_KEY=... S3_SECRET_KEY=... \
 #   bash scripts/s3-migrate-from-minio.sh --source-endpoint http://127.0.0.1:9190
 #
-# and `docker rm -f minio-migrate-source` when it reports PASS.
+# and `docker rm -fv minio-migrate-source` when it reports PASS (-v drops only
+# anonymous volumes; the named MinIO volume is kept).
 #
 # How the copy works. The aws CLI cannot sync between two endpoints in one
 # command, so each bucket is synced source -> a local staging dir -> dest

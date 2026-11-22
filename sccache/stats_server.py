@@ -22,11 +22,13 @@ import hmac
 import json
 import os
 import subprocess
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BUCKET = os.environ.get("SCCACHE_BUCKET", "qontinui-sccache")
 
@@ -35,6 +37,12 @@ _EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 # Stop a runaway walk (a store that never clears IsTruncated) from pinning the
 # scrape forever; a bucket bigger than this reports an error, not a number.
 MAX_LIST_PAGES = 10_000
+# Wall-clock budget for one whole walk (every page together). A slow or huge
+# bucket answers {"error": ...} after this, rather than holding the scrape.
+LIST_DEADLINE_SECS = float(os.environ.get("SCCACHE_STATS_LIST_DEADLINE_SECS", "20"))
+# A walk's result is reused for this long, so N concurrent or rapid scrapes of
+# /stats and /metrics cost one walk, not N.
+CACHE_TTL_SECS = float(os.environ.get("SCCACHE_STATS_CACHE_TTL_SECS", "45"))
 
 
 def sccache_stats_json() -> dict:
@@ -111,25 +119,32 @@ def _local(tag: str) -> str:
 
 def list_bucket_totals(endpoint_url: str, bucket: str, access_key: str, secret_key: str,
                        region: str = "us-east-1", timeout: float = 10.0,
-                       page_size: int = 1000) -> dict:
+                       page_size: int = 1000, deadline_secs: float | None = None) -> dict:
     """Walk the bucket with S3 ListObjectsV2 and return
     ``{"objects": N, "size_bytes": M}``, or ``{"error": "..."}``. Never raises.
 
     Counts every object in the bucket (all prefixes): the whole-bucket totals
-    coord's sccache_metrics scrape has always received."""
+    coord's sccache_metrics scrape has always received. The whole walk is
+    bounded by ``deadline_secs`` (default LIST_DEADLINE_SECS); each request's
+    socket timeout is capped by what is left of it."""
+    budget = LIST_DEADLINE_SECS if deadline_secs is None else deadline_secs
+    give_up_at = time.monotonic() + budget
     objects = 0
     size = 0
     token: str | None = None
     base = f"{endpoint_url.rstrip('/')}/{urllib.parse.quote(bucket, safe='')}"
     try:
         for _page in range(MAX_LIST_PAGES):
+            left = give_up_at - time.monotonic()
+            if left <= 0:
+                return {"error": f"listing exceeded its {budget:g}s deadline after {objects} objects"}
             query = {"list-type": "2", "max-keys": str(page_size)}
             if token:
                 query["continuation-token"] = token
             url, headers = _sign_get(base, query, access_key, secret_key, region,
                                      _dt.datetime.now(_dt.timezone.utc))
             req = urllib.request.Request(url, headers=headers, method="GET")
-            with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (configured endpoint)
+            with urllib.request.urlopen(req, timeout=min(timeout, left)) as resp:  # noqa: S310 (configured endpoint)
                 root = ET.fromstring(resp.read())
             truncated = False
             token = None
@@ -153,12 +168,32 @@ def list_bucket_totals(endpoint_url: str, bucket: str, access_key: str, secret_k
         body = e.read()[:300].decode("utf-8", "replace")
         return {"error": f"HTTP {e.code} from the store: {body}"}
     except (urllib.error.URLError, OSError, ET.ParseError, ValueError) as e:
+        if time.monotonic() >= give_up_at:
+            return {"error": f"listing exceeded its {budget:g}s deadline after {objects} objects ({type(e).__name__})"}
         return {"error": f"{type(e).__name__}: {e}"}
+
+
+_cache_lock = threading.Lock()
+_cache: dict = {"at": None, "value": None}
 
 
 def bucket_stats() -> dict:
     """Return { objects, size_bytes } for the sccache bucket by listing it
-    over S3, with the same endpoint and key pair the entrypoint gave sccache."""
+    over S3, with the same endpoint and key pair the entrypoint gave sccache.
+
+    Cached for CACHE_TTL_SECS (errors too, so a failing store is not hammered);
+    the lock makes concurrent scrapes wait for one walk instead of starting
+    their own."""
+    with _cache_lock:
+        now = time.monotonic()
+        if _cache["at"] is not None and now - _cache["at"] < CACHE_TTL_SECS:
+            return dict(_cache["value"])
+        value = _bucket_stats_uncached()
+        _cache["at"], _cache["value"] = time.monotonic(), value
+        return dict(value)
+
+
+def _bucket_stats_uncached() -> dict:
     access_key = os.environ.get("AWS_ACCESS_KEY_ID", "")
     secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
     if not access_key or not secret_key:
@@ -253,7 +288,9 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     port = int(os.environ.get("SCCACHE_STATS_PORT", "4227"))
-    srv = HTTPServer(("0.0.0.0", port), Handler)
+    # Threaded, so a slow bucket walk on one request never blocks /health.
+    srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    srv.daemon_threads = True
     print(f"[sccache-stats] listening on :{port}", flush=True)
     srv.serve_forever()
 

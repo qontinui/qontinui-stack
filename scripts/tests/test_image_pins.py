@@ -19,12 +19,29 @@ the moment it appeared). So the rule has two halves, both checked here:
 Exempt: locally built first-party images (``qontinui-*``; their own Dockerfiles
 are checked instead), ``scratch``, and references to an earlier build stage.
 
-Where ``released`` comes from, so it is read rather than typed: for an image,
-the Docker Hub tag API's ``tag_last_pushed`` for the tag whose CURRENT digest
-is the pinned one (the moment that digest became that tag's content), with the
-digest cross-checked against the registry's ``Docker-Content-Digest``; for a
-release archive, the upstream release API's ``published_at`` (the same source
-``scripts/s3-candidates.pins.toml`` records).
+WHAT THIS TEST CANNOT SEE — it is FORMAT-ONLY and offline. It checks that a
+digest has the sha256 shape, that the dates parse, that ``released <=
+pinned <= today`` and that the gap is at least the cooldown. It does NOT
+contact a registry, so it cannot tell a wrong digest or a mistyped date from
+a right one: a false ``released:`` that is old enough passes. Those values are
+only as good as the read that produced them, recorded here so it can be
+repeated:
+
+* images — ``released`` is the Docker Hub tag API's ``tag_last_pushed``
+  (``GET hub.docker.com/v2/repositories/<repo>/tags/<tag>``) for the tag whose
+  CURRENT digest is the pinned one, i.e. when that digest became the tag's
+  content, which is a push date, not the upstream project's release date. At
+  pin time (2026-11-22, on nilan) each digest was also read from the registry's
+  ``Docker-Content-Digest`` header and matched. Nothing re-checks either later.
+* release archives — the upstream release API's ``published_at`` (the source
+  ``scripts/s3-candidates.pins.toml`` records), with the sha256 verified at
+  build time by ``sha256sum -c``.
+
+Also NOT covered: OS packages installed in an image (``apk add``, ``apt-get
+install``) are not version-pinned. They come from the pinned base image's
+distribution branch at build time, so a rebuild can pick up a newer package.
+That gap is known and deliberate for now: pinning them would mean a version
+list that breaks whenever the distribution drops an old build.
 
 COOLDOWN_DAYS is the plan's single number (D5). Its fleet home is Phase 3's
 qontinui-claude-config ``scripts/fetch-pins-check.py``, which does not exist
@@ -58,6 +75,9 @@ def _age_violation(comment_line: str, where: str) -> str | None:
     if not m:
         return f"{where}: missing '# released: YYYY-MM-DD pinned: YYYY-MM-DD'"
     released, pinned = (_dt.date.fromisoformat(x) for x in m.groups())
+    today = _dt.datetime.now(_dt.timezone.utc).date()
+    if pinned > today:
+        return f"{where}: pinned {pinned} is in the future"
     if released > pinned:
         return f"{where}: released {released} is after pinned {pinned}"
     days = (pinned - released).days
@@ -232,6 +252,14 @@ class RuleCanFailTests(unittest.TestCase):
         v = check_compose(f"    image: redis:7@{self.D} # released: 2026-11-09 pinned: 2026-11-22\n", "c")
         self.assertEqual(len(v), 1)
         self.assertIn("13 days", v[0])
+
+    def test_future_pin_date_fails(self) -> None:
+        v = check_compose(f"    image: redis:7@{self.D} # released: 2099-01-01 pinned: 2099-02-01\n", "c")
+        self.assertEqual(len(v), 1)
+        self.assertIn("future", v[0])
+
+    def test_short_digest_fails(self) -> None:
+        self.assertTrue(check_compose("    image: redis:7@sha256:abc # released: 2026-01-01 pinned: 2026-11-22\n", "c"))
 
     def test_exactly_the_cooldown_passes(self) -> None:
         self.assertEqual(check_compose(f"    image: redis:7@{self.D} # released: 2026-11-08 pinned: 2026-11-22\n", "c"), [])

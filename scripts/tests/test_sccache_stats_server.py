@@ -35,7 +35,9 @@ import os
 import socket
 import sys
 import threading
+import time
 import unittest
+import urllib.request
 import urllib.parse
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -101,9 +103,10 @@ class _ListStub:
     """A bucket of ``objects`` (key -> size) served by a signature-checking
     ListObjectsV2. ``drop_token`` makes it claim truncation without a token."""
 
-    def __init__(self, objects: dict[str, int], drop_token: bool = False) -> None:
+    def __init__(self, objects: dict[str, int], drop_token: bool = False, page_delay: float = 0.0) -> None:
         self.objects = dict(sorted(objects.items()))
         self.drop_token = drop_token
+        self.page_delay = page_delay
         self.pages_served = 0
         store = self
 
@@ -130,6 +133,8 @@ class _ListStub:
                 page = keys[start:start + size]
                 truncated = start + size < len(keys)
                 store.pages_served += 1
+                if store.page_delay:
+                    time.sleep(store.page_delay)
                 body = ['<?xml version="1.0" encoding="UTF-8"?>',
                         '<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">',
                         f"<KeyCount>{len(page)}</KeyCount>",
@@ -167,6 +172,9 @@ FIVE = {"sccache/a/1": 100, "sccache/a/2": 250, "sccache/b/3": 1, "sccache/c/4":
 
 
 class StubListingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        stats._cache.update(at=None, value=None)
+
     def test_walk_counts_every_object_across_pages(self) -> None:
         with _ListStub(FIVE) as stub:
             got = stats.list_bucket_totals(stub.url, "qontinui-sccache", ACCESS, SECRET, REGION, page_size=2)
@@ -197,6 +205,65 @@ class StubListingTests(unittest.TestCase):
     def test_unreachable_store_is_an_error(self) -> None:
         got = stats.list_bucket_totals(f"http://127.0.0.1:{_closed_port()}", "b", ACCESS, SECRET, REGION, timeout=2)
         self.assertIn("error", got)
+
+    def test_walk_past_its_deadline_is_an_error(self) -> None:
+        # Five objects at one per page, 0.3 s a page, against a 0.5 s budget.
+        with _ListStub(FIVE, page_delay=0.3) as stub:
+            started = time.monotonic()
+            got = stats.list_bucket_totals(stub.url, "qontinui-sccache", ACCESS, SECRET, REGION,
+                                           page_size=1, deadline_secs=0.5)
+            elapsed = time.monotonic() - started
+        self.assertIn("error", got)
+        self.assertIn("deadline", got["error"])
+        self.assertNotIn("objects", got)
+        self.assertLess(elapsed, 2.0, "the deadline bounds the whole walk")
+
+    def _env(self, stub: "_ListStub") -> dict[str, str]:
+        return {"SCCACHE_ENDPOINT": stub.url, "SCCACHE_REGION": REGION,
+                "AWS_ACCESS_KEY_ID": ACCESS, "AWS_SECRET_ACCESS_KEY": SECRET}
+
+    def test_bucket_stats_is_cached_within_the_ttl(self) -> None:
+        with _ListStub(FIVE) as stub, mock.patch.dict(os.environ, self._env(stub)), \
+                mock.patch.object(stats, "CACHE_TTL_SECS", 60.0):
+            first = stats.bucket_stats()
+            served = stub.pages_served
+            second = stats.bucket_stats()
+            self.assertEqual(first, second)
+            self.assertEqual(stub.pages_served, served, "a second scrape inside the TTL walks nothing")
+
+    def test_bucket_stats_walks_again_after_the_ttl(self) -> None:
+        with _ListStub(FIVE) as stub, mock.patch.dict(os.environ, self._env(stub)), \
+                mock.patch.object(stats, "CACHE_TTL_SECS", 0.0):
+            stats.bucket_stats()
+            served = stub.pages_served
+            stats.bucket_stats()
+            self.assertGreater(stub.pages_served, served)
+
+    def test_health_answers_while_a_stats_walk_is_in_flight(self) -> None:
+        release = threading.Event()
+
+        def slow_bucket_stats() -> dict:
+            release.wait(5)
+            return {"objects": 1, "size_bytes": 1}
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), stats.Handler)
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+        try:
+            with mock.patch.object(stats, "bucket_stats", slow_bucket_stats), \
+                    mock.patch.object(stats, "sccache_stats_json", lambda: {"stats": {}}):
+                blocked = threading.Thread(target=lambda: urllib.request.urlopen(base + "/stats", timeout=10).read())
+                blocked.start()
+                time.sleep(0.2)
+                with urllib.request.urlopen(base + "/health", timeout=2) as resp:
+                    self.assertEqual(resp.status, 200)
+                release.set()
+                blocked.join(10)
+        finally:
+            release.set()
+            srv.shutdown()
+            srv.server_close()
 
     def test_bucket_stats_reads_the_sccache_env(self) -> None:
         with _ListStub(FIVE) as stub:

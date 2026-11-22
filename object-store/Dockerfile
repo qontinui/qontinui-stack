@@ -2,7 +2,7 @@
 # released: 2024-04-25 pinned: 2026-11-22
 #
 # qontinui canonical object store — versitygw (posix backend), the S3 store
-# that replaced the archived MinIO.
+# that replaced MinIO (whose GitHub repository reports `archived: true`).
 #
 # Plan 2026-11-22-fetches-stop-depending-on-upstreams, Phase 2. The store was
 # chosen by Phase 1's conformance run (D8): versitygw v1.11.0 passed all seven

@@ -110,8 +110,10 @@ docker compose logs -f object-store
 
 `object-store` is [versitygw](https://github.com/versity/versitygw) v1.11.0
 (posix backend), built locally from `object-store/Dockerfile` — the release
-tarball pinned by sha256 on a digest-pinned base. It replaced MinIO, which was
-archived on 2026-04-25. It was chosen by running a conformance subset (put, get,
+tarball pinned by sha256 on a digest-pinned base. It replaced MinIO, whose
+repository GitHub reports as archived (repo API `archived: true`, read
+2026-11-22; the API gives no archive date, and the last push was 2026-04-24).
+It was chosen by running a conformance subset (put, get,
 head, delete, multipart, presign, create-if-absent) and both real clients
 (bazel-remote, sccache) against each candidate (plan
 `2026-11-22-fetches-stop-depending-on-upstreams`; result in qontinui-dev-notes
@@ -142,6 +144,25 @@ store and against its fallback.
   and run `scripts/s3-migrate-from-minio.sh --source-endpoint <url>`. It copies
   each bucket and verifies the copy by listing keys, sizes and ETags. The header
   gives the full procedure.
+- **Cutting over a running stack.** The old `minio` / `minio-init` services
+  are no longer in this file, so their containers become orphans that still
+  hold port 9100. Remove them first, then bring the stack up with orphans
+  pruned (named volumes, including the old MinIO data, are not touched):
+
+  ```bash
+  docker rm -fv qontinui-canonical-minio qontinui-canonical-minio-init  # -v: anonymous volumes only; named ones are kept
+  docker compose up -d --build --remove-orphans
+  ```
+
+  Then copy the data across with `scripts/s3-migrate-from-minio.sh`, below.
+- **bazel-remote health** is read from the host with
+  `bash scripts/bazel-remote-probe.sh` (its upstream image is distroless, so
+  the container has no healthcheck). Its volume is handed to the image's
+  non-root uid by the one-shot `bazel-remote-init`.
+- **Image pins** are checked by `scripts/tests/test_image_pins.py` for FORMAT
+  and age only (digest shape, `released <= pinned <= today`, a 14-day gap);
+  where each `released:` date came from is recorded in that test's docstring.
+  OS packages installed inside the built images are not version-pinned.
 - **Credentials** are `S3_ACCESS_KEY` / `S3_SECRET_KEY` (default
   `qontinui_dev_s3` / `qontinui_dev_s3_secret`), replacing `MINIO_ROOT_USER` /
   `MINIO_ROOT_PASSWORD`. Update `blob.access_key` / `blob.secret_key` in

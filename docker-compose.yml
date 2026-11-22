@@ -70,8 +70,10 @@
 #   * 2.1% of `threads-max` (4096 / 192,146). One container can no longer
 #     reach even a fiftieth of the kernel task table.
 #   * The AGGREGATE is the invariant that actually matters, and it only
-#     holds if the bound is universal: 13 services x 4096 = 53,248 = **27.7%**
-#     of `threads-max`. Even a simultaneous stack-wide worst case leaves the
+#     holds if the bound is universal: 14 services x 4096 = 57,344 = **29.8%**
+#     of `threads-max` (15 services are defined; `object-store-seaweedfs`
+#     stands in for `object-store`, never beside it, so 14 run at once).
+#     Even a simultaneous stack-wide worst case leaves the
 #     VM able to fork — which is exactly what 2026-08-27 took away.
 #
 # Applied to every service, not just coord. Bounding only the container that
@@ -92,6 +94,15 @@
 #
 # Takes effect at the next container CREATE (`docker compose up -d` will
 # recreate; a running container is not retroactively bounded).
+# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════
+# Image pins. Every third-party `image:` is `<name>:<tag>@sha256:<digest>`
+# with `# released: … pinned: …` at least 14 days apart (plan
+# 2026-11-22-fetches-stop-depending-on-upstreams, D5). `released` is Docker
+# Hub's `tag_last_pushed` for the tag whose current digest is the pinned one
+# (a push date, read 2026-11-22), not the upstream project's release date.
+# scripts/tests/test_image_pins.py checks format and age only, offline; it
+# cannot detect a wrong digest or date. Its docstring records the method.
 # ═══════════════════════════════════════════════════════════════════════════
 services:
   # ───────────────────────────────────────────────────────────────────────
@@ -182,7 +193,9 @@ services:
   # ───────────────────────────────────────────────────────────────────────
   # Object store — S3-compatible blob storage (dev only): versitygw.
   #
-  # Replaced the archived MinIO (plan 2026-11-22-fetches-stop-depending-on-
+  # Replaced MinIO, whose repository GitHub reports as archived (repo API
+  # `archived: true`, read 2026-11-22; the API serves no archive date, the
+  # last push was 2026-04-24) (plan 2026-11-22-fetches-stop-depending-on-
   # upstreams, Phase 2). The engine was chosen by running the D7 conformance
   # subset (put, get, head, delete, multipart, presign, create-if-absent) and
   # both real clients (bazel-remote, sccache) against every candidate:
@@ -224,10 +237,15 @@ services:
       ROOT_ACCESS_KEY: ${S3_ACCESS_KEY:-qontinui_dev_s3}
       ROOT_SECRET_KEY: ${S3_SECRET_KEY:-qontinui_dev_s3_secret}
       VGW_REGION: ${S3_REGION:-us-east-1}
+      # Empty (the default) keeps object metadata in xattrs on /data. Set it
+      # to /meta to keep metadata as sidecar files on the meta volume instead
+      # — the remedy the entrypoint names on a filesystem without user xattrs.
+      VGW_META_SIDECAR: ${VGW_META_SIDECAR:-}
     ports:
       - "${S3_API_PORT:-9100}:9000"
     volumes:
       - canonical_object_store_data:/data
+      - canonical_object_store_meta:/meta
     # conformance: scripts/s3-conformance.py (D7 subset)
     healthcheck:
       # versitygw's own unauthenticated liveness route (`--health /health`).
@@ -546,8 +564,10 @@ services:
   #
   # The upstream image is distroless (no shell, no wget), so this service
   # has NO in-container healthcheck — there is nothing in the image to run
-  # one with, and nothing in this file waits on its health. Read liveness
-  # from the host: `curl -fsS http://127.0.0.1:${BAZEL_REMOTE_HTTP_PORT:-9094}/status`.
+  # one with, and nothing in this file waits on its health. The health signal
+  # is host-side instead: `bash scripts/bazel-remote-probe.sh` reads /status
+  # through the published port and exits 0 (healthy), 1 (answered wrong) or 2
+  # (no answer — UNKNOWN, not "down").
   #
   # AC validation: ON (Row 10 Item 7, 2026-05-15). The supervisor build
   # pool now writes real REAPI `ActionResult` protobufs
@@ -565,16 +585,17 @@ services:
     image: buchgr/bazel-remote-cache:v2.6.4@sha256:10285c1183e606679eb450b725c2495c055a45eb532a6c80f6b6f9771f6d2f67 # released: 2026-10-20 pinned: 2026-11-22
     container_name: qontinui-canonical-bazel-remote
     restart: unless-stopped
-    # The image runs as uid 65532 by default; the existing
-    # canonical_bazel_remote_data volume was written as root by the image
-    # this replaced, so run as root to keep it writable.
-    user: "0:0"
+    # Runs as the image's own non-root uid 65532; bazel-remote-init (below)
+    # hands the volume to that uid first, since the image this replaced wrote
+    # it as root.
     # PID containment — see the block above `services:`. Measured 34 PIDs.
     pids_limit: 4096
     depends_on:
       object-store:
         condition: service_healthy
       object-store-init:
+        condition: service_completed_successfully
+      bazel-remote-init:
         condition: service_completed_successfully
     # Image entrypoint hardcodes `--http_address=:8080 --dir=/data`;
     # `command` flags below append. --max_size is required by the binary
@@ -584,7 +605,7 @@ services:
     # as well as flags, so the secret stays off argv.
     command:
       - --max_size=${BAZEL_REMOTE_MAX_SIZE_GIB:-50}
-      - --grpc_port=9092
+      - --grpc_address=:9092
       - --s3.endpoint=${BAZEL_REMOTE_S3_ENDPOINT:-object-store:9000}
       - --s3.bucket=${BAZEL_REMOTE_BUCKET:-qontinui-bazel-remote}
       - --s3.auth_method=access_key
@@ -598,6 +619,31 @@ services:
       - "${BAZEL_REMOTE_GRPC_PORT:-9095}:9092"
     volumes:
       - canonical_bazel_remote_data:/data
+
+  # One-shot: give the bazel-remote volume to the image's non-root uid
+  # (65532, distroless `nonroot`). Idempotent — on a volume already owned by
+  # 65532 it changes nothing — and cheap after the first run, because it
+  # only walks when the top-level owner is wrong.
+  bazel-remote-init:
+    image: alpine:3.23.7@sha256:ff7f0c727dd796aa36787bfcd9a64bf35a6ce72a73451b3359fde849b6703d63 # released: 2026-10-23 pinned: 2026-11-22
+    container_name: qontinui-canonical-bazel-remote-init
+    # PID containment — see the block above `services:`. One-shot chown.
+    pids_limit: 4096
+    user: "0:0"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        if [ "$$(stat -c %u:%g /data)" != "65532:65532" ]; then
+          chown -R 65532:65532 /data
+          echo "bazel-remote volume handed to uid 65532"
+        else
+          echo "bazel-remote volume already owned by uid 65532"
+        fi
+    volumes:
+      - canonical_bazel_remote_data:/data
+    restart: "no"
 
   # ───────────────────────────────────────────────────────────────────────
   # NATS JetStream — durable, replayable event streams.
@@ -983,6 +1029,8 @@ volumes:
     name: qontinui_canonical_coord_mirrors
   canonical_object_store_data:
     name: qontinui_canonical_object_store_data
+  canonical_object_store_meta:
+    name: qontinui_canonical_object_store_meta
   canonical_object_store_fallback_data:
     name: qontinui_canonical_object_store_fallback_data
   # The retired MinIO's data. Declared but mounted by nothing, so neither
