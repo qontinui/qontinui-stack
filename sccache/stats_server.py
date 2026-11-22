@@ -16,12 +16,25 @@ sccache server here is dormant until Phase 6 cloud-burst).
 """
 from __future__ import annotations
 
+import datetime as _dt
+import hashlib
+import hmac
 import json
 import os
 import subprocess
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 BUCKET = os.environ.get("SCCACHE_BUCKET", "qontinui-sccache")
+
+# SHA-256 of the empty body: every request this module signs is a bodiless GET.
+_EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
+# Stop a runaway walk (a store that never clears IsTruncated) from pinning the
+# scrape forever; a bucket bigger than this reports an error, not a number.
+MAX_LIST_PAGES = 10_000
 
 
 def sccache_stats_json() -> dict:
@@ -41,32 +54,117 @@ def sccache_stats_json() -> dict:
         return {"error": f"{type(e).__name__}: {e}"}
 
 
-def bucket_stats() -> dict:
-    """Return { objects, size_bytes } for the sccache bucket. Uses `mc du`
-    against the `canonical` alias the entrypoint has already configured."""
+def _endpoint_url() -> str:
+    """The store's base URL from the same env sccache itself reads:
+    SCCACHE_ENDPOINT is host:port (or a full URL), SCCACHE_S3_USE_SSL picks
+    the scheme for the bare form."""
+    endpoint = os.environ.get("SCCACHE_ENDPOINT", "object-store:9000")
+    if "://" in endpoint:
+        return endpoint.rstrip("/")
+    use_ssl = os.environ.get("SCCACHE_S3_USE_SSL", "off").lower() in ("on", "true", "1", "yes")
+    return f"{'https' if use_ssl else 'http'}://{endpoint}"
+
+
+def _uri_encode(value: str) -> str:
+    return urllib.parse.quote(value, safe="-_.~")
+
+
+def _sign_get(url: str, query: dict[str, str], access_key: str, secret_key: str,
+              region: str, now: _dt.datetime) -> tuple[str, dict[str, str]]:
+    """Build a SigV4-signed (header auth) path-style GET. Returns the full URL
+    and the headers to send. Stdlib only, so the image needs no SDK."""
+    parts = urllib.parse.urlsplit(url)
+    host = parts.netloc
+    path = parts.path or "/"
+    canonical_query = "&".join(f"{_uri_encode(k)}={_uri_encode(v)}" for k, v in sorted(query.items()))
+    amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+    date = now.strftime("%Y%m%d")
+    headers = {"host": host, "x-amz-content-sha256": _EMPTY_SHA256, "x-amz-date": amz_date}
+    signed_headers = ";".join(sorted(headers))
+    canonical_headers = "".join(f"{k}:{headers[k]}\n" for k in sorted(headers))
+    canonical_request = "\n".join(
+        ["GET", path, canonical_query, canonical_headers, signed_headers, _EMPTY_SHA256]
+    )
+    scope = f"{date}/{region}/s3/aws4_request"
+    string_to_sign = "\n".join(
+        ["AWS4-HMAC-SHA256", amz_date, scope, hashlib.sha256(canonical_request.encode()).hexdigest()]
+    )
+    key = ("AWS4" + secret_key).encode()
+    for part in (date, region, "s3", "aws4_request"):
+        key = hmac.new(key, part.encode(), hashlib.sha256).digest()
+    signature = hmac.new(key, string_to_sign.encode(), hashlib.sha256).hexdigest()
+    out = {
+        "x-amz-content-sha256": _EMPTY_SHA256,
+        "x-amz-date": amz_date,
+        "Authorization": (
+            f"AWS4-HMAC-SHA256 Credential={access_key}/{scope}, "
+            f"SignedHeaders={signed_headers}, Signature={signature}"
+        ),
+    }
+    return f"{parts.scheme}://{host}{path}?{canonical_query}", out
+
+
+def _local(tag: str) -> str:
+    """Element tag without its XML namespace (stores differ on emitting one)."""
+    return tag.rsplit("}", 1)[-1]
+
+
+def list_bucket_totals(endpoint_url: str, bucket: str, access_key: str, secret_key: str,
+                       region: str = "us-east-1", timeout: float = 10.0,
+                       page_size: int = 1000) -> dict:
+    """Walk the bucket with S3 ListObjectsV2 and return
+    ``{"objects": N, "size_bytes": M}``, or ``{"error": "..."}``. Never raises.
+
+    Counts every object in the bucket (all prefixes): the whole-bucket totals
+    coord's sccache_metrics scrape has always received."""
+    objects = 0
+    size = 0
+    token: str | None = None
+    base = f"{endpoint_url.rstrip('/')}/{urllib.parse.quote(bucket, safe='')}"
     try:
-        # `mc du --json canonical/<bucket>` returns one JSON object per
-        # depth level; the top-level one (the bucket root) is what we want.
-        out = subprocess.run(
-            ["mc", "du", "--json", f"canonical/{BUCKET}"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if out.returncode != 0:
-            return {"error": out.stderr.strip() or "non-zero exit"}
-        last = None
-        for line in out.stdout.strip().splitlines():
-            if line:
-                last = json.loads(line)
-        if not last:
-            return {"objects": 0, "size_bytes": 0}
-        return {
-            "objects": last.get("objects", 0),
-            "size_bytes": last.get("size", 0),
-        }
-    except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError) as e:
+        for _page in range(MAX_LIST_PAGES):
+            query = {"list-type": "2", "max-keys": str(page_size)}
+            if token:
+                query["continuation-token"] = token
+            url, headers = _sign_get(base, query, access_key, secret_key, region,
+                                     _dt.datetime.now(_dt.timezone.utc))
+            req = urllib.request.Request(url, headers=headers, method="GET")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (configured endpoint)
+                root = ET.fromstring(resp.read())
+            truncated = False
+            token = None
+            for child in root:
+                name = _local(child.tag)
+                if name == "Contents":
+                    objects += 1
+                    for field in child:
+                        if _local(field.tag) == "Size" and field.text:
+                            size += int(field.text)
+                elif name == "IsTruncated":
+                    truncated = (child.text or "").strip().lower() == "true"
+                elif name == "NextContinuationToken":
+                    token = child.text
+            if not truncated:
+                return {"objects": objects, "size_bytes": size}
+            if not token:
+                return {"error": "listing truncated without a NextContinuationToken"}
+        return {"error": f"listing exceeded {MAX_LIST_PAGES} pages"}
+    except urllib.error.HTTPError as e:
+        body = e.read()[:300].decode("utf-8", "replace")
+        return {"error": f"HTTP {e.code} from the store: {body}"}
+    except (urllib.error.URLError, OSError, ET.ParseError, ValueError) as e:
         return {"error": f"{type(e).__name__}: {e}"}
+
+
+def bucket_stats() -> dict:
+    """Return { objects, size_bytes } for the sccache bucket by listing it
+    over S3, with the same endpoint and key pair the entrypoint gave sccache."""
+    access_key = os.environ.get("AWS_ACCESS_KEY_ID", "")
+    secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+    if not access_key or not secret_key:
+        return {"error": "AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY not set"}
+    region = os.environ.get("SCCACHE_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
+    return list_bucket_totals(_endpoint_url(), BUCKET, access_key, secret_key, region)
 
 
 def _stats_payload() -> dict:
@@ -84,11 +182,11 @@ def _prometheus_payload(stats: dict) -> str:
     objects = bucket.get("objects")
     size = bucket.get("size_bytes")
     if isinstance(objects, int):
-        lines.append("# HELP sccache_bucket_objects Object count in the shared sccache MinIO bucket.")
+        lines.append("# HELP sccache_bucket_objects Object count in the shared sccache object-store bucket.")
         lines.append("# TYPE sccache_bucket_objects gauge")
         lines.append(f'sccache_bucket_objects{{bucket="{BUCKET}"}} {objects}')
     if isinstance(size, int):
-        lines.append("# HELP sccache_bucket_size_bytes Total byte size of the shared sccache MinIO bucket.")
+        lines.append("# HELP sccache_bucket_size_bytes Total byte size of the shared sccache object-store bucket.")
         lines.append("# TYPE sccache_bucket_size_bytes gauge")
         lines.append(f'sccache_bucket_size_bytes{{bucket="{BUCKET}"}} {size}')
     local = stats.get("local", {})

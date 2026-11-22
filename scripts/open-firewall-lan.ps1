@@ -28,10 +28,21 @@ $LanSubnet = "192.168.178.0/24"
 $rules = @(
     @{ Name = "qontinui-stack-postgres-5433"; Port = 5433; DisplayName = "qontinui-stack canonical Postgres (5433/tcp)" },
     @{ Name = "qontinui-stack-redis-6380";    Port = 6380; DisplayName = "qontinui-stack canonical Redis (6380/tcp)" },
-    @{ Name = "qontinui-stack-minio-9100";    Port = 9100; DisplayName = "qontinui-stack canonical MinIO API (9100/tcp)" },
-    @{ Name = "qontinui-stack-minio-9101";    Port = 9101; DisplayName = "qontinui-stack canonical MinIO Console (9101/tcp)" },
+    @{ Name = "qontinui-stack-object-store-9100"; Port = 9100; DisplayName = "qontinui-stack canonical object store S3 API (9100/tcp)" },
     @{ Name = "qontinui-stack-coord-9870";    Port = 9870; DisplayName = "qontinui-stack coord service (9870/tcp)" }
 )
+
+# Rules for ports the stack no longer serves. The object store that replaced
+# MinIO (plan 2026-11-22-fetches-stop-depending-on-upstreams) has no console,
+# so 9101 is closed again rather than left open to nothing; 9100 keeps its
+# port under the new rule name above.
+$retiredRules = @("qontinui-stack-minio-9100", "qontinui-stack-minio-9101")
+foreach ($name in $retiredRules) {
+    if (Get-NetFirewallRule -Name $name -ErrorAction SilentlyContinue) {
+        Get-NetFirewallRule -Name $name | Remove-NetFirewallRule
+        Write-Host ("DEL {0,-32}  (retired)" -f $name)
+    }
+}
 
 foreach ($r in $rules) {
     Get-NetFirewallRule -Name $r.Name -ErrorAction SilentlyContinue | Remove-NetFirewallRule

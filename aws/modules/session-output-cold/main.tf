@@ -1,6 +1,6 @@
 # Cold-tier object storage for opt-in PTY output (coord-native sessions Phase 8).
 #
-# Replaces the dev MinIO `qontinui-session-output-cold` bucket when running on
+# Replaces the dev object store's `qontinui-session-output-cold` bucket when running on
 # AWS. This is the COLD tier of the three-tier PTY-output retention model:
 #
 #   Hot  — JetStream replay buffer (last 64 KB, session-active only).  In-NATS;
