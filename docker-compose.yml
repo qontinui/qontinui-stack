@@ -621,9 +621,10 @@ services:
       - canonical_bazel_remote_data:/data
 
   # One-shot: give the bazel-remote volume to the image's non-root uid
-  # (65532, distroless `nonroot`). Idempotent — on a volume already owned by
-  # 65532 it changes nothing — and cheap after the first run, because it
-  # only walks when the top-level owner is wrong.
+  # (65532, distroless `nonroot`). Idempotent: it looks for the FIRST entry
+  # anywhere under /data not owned by 65532:65532 (`find ... -print -quit`,
+  # which stops at one) and only then chowns the whole tree, so a volume whose
+  # top directory is right but whose contents are root-owned is still fixed.
   bazel-remote-init:
     image: alpine:3.23.7@sha256:ff7f0c727dd796aa36787bfcd9a64bf35a6ce72a73451b3359fde849b6703d63 # released: 2026-10-23 pinned: 2026-11-22
     container_name: qontinui-canonical-bazel-remote-init
@@ -635,7 +636,7 @@ services:
       - -c
       - |
         set -eu
-        if [ "$$(stat -c %u:%g /data)" != "65532:65532" ]; then
+        if [ -n "$$(find /data \( ! -user 65532 -o ! -group 65532 \) -print -quit)" ]; then
           chown -R 65532:65532 /data
           echo "bazel-remote volume handed to uid 65532"
         else

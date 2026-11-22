@@ -10,9 +10,11 @@
 # Exit codes:
 #   0  HEALTHY  — 200 and a JSON body carrying bazel-remote's status fields
 #   1  UNHEALTHY — it answered, but not with a 200 + status JSON
-#   2  UNKNOWN  — no answer at all (not listening, refused, timed out). That
-#                 is not evidence the service is down; read `docker compose ps`
-#                 and `docker compose logs bazel-remote` next.
+#   2  UNKNOWN  — no answer at all (not listening, refused, timed out), or
+#                 this host cannot judge (curl or python3 missing). Neither is
+#                 evidence the service is down; read `docker compose ps` and
+#                 `docker compose logs bazel-remote` next.
+#  64  usage error (an unknown argument) — nothing was probed.
 #
 # Options: --url <base> (default http://127.0.0.1:${BAZEL_REMOTE_HTTP_PORT:-9094}),
 #          --timeout <secs> (default 10).
@@ -27,6 +29,13 @@ while [ $# -gt 0 ]; do
         -h|--help) sed -n '2,/^set -uo/p' "$0" | sed 's/^# \{0,1\}//;$d'; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 64 ;;
     esac
+done
+
+for tool in curl python3; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        echo "bazel-remote: UNKNOWN — $tool is not installed here, so the answer cannot be judged"
+        exit 2
+    fi
 done
 
 body="$(mktemp)"

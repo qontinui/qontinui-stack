@@ -19,6 +19,7 @@ from __future__ import annotations
 import datetime as _dt
 import hashlib
 import hmac
+import http.client
 import json
 import os
 import subprocess
@@ -40,9 +41,13 @@ MAX_LIST_PAGES = 10_000
 # Wall-clock budget for one whole walk (every page together). A slow or huge
 # bucket answers {"error": ...} after this, rather than holding the scrape.
 LIST_DEADLINE_SECS = float(os.environ.get("SCCACHE_STATS_LIST_DEADLINE_SECS", "20"))
-# A walk's result is reused for this long, so N concurrent or rapid scrapes of
-# /stats and /metrics cost one walk, not N.
+# A walk's result is served for this long before a background refresh starts.
+# Scrapes never wait on a walk (coord's scrape times out at 3 s; a walk may take
+# up to LIST_DEADLINE_SECS): they get the last completed result.
 CACHE_TTL_SECS = float(os.environ.get("SCCACHE_STATS_CACHE_TTL_SECS", "45"))
+# The very first scrape, before any walk has finished, waits at most this long
+# for the first result, then answers that totals are not computed yet.
+FIRST_RESULT_WAIT_SECS = float(os.environ.get("SCCACHE_STATS_FIRST_WAIT_SECS", "2"))
 
 
 def sccache_stats_json() -> dict:
@@ -167,30 +172,83 @@ def list_bucket_totals(endpoint_url: str, bucket: str, access_key: str, secret_k
     except urllib.error.HTTPError as e:
         body = e.read()[:300].decode("utf-8", "replace")
         return {"error": f"HTTP {e.code} from the store: {body}"}
-    except (urllib.error.URLError, OSError, ET.ParseError, ValueError) as e:
+    except (urllib.error.URLError, http.client.HTTPException, OSError, ET.ParseError, ValueError) as e:
         if time.monotonic() >= give_up_at:
             return {"error": f"listing exceeded its {budget:g}s deadline after {objects} objects ({type(e).__name__})"}
         return {"error": f"{type(e).__name__}: {e}"}
 
 
-_cache_lock = threading.Lock()
-_cache: dict = {"at": None, "value": None}
+class _Totals:
+    """Stale-while-revalidate holder for the bucket totals.
+
+    One walk at a time runs in a background thread; readers take the last
+    completed result under a lock held only for the read, never across a walk.
+    A result older than CACHE_TTL_SECS starts a refresh and is still served
+    (with ``age_secs`` so a reader can see how old it is). Errors are cached
+    the same way, so a failing store is not hammered."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.value: dict | None = None
+        self.at: float | None = None
+        self.refreshing = False
+        self.first_done = threading.Event()
+        self.walks = 0
+        self.generation = 0
+
+    def reset(self) -> None:
+        """Forget every result; a walk still running from before is ignored."""
+        with self.lock:
+            self.value, self.at, self.refreshing, self.walks = None, None, False, 0
+            self.first_done = threading.Event()
+            self.generation += 1
+
+    def _refresh(self, generation: int) -> None:
+        try:
+            value = _bucket_stats_uncached()
+        except Exception as e:  # noqa: BLE001 — a walk must never kill the refresher
+            value = {"error": f"{type(e).__name__}: {e}"}
+        with self.lock:
+            if generation != self.generation:
+                return
+            self.value, self.at, self.refreshing = value, time.monotonic(), False
+            self.walks += 1
+            done = self.first_done
+        done.set()
+
+    def kick(self) -> None:
+        """Start a background walk unless one is running or the result is fresh."""
+        with self.lock:
+            fresh = self.at is not None and time.monotonic() - self.at < CACHE_TTL_SECS
+            if self.refreshing or fresh:
+                return
+            self.refreshing = True
+            generation = self.generation
+        threading.Thread(target=self._refresh, args=(generation,), name="bucket-totals", daemon=True).start()
+
+    def get(self) -> dict:
+        self.kick()
+        with self.lock:
+            done = self.first_done
+            have = self.value is not None
+        if not have:
+            done.wait(FIRST_RESULT_WAIT_SECS)
+        with self.lock:
+            if self.value is None:
+                return {"error": "bucket totals not computed yet (first walk in progress)"}
+            out = dict(self.value)
+            out["age_secs"] = round(time.monotonic() - self.at, 1)
+            return out
+
+
+_totals = _Totals()
 
 
 def bucket_stats() -> dict:
-    """Return { objects, size_bytes } for the sccache bucket by listing it
-    over S3, with the same endpoint and key pair the entrypoint gave sccache.
-
-    Cached for CACHE_TTL_SECS (errors too, so a failing store is not hammered);
-    the lock makes concurrent scrapes wait for one walk instead of starting
-    their own."""
-    with _cache_lock:
-        now = time.monotonic()
-        if _cache["at"] is not None and now - _cache["at"] < CACHE_TTL_SECS:
-            return dict(_cache["value"])
-        value = _bucket_stats_uncached()
-        _cache["at"], _cache["value"] = time.monotonic(), value
-        return dict(value)
+    """Return { objects, size_bytes, age_secs } (or { error, age_secs }) for the
+    sccache bucket, from the last completed background walk. Never blocks on a
+    walk beyond FIRST_RESULT_WAIT_SECS on the very first call."""
+    return _totals.get()
 
 
 def _bucket_stats_uncached() -> dict:
@@ -286,11 +344,18 @@ class Handler(BaseHTTPRequestHandler):
         return
 
 
+def make_server(host: str = "0.0.0.0", port: int = 4227) -> ThreadingHTTPServer:
+    """The server main() runs: threaded, so one slow request never blocks
+    /health, with daemon request threads."""
+    srv = ThreadingHTTPServer((host, port), Handler)
+    srv.daemon_threads = True
+    return srv
+
+
 def main() -> None:
     port = int(os.environ.get("SCCACHE_STATS_PORT", "4227"))
-    # Threaded, so a slow bucket walk on one request never blocks /health.
-    srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
-    srv.daemon_threads = True
+    srv = make_server("0.0.0.0", port)
+    _totals.kick()  # warm the totals before the first scrape arrives
     print(f"[sccache-stats] listening on :{port}", flush=True)
     srv.serve_forever()
 

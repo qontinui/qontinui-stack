@@ -173,7 +173,7 @@ FIVE = {"sccache/a/1": 100, "sccache/a/2": 250, "sccache/b/3": 1, "sccache/c/4":
 
 class StubListingTests(unittest.TestCase):
     def setUp(self) -> None:
-        stats._cache.update(at=None, value=None)
+        stats._totals.reset()
 
     def test_walk_counts_every_object_across_pages(self) -> None:
         with _ListStub(FIVE) as stub:
@@ -222,32 +222,74 @@ class StubListingTests(unittest.TestCase):
         return {"SCCACHE_ENDPOINT": stub.url, "SCCACHE_REGION": REGION,
                 "AWS_ACCESS_KEY_ID": ACCESS, "AWS_SECRET_ACCESS_KEY": SECRET}
 
-    def test_bucket_stats_is_cached_within_the_ttl(self) -> None:
+    @staticmethod
+    def _wait_for(pred, secs: float = 5.0) -> bool:
+        end = time.monotonic() + secs
+        while time.monotonic() < end:
+            if pred():
+                return True
+            time.sleep(0.02)
+        return pred()
+
+    @staticmethod
+    def _totals_only(d: dict) -> dict:
+        return {k: v for k, v in d.items() if k != "age_secs"}
+
+    def test_bucket_stats_is_served_from_the_last_walk_within_the_ttl(self) -> None:
         with _ListStub(FIVE) as stub, mock.patch.dict(os.environ, self._env(stub)), \
                 mock.patch.object(stats, "CACHE_TTL_SECS", 60.0):
             first = stats.bucket_stats()
             served = stub.pages_served
             second = stats.bucket_stats()
-            self.assertEqual(first, second)
+            self.assertEqual(self._totals_only(first), self._totals_only(second))
+            self.assertIn("age_secs", second)
             self.assertEqual(stub.pages_served, served, "a second scrape inside the TTL walks nothing")
+            self.assertEqual(stats._totals.walks, 1)
 
-    def test_bucket_stats_walks_again_after_the_ttl(self) -> None:
+    def test_n_concurrent_scrapes_cost_one_walk(self) -> None:
+        with _ListStub(FIVE, page_delay=0.3) as stub, mock.patch.dict(os.environ, self._env(stub)), \
+                mock.patch.object(stats, "CACHE_TTL_SECS", 60.0), \
+                mock.patch.object(stats, "FIRST_RESULT_WAIT_SECS", 2.0):
+            results: list[dict] = []
+            threads = [threading.Thread(target=lambda: results.append(stats.bucket_stats())) for _ in range(10)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(10)
+            self.assertEqual(len(results), 10)
+            self.assertEqual(stub.pages_served, 1, "ten concurrent scrapes, one single-page walk")
+            self.assertEqual(stats._totals.walks, 1)
+            for r in results:
+                self.assertEqual(self._totals_only(r), {"objects": 5, "size_bytes": sum(FIVE.values())})
+
+    def test_a_stale_result_is_served_at_once_while_a_slow_refresh_runs(self) -> None:
         with _ListStub(FIVE) as stub, mock.patch.dict(os.environ, self._env(stub)), \
                 mock.patch.object(stats, "CACHE_TTL_SECS", 0.0):
-            stats.bucket_stats()
-            served = stub.pages_served
-            stats.bucket_stats()
-            self.assertGreater(stub.pages_served, served)
+            stats.bucket_stats()  # first walk completes (fast)
+            stub.page_delay = 3.0  # every later walk is slow
+            started = time.monotonic()
+            got = stats.bucket_stats()  # stale: kicks a refresh, does not wait for it
+            self.assertLess(time.monotonic() - started, 1.0, "a scrape never waits on a walk")
+            self.assertEqual(self._totals_only(got), {"objects": 5, "size_bytes": sum(FIVE.values())})
+            self.assertTrue(self._wait_for(lambda: stub.pages_served >= 2), "the refresh started")
 
-    def test_health_answers_while_a_stats_walk_is_in_flight(self) -> None:
+    def test_first_scrape_during_a_slow_first_walk_says_not_computed_yet(self) -> None:
+        with _ListStub(FIVE, page_delay=2.0) as stub, mock.patch.dict(os.environ, self._env(stub)), \
+                mock.patch.object(stats, "FIRST_RESULT_WAIT_SECS", 0.2):
+            started = time.monotonic()
+            got = stats.bucket_stats()
+            self.assertLess(time.monotonic() - started, 1.0)
+            self.assertIn("not computed yet", got.get("error", ""))
+            self.assertNotIn("objects", got)
+
+    def test_health_answers_while_a_stats_request_is_in_flight(self) -> None:
         release = threading.Event()
 
         def slow_bucket_stats() -> dict:
             release.wait(5)
             return {"objects": 1, "size_bytes": 1}
 
-        srv = ThreadingHTTPServer(("127.0.0.1", 0), stats.Handler)
-        srv.daemon_threads = True
+        srv = stats.make_server("127.0.0.1", 0)  # the server main() runs
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         base = f"http://127.0.0.1:{srv.server_address[1]}"
         try:
@@ -265,6 +307,28 @@ class StubListingTests(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
 
+    def test_a_malformed_http_answer_is_an_error_not_an_exception(self) -> None:
+        # A store that answers with a garbage status line raises
+        # http.client.BadStatusLine, which is not an OSError.
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+
+        def answer() -> None:
+            conn, _ = srv.accept()
+            conn.recv(65536)
+            conn.sendall(b"NOT-HTTP garbage\r\n\r\n")
+            conn.close()
+
+        threading.Thread(target=answer, daemon=True).start()
+        try:
+            got = stats.list_bucket_totals(f"http://127.0.0.1:{port}", "b", ACCESS, SECRET, REGION, timeout=3)
+        finally:
+            srv.close()
+        self.assertIn("error", got)
+        self.assertNotIn("objects", got)
+
     def test_bucket_stats_reads_the_sccache_env(self) -> None:
         with _ListStub(FIVE) as stub:
             host = stub.url.removeprefix("http://")
@@ -272,7 +336,7 @@ class StubListingTests(unittest.TestCase):
                    "AWS_ACCESS_KEY_ID": ACCESS, "AWS_SECRET_ACCESS_KEY": SECRET}
             with mock.patch.dict(os.environ, env):
                 got = stats.bucket_stats()
-        self.assertEqual(got, {"objects": 5, "size_bytes": sum(FIVE.values())})
+        self.assertEqual(self._totals_only(got), {"objects": 5, "size_bytes": sum(FIVE.values())})
 
     def test_bucket_stats_without_credentials_is_an_error(self) -> None:
         with mock.patch.dict(os.environ, {"AWS_ACCESS_KEY_ID": "", "AWS_SECRET_ACCESS_KEY": ""}):

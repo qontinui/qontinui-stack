@@ -15,6 +15,13 @@
 # it through and mounts a dedicated volume there) and metadata is kept there as
 # files instead. Empty means unset.
 #
+# Pick ONE mode per volume and keep it. Switching an existing volume between
+# xattrs and VGW_META_SIDECAR does not move metadata: objects written in the
+# old mode lose their ETag, content type and user metadata in the new one, and
+# the bucket policy goes with them. To switch, copy the data into a fresh
+# store in the new mode (scripts/s3-migrate-from-minio.sh works between any
+# two endpoints).
+#
 # Environment (all set by docker-compose.yml):
 #   ROOT_ACCESS_KEY / ROOT_SECRET_KEY  root credentials (from S3_ACCESS_KEY /
 #                                      S3_SECRET_KEY); read by versitygw itself

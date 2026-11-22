@@ -132,7 +132,10 @@ store and against its fallback.
   xattrs on the volume's files. Docker's local volumes (ext4, xfs, Docker
   Desktop's WSL2 ext4) support them. The container checks this at start and
   refuses to serve on a filesystem that does not, naming the `VGW_META_SIDECAR`
-  sidecar-metadata alternative.
+  sidecar-metadata alternative (`VGW_META_SIDECAR=/meta`). Choose one mode per
+  volume: switching an existing volume between xattrs and the sidecar does not
+  move metadata, so objects written before the switch lose theirs. Switch by
+  copying into a fresh store instead.
 - **Fallback.** SeaweedFS 4.52 is `object-store-seaweedfs`, behind
   `--profile fallback-store`. It answers as `object-store` on the same port and
   has its own volume. The switch commands are in the comment above the service in
@@ -155,6 +158,10 @@ store and against its fallback.
   ```
 
   Then copy the data across with `scripts/s3-migrate-from-minio.sh`, below.
+  Anything clients write to the new store between the cutover and the copy is
+  reported by the script's verification as `only on destination`. That is
+  expected for those keys, but it makes the run exit 1, so run the copy
+  before restarting the clients, or check the listed keys by hand.
 - **bazel-remote health** is read from the host with
   `bash scripts/bazel-remote-probe.sh` (its upstream image is distroless, so
   the container has no healthcheck). Its volume is handed to the image's
