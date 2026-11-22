@@ -291,6 +291,24 @@ def _read(path: Path) -> dict | None:
         return None
 
 
+CONTROL_BROKEN_OPS = ["create_if_absent", "presign"]
+
+
+def controls_are_valid(controls: dict) -> bool:
+    """D8's negative control: the run counts only when both controls read as designed."""
+    broken, good = controls.get("broken") or {}, controls.get("conforming") or {}
+    failed = sorted(op for op, v in (broken.get("operations") or {}).items() if v != "PASS")
+    broken_ok = (
+        failed == CONTROL_BROKEN_OPS
+        and len(broken.get("operations") or {}) == 7
+        and isinstance(broken.get("exit_code"), int)
+        and broken["exit_code"] != 0
+    )
+    good_ops = good.get("operations") or {}
+    good_ok = len(good_ops) == 7 and all(v == "PASS" for v in good_ops.values()) and good.get("exit_code") == 0
+    return broken_ok and good_ok
+
+
 def decide(pins: dict, results_dir: Path) -> dict:
     """Apply D8's rule, in order, to every candidate record in ``results_dir``.
 
@@ -359,6 +377,13 @@ def decide(pins: dict, results_dir: Path) -> dict:
             "exit_code": ctrl.get("exit_code"),
             "operations": {o["op"]: o["verdict"] for o in ctrl.get("operations", [])},
         }
+    controls_valid = controls_are_valid(controls)
+    if not controls_valid:
+        # A void run decides nothing: no pick, no runner-up, and not a falsification either.
+        ranked, falsified = [], False
+        notes.insert(0, "controls are VOID (or missing): the broken stub must fail exactly create_if_absent "
+                        "and presign with a non-zero exit, and the conforming stub must pass all seven with exit 0; "
+                        "nothing is decided")
     return {
         "schema": "s3-candidates-decision/v1",
         "rule": [
@@ -376,6 +401,8 @@ def decide(pins: dict, results_dir: Path) -> dict:
         "pick": ranked[0]["name"] if ranked else None,
         "runner_up": ranked[1]["name"] if len(ranked) > 1 else None,
         "notes": notes,
+        "controls_valid": controls_valid,
+        "void": not controls_valid,
         "premise_falsified": falsified,
         "decided_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
     }
@@ -387,6 +414,9 @@ def cmd_decide(a: argparse.Namespace) -> int:
     print(f"ranking={result['ranking']} pick={result['pick']} runner_up={result['runner_up']}")
     for note in result["notes"]:
         print(f"note: {note}")
+    if result["void"]:
+        print("controls VOID: this run decides nothing (D8)", file=sys.stderr)
+        return 1
     if result["premise_falsified"]:
         print("NO candidate passes all seven operations: premise FALSIFIED (D8) — halt", file=sys.stderr)
         return 4

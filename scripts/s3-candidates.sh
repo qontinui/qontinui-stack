@@ -27,15 +27,20 @@
 # and finally writes decision.json with D8's rule applied in order.
 #
 # No Docker and no root: everything runs as the invoking user under --work-dir.
-# Credentials are generated per run and passed by environment variable name;
-# they are throwaway, never written to --out-dir, and never printed.
+# Credentials are generated per run and passed by environment variable name.
+# They are throwaway and are never printed. Nothing under --out-dir carries them:
+# a failure record names the log under --work-dir instead of copying from it.
+# --work-dir itself does hold them (store configs written 0600, store logs), so
+# treat it as throwaway and delete it after the run.
 #
 # Usage:
 #   scripts/s3-candidates.sh --out-dir DIR [--work-dir DIR] [--bin-cache DIR]
 #                            [--candidate NAME]... [--idle-secs N] [--skip-clients]
 #
 # Exit: 0 a pick was made; 4 no candidate passes all seven (premise falsified,
-#       D8 — halt); 2 usage / preflight; 3 a pin failed verification.
+#       D8 — halt); 2 usage / preflight; 3 a pin failed verification (sha256
+#       mismatch or cooldown); 5 a download failed (network, not a mismatch);
+#       1 the controls were void, or a step of the run itself failed.
 
 set -euo pipefail
 
@@ -93,20 +98,39 @@ fi
 
 # ── process bookkeeping: only PIDs this script started are ever signalled ──
 PIDS=()
+forget_pid() {
+    local pid="$1" p kept=()
+    for p in "${PIDS[@]}"; do [ "$p" != "$pid" ] && kept+=("$p"); done
+    PIDS=("${kept[@]}")
+}
+# True only while PID is still a live child of THIS shell: a PID that exited and
+# was reused by some other process is never signalled.
+is_our_child() {
+    local pid="$1" ppid
+    ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')" || return 1
+    [ "$ppid" = "$$" ]
+}
 stop_pid() {
     local pid="$1"
+    forget_pid "$pid"
+    is_our_child "$pid" || return 0
     kill -TERM "$pid" 2>/dev/null || return 0
     for _ in $(seq 1 40); do
-        kill -0 "$pid" 2>/dev/null || return 0
+        kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null || true; return 0; }
         sleep 0.25
     done
-    kill -KILL "$pid" 2>/dev/null || true
+    is_our_child "$pid" && kill -KILL "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null || true
 }
+SCCACHE_BIN=""
+SCCACHE_PORT_STARTED=""   # the port of an sccache server this script started, while it may be up
 cleanup() {
     local pid
-    for pid in "${PIDS[@]:-}"; do [ -n "$pid" ] && stop_pid "$pid"; done
-    if [ -n "${SCCACHE_BIN:-}" ] && [ -n "${SCCACHE_SERVER_PORT:-}" ]; then
-        "$SCCACHE_BIN" --stop-server >/dev/null 2>&1 || true
+    for pid in "${PIDS[@]}"; do stop_pid "$pid"; done
+    if [ -n "$SCCACHE_BIN" ] && [ -n "$SCCACHE_PORT_STARTED" ]; then
+        # The port must be in the environment, or --stop-server addresses the
+        # default 4226 server, which this script did not start.
+        SCCACHE_SERVER_PORT="$SCCACHE_PORT_STARTED" "$SCCACHE_BIN" --stop-server >/dev/null 2>&1 || true
     fi
 }
 trap cleanup EXIT
@@ -122,42 +146,67 @@ fetch_pinned() {
         log "REFUSING $name $PIN_VERSION: inside the release-age cooldown ($why)"
         return 3
     fi
+    # The cache saves only the download. The cached asset is re-hashed against
+    # the pin on every use and the binary is unpacked afresh from it, so nothing
+    # in the cache is trusted on the strength of a file saying it was verified.
+    # (This runs in a command substitution under `||`, where set -e is off, so
+    # every step is checked explicitly.)
     local dir="${BIN_CACHE}/${name}-${PIN_VERSION}"
+    local asset="${dir}/dl/${PIN_ASSET}"
     local bin="${dir}/bin/${PIN_BINARY}"
-    local stamp="${dir}/verified.sha256"
-    if [ -x "$bin" ] && [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$PIN_SHA256" ]; then
-        printf '%s\n' "$bin"; return 0
+    if [ -f "$asset" ] && printf '%s  %s\n' "$PIN_SHA256" "$asset" | sha256sum -c --quiet - >/dev/null 2>&1; then
+        log "reusing cached $name $PIN_VERSION download (sha256 re-checked against the pin)"
+    else
+        rm -rf "$dir"
+        mkdir -p "${dir}/dl" || return 1
+        log "fetching $name $PIN_VERSION ($why)"
+        if ! curl -fsSL --retry 2 --max-time 600 -o "$asset" "$PIN_URL"; then
+            log "DOWNLOAD FAILED for $name $PIN_VERSION ($PIN_URL): a network or upstream failure, not a mismatch"
+            rm -rf "$dir"; return 5
+        fi
+        if ! printf '%s  %s\n' "$PIN_SHA256" "$asset" | sha256sum -c --quiet - >&2; then
+            log "REFUSING $name $PIN_VERSION: sha256 mismatch against the pin"
+            rm -rf "$dir"; return 3
+        fi
     fi
-    rm -rf "$dir"; mkdir -p "${dir}/dl" "${dir}/bin"
-    log "fetching $name $PIN_VERSION ($why)"
-    curl -fsSL --retry 2 --max-time 600 -o "${dir}/dl/${PIN_ASSET}" "$PIN_URL"
-    if ! printf '%s  %s\n' "$PIN_SHA256" "${dir}/dl/${PIN_ASSET}" | sha256sum -c --quiet - >&2; then
-        log "REFUSING $name $PIN_VERSION: sha256 mismatch"
-        rm -rf "$dir"; return 3
-    fi
+    rm -rf "${dir}/bin"
+    mkdir -p "${dir}/bin" || return 1
     case "$PIN_ARCHIVE" in
-        none) install -m 0755 "${dir}/dl/${PIN_ASSET}" "${dir}/bin/${PIN_BINARY}" ;;
-        tar.gz) tar -xzf "${dir}/dl/${PIN_ASSET}" -C "${dir}/bin" --no-same-owner ;;
+        none) install -m 0755 "$asset" "$bin" || return 1 ;;
+        tar.gz) tar -xzf "$asset" -C "${dir}/bin" --no-same-owner || { log "$name: unpack failed"; return 1; } ;;
         *) log "unknown archive type $PIN_ARCHIVE"; return 3 ;;
     esac
     [ -x "$bin" ] || { log "$name: $PIN_BINARY not found after unpack"; return 3; }
-    printf '%s\n' "$PIN_SHA256" >"$stamp"
     printf '%s\n' "$bin"
+}
+
+# One field of a pin entry (e.g. version), for records written by this script.
+pin_field() {
+    local section="$1" name="$2" field="$3"
+    lib pin-env --pins "$PINS" --section "$section" --name "$name" \
+        | sed -n "s/^PIN_${field}=//p" | tr -d "'"
 }
 
 licence_screen() {
     local name="$1" PIN_LICENSE_URL
     eval "$(lib pin-env --pins "$PINS" --section candidate --name "$name" | grep '^PIN_LICENSE_URL=')"
     local d="${WORK_DIR}/licence-${name}"
-    rm -rf "$d"; mkdir -p "$d"
-    curl -fsSL --retry 2 --max-time 60 -o "${d}/LICENSE" "$PIN_LICENSE_URL"
+    rm -rf "$d"; mkdir -p "$d" || return 1
+    if ! curl -fsSL --retry 2 --max-time 60 -o "${d}/LICENSE" "$PIN_LICENSE_URL"; then
+        log "DOWNLOAD FAILED for $name's LICENSE ($PIN_LICENSE_URL)"
+        return 5
+    fi
+    # exit 1 = screened out (recorded); anything else is a failure of the step.
     lib licence --pins "$PINS" --name "$name" --file "${d}/LICENSE" --out "${OUT_DIR}/${name}.licence.json"
 }
 
 new_credentials() {
     # Garage requires its own key-id shape (GK + 24 hex); the other stores accept any.
-    CAND_ACCESS_KEY="GK$(openssl rand -hex 12)"
-    CAND_SECRET_KEY="$(openssl rand -hex 32)"
+    local ak sk
+    ak="$(openssl rand -hex 12)" && sk="$(openssl rand -hex 32)" || return 1
+    [ "${#ak}" -eq 24 ] && [ "${#sk}" -eq 64 ] || return 1
+    CAND_ACCESS_KEY="GK${ak}"
+    CAND_SECRET_KEY="${sk}"
     export CAND_ACCESS_KEY CAND_SECRET_KEY
 }
 
@@ -166,6 +215,7 @@ start_garage() {
     local bin="$1" d="$2" s3 rpc admin
     read -r s3 rpc admin < <(lib ports 3)
     mkdir -p "$d/meta" "$d/data"
+    local old_umask; old_umask="$(umask)"
     umask 077
     cat >"$d/garage.toml" <<EOF
 metadata_dir = "$d/meta"
@@ -184,7 +234,7 @@ root_domain = ".s3.garage.localhost"
 [admin]
 api_bind_addr = "127.0.0.1:$admin"
 EOF
-    umask 022
+    umask "$old_umask"
     "$bin" -c "$d/garage.toml" server >"$d/server.log" 2>&1 &
     CAND_PID=$!; PIDS+=("$CAND_PID")
     lib wait-port 127.0.0.1 "$rpc" 30 || { log "garage rpc did not open"; return 1; }
@@ -194,13 +244,13 @@ EOF
         sleep 0.5
     done
     [ -n "$node" ] || { log "garage node id unavailable"; return 1; }
-    "$bin" -c "$d/garage.toml" layout assign -z dc1 -c 10G "$node" >>"$d/setup.log" 2>&1
-    "$bin" -c "$d/garage.toml" layout apply --version 1 >>"$d/setup.log" 2>&1
+    "$bin" -c "$d/garage.toml" layout assign -z dc1 -c 10G "$node" >>"$d/setup.log" 2>&1 || return 1
+    "$bin" -c "$d/garage.toml" layout apply --version 1 >>"$d/setup.log" 2>&1 || return 1
     # The secret reaches garage's argv here: a throwaway per-run test key on a
     # loopback-only node, which `key import` accepts no other way.
-    "$bin" -c "$d/garage.toml" key import --yes -n conformance "$CAND_ACCESS_KEY" "$CAND_SECRET_KEY" >>"$d/setup.log" 2>&1
-    "$bin" -c "$d/garage.toml" bucket create "$BUCKET" >>"$d/setup.log" 2>&1
-    "$bin" -c "$d/garage.toml" bucket allow --read --write --owner "$BUCKET" --key conformance >>"$d/setup.log" 2>&1
+    "$bin" -c "$d/garage.toml" key import --yes -n conformance "$CAND_ACCESS_KEY" "$CAND_SECRET_KEY" >>"$d/setup.log" 2>&1 || return 1
+    "$bin" -c "$d/garage.toml" bucket create "$BUCKET" >>"$d/setup.log" 2>&1 || return 1
+    "$bin" -c "$d/garage.toml" bucket allow --read --write --owner "$BUCKET" --key conformance >>"$d/setup.log" 2>&1 || return 1
     ENDPOINT="http://127.0.0.1:$s3"
     lib wait-port 127.0.0.1 "$s3" 30
 }
@@ -209,13 +259,14 @@ start_seaweedfs() {
     local bin="$1" d="$2" m mg v vg f fg s sg ic ln
     read -r m mg v vg f fg s sg ic ln < <(lib ports 10)
     mkdir -p "$d/data"
+    local old_umask; old_umask="$(umask)"
     umask 077
     cat >"$d/s3.json" <<EOF
 {"identities": [{"name": "conformance",
   "credentials": [{"accessKey": "$CAND_ACCESS_KEY", "secretKey": "$CAND_SECRET_KEY"}],
   "actions": ["Admin", "Read", "List", "Tagging", "Write"]}]}
 EOF
-    umask 022
+    umask "$old_umask"
     "$bin" server -dir="$d/data" -ip=127.0.0.1 -ip.bind=127.0.0.1 \
         -master.port="$m" -master.port.grpc="$mg" \
         -volume.port="$v" -volume.port.grpc="$vg" -volume.max=0 \
@@ -272,7 +323,12 @@ PY
 # ── client round trips; each writes $OUT_DIR/<cand>.client-<name>.json ──
 bazel_remote_round_trip() {
     local cand="$1" d="$2" out="$3"
-    local br; br="$(fetch_pinned client bazel-remote)" || { write_unknown "$out" "bazel-remote binary unobtainable or refused by its pin"; return 0; }
+    local br br_rc=0; br="$(fetch_pinned client bazel-remote)" || br_rc=$?
+    if [ "$br_rc" -ne 0 ]; then
+        write_unknown "$out" "bazel-remote binary unobtainable (fetch_pinned exit $br_rc: 3 pin refused, 5 download failed)"
+        return 0
+    fi
+    local br_version; br_version="$(pin_field client bazel-remote VERSION)"
     local hostport="${ENDPOINT#http://}" p1 g1 p2 g2
     read -r p1 g1 p2 g2 < <(lib ports 4)
     mkdir -p "$d/br-a" "$d/br-b"
@@ -301,10 +357,10 @@ bazel_remote_round_trip() {
     if [ -f "$d/blob.back" ] && cmp -s "$d/blob.bin" "$d/blob.back"; then equal=true; fi
     local verdict=FAIL
     if [ "$put_status" = 200 ] && [ -n "$key" ] && [ "$get_status" = 200 ] && [ "$equal" = true ]; then verdict=PASS; fi
-    python3 -I - "$out" "$verdict" "$put_status" "$key" "$get_status" "$equal" "$sha" <<'PY'
+    python3 -I - "$out" "$verdict" "$put_status" "$key" "$get_status" "$equal" "$sha" "$br_version" <<'PY'
 import json, sys
-out, verdict, put, key, get, equal, sha = sys.argv[1:]
-json.dump({"client": "bazel-remote", "version": "v2.6.4", "verdict": verdict,
+out, verdict, put, key, get, equal, sha, version = sys.argv[1:]
+json.dump({"client": "bazel-remote", "version": version, "verdict": verdict,
            "cas_put_status_instance_a": put, "s3_object_key": key or None,
            "cas_get_status_instance_b_empty_disk": get, "bytes_equal": equal == "true",
            "blob_sha256": sha, "blob_bytes": 200000,
@@ -317,7 +373,13 @@ PY
 
 sccache_round_trip() {
     local cand="$1" d="$2" out="$3"
-    SCCACHE_BIN="$(fetch_pinned client sccache)" || { SCCACHE_BIN=""; write_unknown "$out" "sccache binary unobtainable or refused by its pin"; return 0; }
+    local sc_rc=0; SCCACHE_BIN="$(fetch_pinned client sccache)" || sc_rc=$?
+    if [ "$sc_rc" -ne 0 ]; then
+        SCCACHE_BIN=""
+        write_unknown "$out" "sccache binary unobtainable (fetch_pinned exit $sc_rc: 3 pin refused, 5 download failed)"
+        return 0
+    fi
+    local sc_version; sc_version="$(pin_field client sccache VERSION)"
     command -v cargo >/dev/null 2>&1 || { write_unknown "$out" "cargo/rustc not on PATH, so no compile can be cached"; return 0; }
     local crate="$d/hello-crate"
     mkdir -p "$crate/src" "$d/sccache-local" "$d/xdg"
@@ -332,7 +394,7 @@ path = "src/lib.rs"
 EOF
     printf 'pub fn hello() -> &%sstatic str {\n    "hello, world"\n}\n' "'" >"$crate/src/lib.rs"
     local port; read -r port < <(lib ports 1)
-    SCCACHE_SERVER_PORT="$port"
+    SCCACHE_PORT_STARTED="$port"
     local -a env=(
         SCCACHE_BUCKET="$BUCKET" SCCACHE_ENDPOINT="${ENDPOINT#http://}" SCCACHE_S3_USE_SSL=off
         SCCACHE_REGION="$REGION" SCCACHE_S3_KEY_PREFIX="sccache" SCCACHE_SERVER_PORT="$port"
@@ -344,27 +406,31 @@ EOF
     )
     : >"$d/xdg/none.toml"
     local build_rc=0
+    # Chained with &&: under `|| build_rc=$?` set -e is off, so a plain list
+    # would report only its last command's status.
     {
-        env "${env[@]}" "$SCCACHE_BIN" --start-server
-        env "${env[@]}" "$SCCACHE_BIN" --zero-stats >/dev/null
-        env "${env[@]}" CARGO_TARGET_DIR="$d/target-1" cargo build --manifest-path "$crate/Cargo.toml" --offline -q
-        env "${env[@]}" "$SCCACHE_BIN" --show-stats --stats-format json >"$d/stats-1.json"
-        env "${env[@]}" "$SCCACHE_BIN" --stop-server >/dev/null
+        env "${env[@]}" "$SCCACHE_BIN" --start-server &&
+        env "${env[@]}" "$SCCACHE_BIN" --zero-stats >/dev/null &&
+        env "${env[@]}" CARGO_TARGET_DIR="$d/target-1" cargo build --manifest-path "$crate/Cargo.toml" --offline -q &&
+        env "${env[@]}" "$SCCACHE_BIN" --show-stats --stats-format json >"$d/stats-1.json" &&
+        env "${env[@]}" "$SCCACHE_BIN" --stop-server >/dev/null &&
         # Same target path, emptied: rustc's -L dependency=<target> argument is
         # part of sccache's hash key, so a different path would miss by design.
-        rm -rf "$d/target-1"
-        env "${env[@]}" "$SCCACHE_BIN" --start-server
-        env "${env[@]}" "$SCCACHE_BIN" --zero-stats >/dev/null
-        env "${env[@]}" CARGO_TARGET_DIR="$d/target-1" cargo build --manifest-path "$crate/Cargo.toml" --offline -q
-        env "${env[@]}" "$SCCACHE_BIN" --show-stats --stats-format json >"$d/stats-2.json"
+        rm -rf "$d/target-1" &&
+        env "${env[@]}" "$SCCACHE_BIN" --start-server &&
+        env "${env[@]}" "$SCCACHE_BIN" --zero-stats >/dev/null &&
+        env "${env[@]}" CARGO_TARGET_DIR="$d/target-1" cargo build --manifest-path "$crate/Cargo.toml" --offline -q &&
+        env "${env[@]}" "$SCCACHE_BIN" --show-stats --stats-format json >"$d/stats-2.json" &&
         env "${env[@]}" "$SCCACHE_BIN" --stop-server >/dev/null
     } >"$d/sccache-run.log" 2>&1 || build_rc=$?
-    SCCACHE_SERVER_PORT=""
+    # A failed step above may have left the server up: stop it by its own port.
+    SCCACHE_SERVER_PORT="$port" "$SCCACHE_BIN" --stop-server >/dev/null 2>&1 || true
+    SCCACHE_PORT_STARTED=""
     local count; count="$(uvpy "$LIB" s3-count --endpoint "$ENDPOINT" --access-key-env CAND_ACCESS_KEY \
         --secret-key-env CAND_SECRET_KEY --region "$REGION" --bucket "$BUCKET" --prefix sccache 2>/dev/null || echo '{}')"
-    python3 -I - "$out" "$d/stats-1.json" "$d/stats-2.json" "$build_rc" "$count" <<'PY'
+    python3 -I - "$out" "$d/stats-1.json" "$d/stats-2.json" "$build_rc" "$count" "$sc_version" <<'PY'
 import json, sys
-out, s1p, s2p, rc, count = sys.argv[1:]
+out, s1p, s2p, rc, count, version = sys.argv[1:]
 def load(p):
     try:
         return json.load(open(p))
@@ -385,7 +451,7 @@ rerr2 = sum(rerr2.get("counts", {}).values()) if isinstance(rerr2, dict) else 0
 location = s1.get("cache_location", "")
 objects = json.loads(count or "{}").get("objects", 0)
 ok = rc == "0" and writes1 >= 1 and werr1 == 0 and hits2 >= 1 and objects >= 1 and "s3" in location.lower()
-json.dump({"client": "sccache", "version": "v0.19.0", "verdict": "PASS" if ok else "FAIL",
+json.dump({"client": "sccache", "version": version, "verdict": "PASS" if ok else "FAIL",
            "build_exit": int(rc), "cache_location": location,
            "build_1_cache_writes": writes1, "build_1_cache_write_errors": werr1,
            "build_2_cache_hits": hits2, "build_2_cache_misses": miss2, "build_2_cache_errors": rerr2,
@@ -404,15 +470,14 @@ import json, sys
 json.dump({"verdict": "UNKNOWN", "reason": sys.argv[2]}, open(sys.argv[1], "w"), indent=2)
 PY
 }
+# A failure record names the log; it never copies from it. Store logs live under
+# --work-dir and may echo the run's credentials, which must not reach --out-dir.
 write_fail() {
     python3 -I - "$1" "$2" "$3" <<'PY'
 import json, sys
-tail = ""
-try:
-    tail = open(sys.argv[3], errors="replace").read()[-1500:]
-except OSError:
-    pass
-json.dump({"verdict": "FAIL", "reason": sys.argv[2], "log_tail": tail}, open(sys.argv[1], "w"), indent=2)
+json.dump({"verdict": "FAIL", "reason": sys.argv[2], "log": sys.argv[3],
+           "log_note": "under --work-dir; not copied here because a store log may echo the run's credentials"},
+          open(sys.argv[1], "w"), indent=2)
 PY
 }
 
@@ -420,24 +485,40 @@ PY
 run_candidate() {
     local name="$1"
     local d="${WORK_DIR}/run-${name}"
-    rm -rf "$d"; mkdir -p "$d"
-    local bin
-    bin="$(fetch_pinned candidate "$name")" || return 3
-    licence_screen "$name" || log "$name EXCLUDED by the licence screen (recorded)"
-    new_credentials
+    # run_candidate is called under `if`, where set -e is off, so every step is
+    # checked here. A recorded RESULT (licence screened out, store failed to
+    # start, conformance below 7/7) continues; a failure of the run itself
+    # returns non-zero and stops the run.
+    rm -rf "$d"; mkdir -p "$d" || return 1
+    local bin rc=0
+    bin="$(fetch_pinned candidate "$name")" || return $?
+    licence_screen "$name" || rc=$?
+    case "$rc" in
+        0) ;;
+        1) log "$name EXCLUDED by the licence screen (recorded)" ;;
+        5) return 5 ;;
+        *) log "$name licence screen could not run (exit $rc)"; return 1 ;;
+    esac
+    new_credentials || { log "could not generate credentials"; return 1; }
     CAND_PID=""; ENDPOINT=""
     if ! "start_${name}" "$bin" "$d"; then
-        log "$name failed to start; see $d/server.log"
-        write_fail "${OUT_DIR}/${name}.start.json" "start or setup failed" "$d/server.log"
+        log "$name failed to start; see $d/server.log and $d/setup.log"
+        write_fail "${OUT_DIR}/${name}.start.json" "start or setup failed" "$d"
         [ -n "$CAND_PID" ] && stop_pid "$CAND_PID"
         return 0
     fi
     log "$name up at $ENDPOINT (pid $CAND_PID); idling ${IDLE_SECS}s before the RSS read"
     sleep "$IDLE_SECS"
-    lib rss --pid "$CAND_PID" --out "${OUT_DIR}/${name}.idle.json"
+    lib rss --pid "$CAND_PID" --out "${OUT_DIR}/${name}.idle.json" || { log "$name: idle RSS unreadable"; return 1; }
+    rc=0
     uvpy "$CONFORMANCE" --endpoint "$ENDPOINT" --access-key-env CAND_ACCESS_KEY --secret-key-env CAND_SECRET_KEY \
-        --bucket "$BUCKET" --region "$REGION" --label "$name" --json-out "${OUT_DIR}/${name}.conformance.json" \
-        || log "$name conformance: not 7/7 PASS (recorded)"
+        --bucket "$BUCKET" --region "$REGION" --label "$name" --json-out "${OUT_DIR}/${name}.conformance.json" || rc=$?
+    case "$rc" in
+        0) ;;
+        1) log "$name conformance: not 7/7 PASS (recorded)" ;;
+        *) log "$name conformance executed nothing or could not run (exit $rc; recorded as such)" ;;
+    esac
+    [ -f "${OUT_DIR}/${name}.conformance.json" ] || { log "$name: conformance wrote no record"; return 1; }
     if [ "$SKIP_CLIENTS" -eq 0 ]; then
         bazel_remote_round_trip "$name" "$d" "${OUT_DIR}/${name}.client-bazel-remote.json"
         sccache_round_trip "$name" "$d" "${OUT_DIR}/${name}.client-sccache.json"
@@ -447,7 +528,7 @@ run_candidate() {
     fi
     stop_pid "$CAND_PID"
     # One record per candidate, assembled from the parts (decide reads it).
-    python3 -I - "$OUT_DIR" "$name" <<'PY'
+    python3 -I - "$OUT_DIR" "$name" <<'PY' || { log "$name: could not assemble its record"; return 1; }
 import json, sys
 from pathlib import Path
 out, name = Path(sys.argv[1]), sys.argv[2]
@@ -501,11 +582,16 @@ if ! run_controls; then
     exit 1
 fi
 
-rc=0
 for name in "${CANDIDATES[@]}"; do
     rm -f "${OUT_DIR}/${name}".*.json "${OUT_DIR}/${name}.json"
+    rc=0
     run_candidate "$name" || rc=$?
-    [ "$rc" -eq 3 ] && { log "pin verification failed for $name; stopping"; exit 3; }
+    case "$rc" in
+        0) ;;
+        3) log "pin verification failed for $name; stopping"; exit 3 ;;
+        5) log "a download failed for $name; stopping (retry when the upstream answers)"; exit 5 ;;
+        *) log "a step of the run failed for $name (exit $rc); stopping, nothing is decided"; exit 1 ;;
+    esac
 done
 
 lib decide --pins "$PINS" --results-dir "$OUT_DIR" --out "${OUT_DIR}/decision.json"
