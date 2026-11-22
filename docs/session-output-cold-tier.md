@@ -5,7 +5,7 @@ model introduced in Phase 8 of the coord-native-sessions plan
 (`qontinui-dev-notes/plans/2026-05-23-coord-native-sessions-phase-7-10.md`).
 
 This PR ships **only the storage substrate** — the S3 bucket, its IAM grant,
-and dev MinIO parity. The runtime streaming/redaction/eviction code lands with
+and dev object-store parity. The runtime streaming/redaction/eviction code lands with
 Phase 8 proper (in qontinui-runner + qontinui-coord). Nothing here is provisioned;
 `terraform apply` is an operator step (see "What remains for the operator").
 
@@ -108,16 +108,16 @@ and cold ceilings. They would live in coord's `tenant_policies` (alongside
 `session_coordination_enabled` from Phase 10), so they're settable per tenant
 without a redeploy.
 
-## Dev parity (MinIO)
+## Dev parity (the stack's object store)
 
-The dev stack mirrors the cold tier via a MinIO bucket created by the
+The dev stack mirrors the cold tier via an object-store bucket created by the
 idempotent bucket-creation sidecar in `docker-compose.yml`:
 
 - Bucket: `qontinui-session-output-cold` (override via
   `SESSION_OUTPUT_COLD_BUCKET` in `.env`).
-- Kept **private** (no `mc anonymous set download`) to mirror staging's full
+- Kept **private** (no anonymous bucket policy) to mirror staging's full
   public-access block. Same key layout (`tenant/<tenant_id>/session/<id>.log`)
-  applies; MinIO has no lifecycle rule, so dev objects don't auto-expire (fine
+  applies; the dev store has no lifecycle rule, so dev objects don't auto-expire (fine
   for local dev).
 
 ## What remains for the operator

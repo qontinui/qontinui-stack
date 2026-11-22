@@ -105,6 +105,9 @@ WORKFLOW_NAME = "qontinui CI"
 JOB_NAMES = {
     "terraform": "terraform fmt + validate",
     "drift-classifier": "python script unit tests",
+    # Added by plan 2026-11-22-fetches-stop-depending-on-upstreams Phase 2:
+    # the object store and its fallback pass the D7 subset on every PR.
+    "s3-store-conformance": "s3 store conformance",
 }
 
 

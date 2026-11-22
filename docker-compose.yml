@@ -1,13 +1,14 @@
 # qontinui-stack — canonical database stack for the canonical-DB topology.
 #
 # This is the authoritative dev/self-host/cloud-equivalent backplane. It runs
-# Postgres 16 (with pgvector), Redis 7, and MinIO (S3-compatible blob), plus
-# a one-shot alembic migrator that brings the schema to head on `up`.
+# Postgres 16 (with pgvector), Redis 7, and an S3-compatible object store
+# (versitygw), plus a one-shot alembic migrator that brings the schema to head
+# on `up`.
 #
 # Topology plan: D:\qontinui-root\tmp_canonical_db_topology_plan.md (§9 Phase 1).
 #
-# Port choices: 5433 / 6380 / 9100-9101 — deliberately offset from the current
-# qontinui-web stack (5432 / 6379 / 9000-9001) so both can run side-by-side
+# Port choices: 5433 / 6380 / 9100 — deliberately offset from the current
+# qontinui-web stack (5432 / 6379 / 9000) so both can run side-by-side
 # during the cutover. After cutover completes (per topology plan §10), the
 # qontinui-web stack is decommissioned and this stack can move to the
 # standard ports if desired.
@@ -15,7 +16,9 @@
 # Service summary:
 #   postgres   — canonical PG; pgvector enabled; four schemas pre-created.
 #   redis      — claims, pub/sub, presence; sub-second TTL primitives.
-#   minio      — S3-compatible blob; dev-only; staging+prod use real S3.
+#   object-store — S3-compatible blob (versitygw); dev-only; staging+prod
+#                use real S3. `object-store-seaweedfs` is its fallback, behind
+#                the `fallback-store` profile.
 #   migrator   — one-shot, runs `alembic upgrade head` on `up`, then exits.
 #   nats-1..3  — JetStream cluster for durable, replayable events
 #                (Row 9 Phase 1 — failure-modes-at-scale design §3.1).
@@ -23,8 +26,7 @@
 # Connection strings for ~/.qontinui/profiles.json (dev profile):
 #   postgres://qontinui_user:qontinui_dev_password@<host>:5433/qontinui_db
 #   redis://<host>:6380/0
-#   http://<host>:9100   (MinIO S3 API)
-#   http://<host>:9101   (MinIO console)
+#   http://<host>:9100   (object store S3 API; there is no console port)
 #
 # <host> is the PC's LAN IP (typically 192.168.x.x), exposed to MSI laptop
 # and the third machine over LAN. Topology plan §9 Phase 2 covers exposure.
@@ -55,7 +57,8 @@
 #
 #   * ~60x steady state. Measured again 2026-08-29 via `docker stats`: the
 #     busiest container in this stack was 68 PIDs (sccache); postgres 18,
-#     nats 17-19, jaeger 18, bazel-remote 34, minio 30, redis 6. The same
+#     nats 17-19, jaeger 18, bazel-remote 34, the object
+#     store's predecessor 30, redis 6. The same
 #     <= 68 held for every container during the incident. The healthy
 #     working set is two orders of magnitude below this cap.
 #   * ~8x coord's worst legitimate burst. coord fans out to ~148 concurrent
@@ -67,8 +70,10 @@
 #   * 2.1% of `threads-max` (4096 / 192,146). One container can no longer
 #     reach even a fiftieth of the kernel task table.
 #   * The AGGREGATE is the invariant that actually matters, and it only
-#     holds if the bound is universal: 13 services x 4096 = 53,248 = **27.7%**
-#     of `threads-max`. Even a simultaneous stack-wide worst case leaves the
+#     holds if the bound is universal: 14 services x 4096 = 57,344 = **29.8%**
+#     of `threads-max` (15 services are defined; `object-store-seaweedfs`
+#     stands in for `object-store`, never beside it, so 14 run at once).
+#     Even a simultaneous stack-wide worst case leaves the
 #     VM able to fork — which is exactly what 2026-08-27 took away.
 #
 # Applied to every service, not just coord. Bounding only the container that
@@ -90,12 +95,23 @@
 # Takes effect at the next container CREATE (`docker compose up -d` will
 # recreate; a running container is not retroactively bounded).
 # ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════
+# Image pins. Every third-party `image:` is `<name>:<tag>@sha256:<digest>`
+# with `# released: … pinned: …` at least 14 days apart (plan
+# 2026-11-22-fetches-stop-depending-on-upstreams, D5). `released` is Docker
+# Hub's `tag_last_pushed` for the tag whose current digest is the pinned one
+# (a push date, read 2026-11-22), not the upstream project's release date.
+# scripts/tests/test_image_pins.py checks format and age only, offline; it
+# cannot detect a wrong digest or date. Its docstring records the method.
+# ═══════════════════════════════════════════════════════════════════════════
 services:
   # ───────────────────────────────────────────────────────────────────────
   # PostgreSQL 16 + pgvector — canonical durable state.
   # ───────────────────────────────────────────────────────────────────────
   postgres:
-    image: pgvector/pgvector:pg16
+    # pgvector 0.8.6 on PG 16, the newest pg16 build outside the 14-day
+    # cooldown on the pin date (0.8.7-pg16 was pushed 2026-11-12).
+    image: pgvector/pgvector:0.8.6-pg16@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b # released: 2026-08-13 pinned: 2026-11-22
     container_name: qontinui-canonical-postgres
     restart: unless-stopped
     # PID containment — see the block above `services:` for the argument.
@@ -137,7 +153,7 @@ services:
   # Redis 7 — claims, pub/sub, presence.
   # ───────────────────────────────────────────────────────────────────────
   redis:
-    image: redis:7-alpine
+    image: redis:7.4.11-alpine@sha256:d9436322172a5b482c187bf1f363d3c4fea086fcca6b9c8a94de8f0f39ed3193 # released: 2026-10-26 pinned: 2026-11-22
     container_name: qontinui-canonical-redis
     restart: unless-stopped
     # PID containment — see the block above `services:`. Measured 6 PIDs.
@@ -175,69 +191,197 @@ services:
       retries: 5
 
   # ───────────────────────────────────────────────────────────────────────
-  # MinIO — S3-compatible blob storage (dev only).
+  # Object store — S3-compatible blob storage (dev only): versitygw.
+  #
+  # Replaced MinIO, whose repository GitHub reports as archived (repo API
+  # `archived: true`, read 2026-11-22; the API serves no archive date, the
+  # last push was 2026-04-24) (plan 2026-11-22-fetches-stop-depending-on-
+  # upstreams, Phase 2). The engine was chosen by running the D7 conformance
+  # subset (put, get, head, delete, multipart, presign, create-if-absent) and
+  # both real clients (bazel-remote, sccache) against every candidate:
+  # versitygw v1.11.0 passed all of it with the lowest idle RSS; SeaweedFS
+  # 4.52 is the runner-up and the rehearsed fallback (`object-store-seaweedfs`
+  # below, profile `fallback-store`). The CI job `s3 store conformance`
+  # re-runs the subset against BOTH on every PR, so a store that stops
+  # passing it cannot land.
+  #
+  # Image: built locally from ./object-store/Dockerfile — the conformance-
+  # tested release tarball (sha256-pinned) on a digest-pinned alpine. The
+  # upstream `versity/versitygw:v1.11.0` image is still inside D5's 14-day
+  # cooldown; the Dockerfile header says why that matters.
+  #
+  # No console port: versitygw has no MinIO-style console, so 9101 is gone.
+  # The S3 API stays on ${S3_API_PORT:-9100}, which keeps every
+  # ~/.qontinui/profiles.json endpoint (http://<host>:9100) valid.
+  #
+  # Storage: the posix backend keeps objects as files and their metadata in
+  # extended attributes, so the volume must support user xattrs. Docker's
+  # local volume driver (ext4 / xfs / Docker Desktop's WSL2 ext4) does; the
+  # entrypoint probes it and refuses to serve, naming the VGW_META_SIDECAR
+  # remedy, on a filesystem that does not.
+  #
+  # Data from the old MinIO volume (still declared below, untouched) is copied
+  # with scripts/s3-migrate-from-minio.sh.
   # ───────────────────────────────────────────────────────────────────────
-  minio:
-    image: minio/minio:latest
-    container_name: qontinui-canonical-minio
+  object-store:
+    build:
+      context: ./object-store
+      dockerfile: Dockerfile
+    image: qontinui-canonical-object-store:latest
+    container_name: qontinui-canonical-object-store
     restart: unless-stopped
-    # PID containment — see the block above `services:`. Measured 30 PIDs.
+    # PID containment — see the block above `services:`. A single Go
+    # process; MinIO measured 30 PIDs in the slot this replaced.
     pids_limit: 4096
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      ROOT_ACCESS_KEY: ${S3_ACCESS_KEY:-qontinui_dev_s3}
+      ROOT_SECRET_KEY: ${S3_SECRET_KEY:-qontinui_dev_s3_secret}
+      VGW_REGION: ${S3_REGION:-us-east-1}
+      # Empty (the default) keeps object metadata in xattrs on /data. Set it
+      # to /meta to keep metadata as sidecar files on the meta volume instead
+      # — the remedy the entrypoint names on a filesystem without user xattrs.
+      VGW_META_SIDECAR: ${VGW_META_SIDECAR:-}
     ports:
-      - "${MINIO_API_PORT:-9100}:9000"
-      - "${MINIO_CONSOLE_PORT:-9101}:9001"
+      - "${S3_API_PORT:-9100}:9000"
     volumes:
-      - canonical_minio_data:/data
-    command: server /data --console-address ":9001"
+      - canonical_object_store_data:/data
+      - canonical_object_store_meta:/meta
+    # conformance: scripts/s3-conformance.py (D7 subset)
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+      # versitygw's own unauthenticated liveness route (`--health /health`).
+      # 127.0.0.1, not localhost: busybox wget tries ::1 first.
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:9000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
 
-  # Bucket-creation sidecar — runs once after MinIO is healthy, then exits.
+  # The runner-up, behind a profile: never started by a plain `up`.
+  #
+  # It answers as `object-store` (network alias) on the same host port, so
+  # every consumer fails over unchanged. Rehearse or switch:
+  #
+  #   docker compose stop object-store
+  #   docker compose --profile fallback-store up -d --wait object-store-seaweedfs
+  #   docker compose run --rm --no-deps object-store-init
+  #
+  # and back with `docker compose --profile fallback-store stop
+  # object-store-seaweedfs && docker compose up -d object-store`. While the
+  # fallback serves, (re)start consumers with `--no-deps` (e.g. `docker compose
+  # up -d --no-deps sccache bazel-remote`): their depends_on names the
+  # `object-store` SERVICE, so a plain `up` would try to start versitygw on the
+  # port SeaweedFS holds. It has its
+  # own volume: the two engines' on-disk layouts are not interchangeable, so a
+  # switch carries data across with scripts/s3-migrate-from-minio.sh's
+  # generic --source-endpoint/--dest-endpoint, not by sharing a volume.
+  object-store-seaweedfs:
+    image: chrislusf/seaweedfs:4.52@sha256:57877e32bb90073b37dc109b438ba66e84fd5ed9ced5f5c04f56444ef243ce59 # released: 2026-11-02 pinned: 2026-11-22
+    container_name: qontinui-canonical-object-store-seaweedfs
+    profiles: ["fallback-store"]
+    restart: unless-stopped
+    # PID containment — see the block above `services:`.
+    pids_limit: 4096
+    environment:
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-qontinui_dev_s3}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-qontinui_dev_s3_secret}
+    # One `weed server` process runs master, volume, filer and the S3 gateway
+    # (as in the Phase 1 run). The identities file is written from the
+    # environment at start so the secret never lands in the image or argv.
+    #
+    # Volume sizing: SeaweedFS gives every bucket its own collection and grows
+    # several volumes for each, and its defaults (30 GB volumes, a slot count
+    # derived from free disk) ran out of writable volumes after a handful of
+    # buckets when measured on nilan 2026-11-22 ("No writable volumes and no
+    # free volumes left"). 1 GiB volumes and 200 slots fit this stack's four
+    # buckets plus the CI tests' scratch buckets; volumes are not
+    # preallocated, so the slot count costs no disk.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        case "$${S3_ACCESS_KEY}$${S3_SECRET_KEY}" in
+          *'"'*|*'\'*) echo "S3_ACCESS_KEY / S3_SECRET_KEY must not contain a double quote or backslash (they are written into JSON)" >&2; exit 1 ;;
+        esac
+        umask 077
+        printf '{"identities":[{"name":"admin","credentials":[{"accessKey":"%s","secretKey":"%s"}],"actions":["Admin","Read","List","Tagging","Write"]}]}\n' \
+          "$${S3_ACCESS_KEY}" "$${S3_SECRET_KEY}" > /tmp/s3-identities.json
+        exec weed server -dir=/data -ip=127.0.0.1 -ip.bind=0.0.0.0 \
+          -master.volumeSizeLimitMB=1024 -volume.max=200 \
+          -filer -s3 -s3.port=9000 -s3.config=/tmp/s3-identities.json
+    ports:
+      - "${S3_API_PORT:-9100}:9000"
+    volumes:
+      - canonical_object_store_fallback_data:/data
+    networks:
+      default:
+        aliases:
+          - object-store
+    # conformance: scripts/s3-conformance.py (D7 subset)
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:9000/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # Bucket-creation sidecar — runs once after the object store is healthy,
+  # then exits.
   #
   # Owns these buckets:
-  #   qontinui-dev                  — general dev blob store
+  #   qontinui-dev                  — general dev blob store. Anonymous
+  #                                   DOWNLOAD (s3:GetObject) via a bucket
+  #                                   policy; anonymous listing stays refused.
   #   qontinui-bazel-remote         — content-addressed cache backing for the
   #                                   bazel-remote service below (Row 10 Item 4).
   #   qontinui-session-output-cold  — Phase 8 cold-tier PTY output (dev mirror
   #                                   of the staging session-output-cold S3
   #                                   bucket). Key layout:
   #                                   tenant/<tenant_id>/session/<session_id>.log.
-  #                                   Kept PRIVATE (no anonymous download) to
+  #                                   Kept PRIVATE (no bucket policy) to
   #                                   mirror staging's full public-access block —
   #                                   PTY output is sensitive; reads go through
   #                                   coord, never anonymous S3.
   #
-  # Bucket creation is idempotent (`mb --ignore-existing`); the sidecar
-  # is the gate that downstream services depend on for "bucket exists".
-  # The sccache container creates its own `qontinui-sccache` bucket via
-  # its entrypoint — that pattern stays in place; only buckets co-owned
-  # with multi-service contracts live here.
-  minio-init:
-    image: minio/mc:latest
-    container_name: qontinui-canonical-minio-init
-    # PID containment — see the block above `services:`. One-shot `mc` shell;
-    # bounded anyway so the aggregate ceiling covers every service, not most.
+  # Bucket creation is idempotent (head-bucket, else create-bucket); the
+  # sidecar is the gate that downstream services depend on for "bucket
+  # exists". The sccache container creates its own `qontinui-sccache` bucket
+  # via its entrypoint — that pattern stays in place; only buckets co-owned
+  # with multi-service contracts live here. The same commands work against
+  # the SeaweedFS fallback, which honours bucket policies too.
+  object-store-init:
+    image: amazon/aws-cli:2.39.6@sha256:eccdb3ec77e159d43ca6a750a70738c546883138be7f094498294a1477ec7e42 # released: 2026-11-06 pinned: 2026-11-22
+    container_name: qontinui-canonical-object-store-init
+    # PID containment — see the block above `services:`. One-shot aws CLI
+    # shell; bounded anyway so the aggregate ceiling covers every service.
     pids_limit: 4096
     depends_on:
-      minio:
+      object-store:
         condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-qontinui_dev_s3}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-qontinui_dev_s3_secret}
+      AWS_DEFAULT_REGION: ${S3_REGION:-us-east-1}
+      AWS_ENDPOINT_URL: http://object-store:9000
+      # Send checksums only where the API requires them, as the conformance
+      # run did; nothing here depends on the CLI's default CRC32 trailers.
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
     entrypoint:
       - /bin/sh
       - -c
       - |
-        /usr/bin/mc alias set canonical http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin} && \
-        /usr/bin/mc mb canonical/qontinui-dev --ignore-existing && \
-        /usr/bin/mc anonymous set download canonical/qontinui-dev && \
-        /usr/bin/mc mb canonical/${BAZEL_REMOTE_BUCKET:-qontinui-bazel-remote} --ignore-existing && \
-        /usr/bin/mc mb canonical/${SESSION_OUTPUT_COLD_BUCKET:-qontinui-session-output-cold} --ignore-existing && \
-        echo "MinIO buckets qontinui-dev + ${BAZEL_REMOTE_BUCKET:-qontinui-bazel-remote} + ${SESSION_OUTPUT_COLD_BUCKET:-qontinui-session-output-cold} ready" && \
-        exit 0
+        set -eu
+        ensure_bucket() {
+          aws s3api head-bucket --bucket "$$1" >/dev/null 2>&1 \
+            || aws s3api create-bucket --bucket "$$1" >/dev/null
+          aws s3api head-bucket --bucket "$$1"
+        }
+        ensure_bucket qontinui-dev
+        aws s3api put-bucket-policy --bucket qontinui-dev --policy '{"Version":"2012-10-17","Statement":[{"Sid":"AnonymousDownload","Effect":"Allow","Principal":"*","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::qontinui-dev/*"]}]}'
+        ensure_bucket ${BAZEL_REMOTE_BUCKET:-qontinui-bazel-remote}
+        ensure_bucket ${SESSION_OUTPUT_COLD_BUCKET:-qontinui-session-output-cold}
+        echo "object-store buckets qontinui-dev + ${BAZEL_REMOTE_BUCKET:-qontinui-bazel-remote} + ${SESSION_OUTPUT_COLD_BUCKET:-qontinui-session-output-cold} ready"
     restart: "no"
 
   # ───────────────────────────────────────────────────────────────────────
@@ -335,11 +479,12 @@ services:
   #
   # Row 2 Phase 2 of the fleet topology design
   # (plans/2026-05-14-fleet-topology-and-build-pool-design.md §3.3).
-  # The shared cache itself lives in MinIO under bucket `qontinui-sccache`;
+  # The shared cache itself lives in the object store under bucket
+  # `qontinui-sccache`;
   # each agent / build machine runs a local sccache daemon configured to
   # talk S3 to that bucket. This container's role is:
   #
-  #   1. Idempotently create the `qontinui-sccache` MinIO bucket at boot.
+  #   1. Idempotently create the `qontinui-sccache` bucket at boot.
   #   2. Expose stats HTTP for the coord `/metrics` scraper (:4227).
   #   3. Pre-stage a dormant sccache server (:4226) for Phase 6
   #      cloud-burst CI workers that will compile inside containers.
@@ -359,15 +504,20 @@ services:
     # the highest steady-state reading in the stack; 4096 is ~60x it.
     pids_limit: 4096
     depends_on:
-      minio:
+      object-store:
         condition: service_healthy
-      minio-init:
+      object-store-init:
         condition: service_completed_successfully
     environment:
       SCCACHE_BUCKET: ${SCCACHE_BUCKET:-qontinui-sccache}
-      SCCACHE_MINIO_HOST: ${SCCACHE_MINIO_HOST:-minio:9000}
-      SCCACHE_MINIO_USER: ${MINIO_ROOT_USER:-minioadmin}
-      SCCACHE_MINIO_PASS: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      # host:port inside the stack network. The host-side override is
+      # SCCACHE_STORE_ENDPOINT, deliberately NOT SCCACHE_ENDPOINT, so a shell
+      # configured for the cross-machine lane (docs/sccache-cross-machine.md)
+      # cannot repoint this container by accident.
+      SCCACHE_ENDPOINT: ${SCCACHE_STORE_ENDPOINT:-object-store:9000}
+      SCCACHE_REGION: ${S3_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-qontinui_dev_s3}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-qontinui_dev_s3_secret}
       SCCACHE_STATS_PORT: "4227"
     ports:
       - "${SCCACHE_DAEMON_PORT:-4226}:4226"
@@ -394,21 +544,30 @@ services:
   # container is just the backing store; integration is Wave 4+.
   #
   # Topology:
-  #   - HTTP API on host :9094 (container :80) — REST CAS + AC routes
-  #     used by the spike + (eventually) supervisor pool. Default port 80
-  #     is hardcoded in the upstream image entrypoint.
+  #   - HTTP API on host :9094 (container :8080) — REST CAS + AC routes
+  #     used by the spike + (eventually) supervisor pool. `:8080` is
+  #     hardcoded in the upstream image entrypoint (`--http_address=:8080`).
   #   - gRPC on host :9095 (container :9092) — REAPI gRPC for native
   #     Bazel-style clients; reserved for Item 7+ once supervisor writes
   #     real ActionResult protobufs.
   #   - Local disk cache at /data (volume-mounted) acts as the hot tier.
-  #   - S3 backing against canonical MinIO bucket `qontinui-bazel-remote`
-  #     is the durable cold tier: blobs survive container restart even
-  #     after the local volume is wiped.
+  #   - S3 backing against the canonical object store's bucket
+  #     `qontinui-bazel-remote` is the durable cold tier: blobs survive
+  #     container restart even after the local volume is wiped.
   #
-  # Image: `muxinc/bazel-remote:latest` (mirror of buchgr/bazel-remote;
-  # `buchgr/bazel-remote` was pulled from Docker Hub per Phase-0 spike
-  # findings). Same image the spike at `tmp_spike_bazel_remote/`
-  # verified end-to-end.
+  # Image: `buchgr/bazel-remote-cache:v2.6.4`, the project's own image, at
+  # the release whose S3 round trip against the object store was measured in
+  # the store conformance run (plan 2026-11-22-fetches-stop-depending-on-
+  # upstreams, Phase 1). It replaced `muxinc/bazel-remote:latest`, a 2020
+  # third-party mirror of a v1 binary that was never digest-pinnable to a
+  # maintained build.
+  #
+  # The upstream image is distroless (no shell, no wget), so this service
+  # has NO in-container healthcheck — there is nothing in the image to run
+  # one with, and nothing in this file waits on its health. The health signal
+  # is host-side instead: `bash scripts/bazel-remote-probe.sh` reads /status
+  # through the published port and exits 0 (healthy), 1 (answered wrong) or 2
+  # (no answer — UNKNOWN, not "down").
   #
   # AC validation: ON (Row 10 Item 7, 2026-05-15). The supervisor build
   # pool now writes real REAPI `ActionResult` protobufs
@@ -423,42 +582,69 @@ services:
   # behavior.
   # ───────────────────────────────────────────────────────────────────────
   bazel-remote:
-    image: muxinc/bazel-remote:latest
+    image: buchgr/bazel-remote-cache:v2.6.4@sha256:10285c1183e606679eb450b725c2495c055a45eb532a6c80f6b6f9771f6d2f67 # released: 2026-10-20 pinned: 2026-11-22
     container_name: qontinui-canonical-bazel-remote
     restart: unless-stopped
+    # Runs as the image's own non-root uid 65532; bazel-remote-init (below)
+    # hands the volume to that uid first, since the image this replaced wrote
+    # it as root.
     # PID containment — see the block above `services:`. Measured 34 PIDs.
     pids_limit: 4096
     depends_on:
-      minio:
+      object-store:
         condition: service_healthy
-      minio-init:
+      object-store-init:
         condition: service_completed_successfully
-    # Image entrypoint hardcodes `./bazel-remote --port=80 --dir=/data`;
+      bazel-remote-init:
+        condition: service_completed_successfully
+    # Image entrypoint hardcodes `--http_address=:8080 --dir=/data`;
     # `command` flags below append. --max_size is required by the binary
-    # so cache size is bounded. S3 flags route to canonical MinIO over
-    # plain HTTP (--s3.disable_ssl) since the in-stack bridge is local.
+    # so cache size is bounded. S3 flags route to the canonical object store
+    # over plain HTTP (--s3.disable_ssl) since the in-stack bridge is local.
+    # The S3 key pair comes from the environment, which bazel-remote reads
+    # as well as flags, so the secret stays off argv.
     command:
       - --max_size=${BAZEL_REMOTE_MAX_SIZE_GIB:-50}
-      - --grpc_port=9092
-      - --s3.endpoint=${BAZEL_REMOTE_S3_ENDPOINT:-minio:9000}
+      - --grpc_address=:9092
+      - --s3.endpoint=${BAZEL_REMOTE_S3_ENDPOINT:-object-store:9000}
       - --s3.bucket=${BAZEL_REMOTE_BUCKET:-qontinui-bazel-remote}
-      - --s3.access_key_id=${MINIO_ROOT_USER:-minioadmin}
-      - --s3.secret_access_key=${MINIO_ROOT_PASSWORD:-minioadmin}
+      - --s3.auth_method=access_key
+      - --s3.region=${S3_REGION:-us-east-1}
       - --s3.disable_ssl
+    environment:
+      BAZEL_REMOTE_S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-qontinui_dev_s3}
+      BAZEL_REMOTE_S3_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-qontinui_dev_s3_secret}
     ports:
-      - "${BAZEL_REMOTE_HTTP_PORT:-9094}:80"
+      - "${BAZEL_REMOTE_HTTP_PORT:-9094}:8080"
       - "${BAZEL_REMOTE_GRPC_PORT:-9095}:9092"
     volumes:
       - canonical_bazel_remote_data:/data
-    healthcheck:
-      # /status returns a JSON stats blob — exercises the HTTP server +
-      # confirms the cache directory is initialised. wget ships in the
-      # image (no curl); the binary listens on container-port 80.
-      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:80/status"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 15s
+
+  # One-shot: give the bazel-remote volume to the image's non-root uid
+  # (65532, distroless `nonroot`). Idempotent: it looks for the FIRST entry
+  # anywhere under /data not owned by 65532:65532 (`find ... -print -quit`,
+  # which stops at one) and only then chowns the whole tree, so a volume whose
+  # top directory is right but whose contents are root-owned is still fixed.
+  bazel-remote-init:
+    image: alpine:3.23.7@sha256:ff7f0c727dd796aa36787bfcd9a64bf35a6ce72a73451b3359fde849b6703d63 # released: 2026-10-23 pinned: 2026-11-22
+    container_name: qontinui-canonical-bazel-remote-init
+    # PID containment — see the block above `services:`. One-shot chown.
+    pids_limit: 4096
+    user: "0:0"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        if [ -n "$$(find /data \( ! -user 65532 -o ! -group 65532 \) -print -quit)" ]; then
+          chown -R 65532:65532 /data
+          echo "bazel-remote volume handed to uid 65532"
+        else
+          echo "bazel-remote volume already owned by uid 65532"
+        fi
+    volumes:
+      - canonical_bazel_remote_data:/data
+    restart: "no"
 
   # ───────────────────────────────────────────────────────────────────────
   # NATS JetStream — durable, replayable event streams.
@@ -480,7 +666,7 @@ services:
   # pair, same posture as redis `requirepass`.
   # ───────────────────────────────────────────────────────────────────────
   nats-1:
-    image: nats:2.10-alpine
+    image: nats:2.10.29-alpine@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927 # released: 2026-01-28 pinned: 2026-11-22
     container_name: qontinui-canonical-nats-1
     restart: unless-stopped
     # PID containment — see the block above `services:`. Measured 19 PIDs.
@@ -505,7 +691,7 @@ services:
       start_period: 10s
 
   nats-2:
-    image: nats:2.10-alpine
+    image: nats:2.10.29-alpine@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927 # released: 2026-01-28 pinned: 2026-11-22
     container_name: qontinui-canonical-nats-2
     restart: unless-stopped
     # PID containment — see the block above `services:`. Measured 18 PIDs.
@@ -527,7 +713,7 @@ services:
       start_period: 10s
 
   nats-3:
-    image: nats:2.10-alpine
+    image: nats:2.10.29-alpine@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927 # released: 2026-01-28 pinned: 2026-11-22
     container_name: qontinui-canonical-nats-3
     restart: unless-stopped
     # PID containment — see the block above `services:`. Measured 17 PIDs.
@@ -570,7 +756,7 @@ services:
   # override via env vars before `docker compose up`.
   # ───────────────────────────────────────────────────────────────────────
   jaeger:
-    image: jaegertracing/all-in-one:1.62.0
+    image: jaegertracing/all-in-one:1.62.0@sha256:836e9b69c88afbedf7683ea7162e179de63b1f981662e83f5ebb68badadc710f # released: 2024-10-07 pinned: 2026-11-22
     container_name: qontinui-canonical-jaeger
     restart: unless-stopped
     # PID containment — see the block above `services:`. Measured 18 PIDs.
@@ -842,6 +1028,16 @@ volumes:
     name: qontinui_canonical_redis_data
   canonical_coord_mirrors:
     name: qontinui_canonical_coord_mirrors
+  canonical_object_store_data:
+    name: qontinui_canonical_object_store_data
+  canonical_object_store_meta:
+    name: qontinui_canonical_object_store_meta
+  canonical_object_store_fallback_data:
+    name: qontinui_canonical_object_store_fallback_data
+  # The retired MinIO's data. Declared but mounted by nothing, so neither
+  # `up` nor `down` touches it (only `down -v` would): it is the source
+  # scripts/s3-migrate-from-minio.sh copies from, and it is kept until an
+  # operator decides it is no longer needed. Nothing is deleted by the swap.
   canonical_minio_data:
     name: qontinui_canonical_minio_data
   canonical_bazel_remote_data:

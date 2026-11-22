@@ -38,13 +38,13 @@
 > (the recurrence, the latch-at-start proof, and the shipped guards).
 
 Phase 2.1 of `plans/2026-05-21-coordination-improvements.md`. Migrates the
-rustc compile-unit cache from the in-stack MinIO bucket (`qontinui-sccache`)
+rustc compile-unit cache from the in-stack object-store bucket (`qontinui-sccache`)
 to a shared real-AWS S3 bucket (`qontinui-sccache-shared`) so multiple
 developer machines (spaceship + MSI today; future cloud-burst builders later)
 hit the same artifact store.
 
-The in-stack MinIO sccache lane (`docker-compose.yml` `sccache` service +
-the `qontinui-sccache` MinIO bucket) is **not removed** — it still serves
+The in-stack sccache lane (`docker-compose.yml` `sccache` service + the
+`qontinui-sccache` bucket in the stack's object store) is **not removed** — it still serves
 the docker-compose-only CI path that runs entirely inside the stack. The
 shared S3 bucket is the lane developer machines use directly.
 
@@ -119,14 +119,16 @@ export AWS_SECRET_ACCESS_KEY=<secret>
 export SCCACHE_BUCKET=qontinui-sccache-shared
 export SCCACHE_REGION=us-east-1
 
-# Unset any in-stack-MinIO env that a previous setup might have left in
-# place. With SCCACHE_ENDPOINT unset, sccache talks to real AWS S3; with
-# SCCACHE_S3_USE_SSL unset, sccache defaults to TLS (required for AWS).
+# Unset any in-stack object-store env that a previous setup might have
+# left in place. With SCCACHE_ENDPOINT unset, sccache talks to real AWS S3;
+# with SCCACHE_S3_USE_SSL unset, sccache defaults to TLS (required for AWS).
+# SCCACHE_MINIO_* are the names the stack used before its store was swapped
+# (plan 2026-11-22-fetches-stop-depending-on-upstreams); nothing reads them
+# now, but an old shell profile may still export them.
 unset SCCACHE_ENDPOINT
 unset SCCACHE_S3_USE_SSL
-unset SCCACHE_MINIO_HOST
-unset SCCACHE_MINIO_USER
-unset SCCACHE_MINIO_PASS
+unset SCCACHE_STORE_ENDPOINT
+unset SCCACHE_MINIO_HOST SCCACHE_MINIO_USER SCCACHE_MINIO_PASS
 
 # Opt the toolchain in (keep this in your shell profile / dev-start
 # script — pin it per-shell, not in .cargo/config.toml, so machines
@@ -143,9 +145,9 @@ $env:SCCACHE_BUCKET = 'qontinui-sccache-shared'
 $env:SCCACHE_REGION = 'us-east-1'
 Remove-Item Env:SCCACHE_ENDPOINT     -ErrorAction SilentlyContinue
 Remove-Item Env:SCCACHE_S3_USE_SSL   -ErrorAction SilentlyContinue
-Remove-Item Env:SCCACHE_MINIO_HOST   -ErrorAction SilentlyContinue
-Remove-Item Env:SCCACHE_MINIO_USER   -ErrorAction SilentlyContinue
-Remove-Item Env:SCCACHE_MINIO_PASS   -ErrorAction SilentlyContinue
+Remove-Item Env:SCCACHE_STORE_ENDPOINT -ErrorAction SilentlyContinue
+# Pre-swap names; nothing reads them now (see the bash block above).
+Remove-Item Env:SCCACHE_MINIO_HOST, Env:SCCACHE_MINIO_USER, Env:SCCACHE_MINIO_PASS -ErrorAction SilentlyContinue
 $env:RUSTC_WRAPPER = 'sccache'
 ```
 
@@ -167,7 +169,7 @@ Confirm `--show-stats` reports the new backend:
 Cache location                  S3, bucket: Bucket(name=qontinui-sccache-shared), region: us-east-1
 ```
 
-If you still see `Bucket(name=qontinui-sccache)` or a MinIO endpoint, the
+If you still see `Bucket(name=qontinui-sccache)` or the stack's object-store endpoint, the
 daemon picked up stale env — re-export, stop-server, then start-server
 again, in that order in the same shell.
 
@@ -260,11 +262,11 @@ number above 80% when worktree paths differ between machines.
 online.** The substrate is verified single-machine; run the producer/consumer
 pair above on both machines to capture the two-machine figure.
 
-## Coexistence with the in-stack MinIO
+## Coexistence with the in-stack object store
 
 | Lane | Backend | Bucket | Who uses it |
 |---|---|---|---|
-| In-stack | `qontinui-canonical-minio` container | `qontinui-sccache` | Docker-compose-only builders that live inside the stack network (Phase 6 cloud-burst CI containers, the `sccache` sidecar's own daemon). |
+| In-stack | `qontinui-canonical-object-store` container (versitygw) | `qontinui-sccache` | Docker-compose-only builders that live inside the stack network (Phase 6 cloud-burst CI containers, the `sccache` sidecar's own daemon). |
 | Cross-machine | AWS S3 (us-east-1) | `qontinui-sccache-shared` | Developer machines (spaceship, MSI, future hosts) running cargo directly on the host. |
 
 The in-stack `sccache` service in `docker-compose.yml` and its
@@ -279,7 +281,7 @@ Two key reasons to keep both:
    bring-up to having IAM keys present, which violates the "stack is
    self-contained" property.
 2. The Phase 6 cloud-burst CI workers will run inside the stack and want
-   the lowest-latency cache they can get — the MinIO container on
+   the lowest-latency cache they can get — the object-store container on
    loopback (or stack-internal LAN) beats a trans-region S3 call.
 
 ## Cost / observability notes
@@ -299,8 +301,8 @@ Two key reasons to keep both:
   Watch for egress >5 GB/day per dev — that's a signal the local sccache
   disk cache should be made larger so warm-build hits don't re-fetch.
 - **Stats**: there is no per-machine telemetry endpoint for the shared S3
-  lane yet (the in-stack `stats_server.py` only knows about the MinIO
-  bucket). Use AWS CloudWatch S3 metrics (`BucketSizeBytes`,
+  lane yet (the in-stack `stats_server.py` only lists the stack's own
+  object-store bucket). Use AWS CloudWatch S3 metrics (`BucketSizeBytes`,
   `NumberOfObjects`, request counts) for fleet-level visibility. A
   follow-up could teach the coord scraper to also hit
   `aws s3api head-bucket` + `s3:ListBucket` for headline counts.

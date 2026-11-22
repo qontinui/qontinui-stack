@@ -1,5 +1,5 @@
 # S3 bucket for snapshots / screenshots / recordings / large embeddings.
-# Replaces MinIO when running on AWS.
+# Replaces the stack's dev object store when running on AWS.
 
 variable "environment" { type = string }
 

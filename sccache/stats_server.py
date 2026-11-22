@@ -16,12 +16,38 @@ sccache server here is dormant until Phase 6 cloud-burst).
 """
 from __future__ import annotations
 
+import datetime as _dt
+import hashlib
+import hmac
+import http.client
 import json
 import os
 import subprocess
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BUCKET = os.environ.get("SCCACHE_BUCKET", "qontinui-sccache")
+
+# SHA-256 of the empty body: every request this module signs is a bodiless GET.
+_EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
+# Stop a runaway walk (a store that never clears IsTruncated) from pinning the
+# scrape forever; a bucket bigger than this reports an error, not a number.
+MAX_LIST_PAGES = 10_000
+# Wall-clock budget for one whole walk (every page together). A slow or huge
+# bucket answers {"error": ...} after this, rather than holding the scrape.
+LIST_DEADLINE_SECS = float(os.environ.get("SCCACHE_STATS_LIST_DEADLINE_SECS", "20"))
+# A walk's result is served for this long before a background refresh starts.
+# Scrapes never wait on a walk (coord's scrape times out at 3 s; a walk may take
+# up to LIST_DEADLINE_SECS): they get the last completed result.
+CACHE_TTL_SECS = float(os.environ.get("SCCACHE_STATS_CACHE_TTL_SECS", "45"))
+# The very first scrape, before any walk has finished, waits at most this long
+# for the first result, then answers that totals are not computed yet.
+FIRST_RESULT_WAIT_SECS = float(os.environ.get("SCCACHE_STATS_FIRST_WAIT_SECS", "2"))
 
 
 def sccache_stats_json() -> dict:
@@ -32,7 +58,7 @@ def sccache_stats_json() -> dict:
             ["sccache", "--show-stats", "--stats-format=json"],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=float(os.environ.get("SCCACHE_STATS_LOCAL_TIMEOUT_SECS", "2.5")),
         )
         if out.returncode != 0:
             return {"error": out.stderr.strip() or "non-zero exit"}
@@ -41,37 +67,245 @@ def sccache_stats_json() -> dict:
         return {"error": f"{type(e).__name__}: {e}"}
 
 
-def bucket_stats() -> dict:
-    """Return { objects, size_bytes } for the sccache bucket. Uses `mc du`
-    against the `canonical` alias the entrypoint has already configured."""
+def _endpoint_url() -> str:
+    """The store's base URL from the same env sccache itself reads:
+    SCCACHE_ENDPOINT is host:port (or a full URL), SCCACHE_S3_USE_SSL picks
+    the scheme for the bare form."""
+    endpoint = os.environ.get("SCCACHE_ENDPOINT", "object-store:9000")
+    if "://" in endpoint:
+        return endpoint.rstrip("/")
+    use_ssl = os.environ.get("SCCACHE_S3_USE_SSL", "off").lower() in ("on", "true", "1", "yes")
+    return f"{'https' if use_ssl else 'http'}://{endpoint}"
+
+
+def _uri_encode(value: str) -> str:
+    return urllib.parse.quote(value, safe="-_.~")
+
+
+def _sign_get(url: str, query: dict[str, str], access_key: str, secret_key: str,
+              region: str, now: _dt.datetime) -> tuple[str, dict[str, str]]:
+    """Build a SigV4-signed (header auth) path-style GET. Returns the full URL
+    and the headers to send. Stdlib only, so the image needs no SDK."""
+    parts = urllib.parse.urlsplit(url)
+    host = parts.netloc
+    path = parts.path or "/"
+    canonical_query = "&".join(f"{_uri_encode(k)}={_uri_encode(v)}" for k, v in sorted(query.items()))
+    amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+    date = now.strftime("%Y%m%d")
+    headers = {"host": host, "x-amz-content-sha256": _EMPTY_SHA256, "x-amz-date": amz_date}
+    signed_headers = ";".join(sorted(headers))
+    canonical_headers = "".join(f"{k}:{headers[k]}\n" for k in sorted(headers))
+    canonical_request = "\n".join(
+        ["GET", path, canonical_query, canonical_headers, signed_headers, _EMPTY_SHA256]
+    )
+    scope = f"{date}/{region}/s3/aws4_request"
+    string_to_sign = "\n".join(
+        ["AWS4-HMAC-SHA256", amz_date, scope, hashlib.sha256(canonical_request.encode()).hexdigest()]
+    )
+    key = ("AWS4" + secret_key).encode()
+    for part in (date, region, "s3", "aws4_request"):
+        key = hmac.new(key, part.encode(), hashlib.sha256).digest()
+    signature = hmac.new(key, string_to_sign.encode(), hashlib.sha256).hexdigest()
+    out = {
+        "x-amz-content-sha256": _EMPTY_SHA256,
+        "x-amz-date": amz_date,
+        "Authorization": (
+            f"AWS4-HMAC-SHA256 Credential={access_key}/{scope}, "
+            f"SignedHeaders={signed_headers}, Signature={signature}"
+        ),
+    }
+    return f"{parts.scheme}://{host}{path}?{canonical_query}", out
+
+
+def _local(tag: str) -> str:
+    """Element tag without its XML namespace (stores differ on emitting one)."""
+    return tag.rsplit("}", 1)[-1]
+
+
+def list_bucket_totals(endpoint_url: str, bucket: str, access_key: str, secret_key: str,
+                       region: str = "us-east-1", timeout: float = 10.0,
+                       page_size: int = 1000, deadline_secs: float | None = None) -> dict:
+    """Walk the bucket with S3 ListObjectsV2 and return
+    ``{"objects": N, "size_bytes": M}``, or ``{"error": "..."}``. Never raises.
+
+    Counts every object in the bucket (all prefixes): the whole-bucket totals
+    coord's sccache_metrics scrape has always received. The whole walk is
+    bounded by ``deadline_secs`` (default LIST_DEADLINE_SECS); each request's
+    socket timeout is capped by what is left of it."""
+    budget = LIST_DEADLINE_SECS if deadline_secs is None else deadline_secs
+    give_up_at = time.monotonic() + budget
+    objects = 0
+    size = 0
+    token: str | None = None
+    base = f"{endpoint_url.rstrip('/')}/{urllib.parse.quote(bucket, safe='')}"
     try:
-        # `mc du --json canonical/<bucket>` returns one JSON object per
-        # depth level; the top-level one (the bucket root) is what we want.
-        out = subprocess.run(
-            ["mc", "du", "--json", f"canonical/{BUCKET}"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if out.returncode != 0:
-            return {"error": out.stderr.strip() or "non-zero exit"}
-        last = None
-        for line in out.stdout.strip().splitlines():
-            if line:
-                last = json.loads(line)
-        if not last:
-            return {"objects": 0, "size_bytes": 0}
-        return {
-            "objects": last.get("objects", 0),
-            "size_bytes": last.get("size", 0),
-        }
-    except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError) as e:
+        for _page in range(MAX_LIST_PAGES):
+            left = give_up_at - time.monotonic()
+            if left <= 0:
+                return {"error": f"listing exceeded its {budget:g}s deadline after {objects} objects"}
+            query = {"list-type": "2", "max-keys": str(page_size)}
+            if token:
+                query["continuation-token"] = token
+            url, headers = _sign_get(base, query, access_key, secret_key, region,
+                                     _dt.datetime.now(_dt.timezone.utc))
+            req = urllib.request.Request(url, headers=headers, method="GET")
+            with urllib.request.urlopen(req, timeout=min(timeout, left)) as resp:  # noqa: S310 (configured endpoint)
+                root = ET.fromstring(resp.read())
+            truncated = False
+            token = None
+            for child in root:
+                name = _local(child.tag)
+                if name == "Contents":
+                    objects += 1
+                    for field in child:
+                        if _local(field.tag) == "Size" and field.text:
+                            size += int(field.text)
+                elif name == "IsTruncated":
+                    truncated = (child.text or "").strip().lower() == "true"
+                elif name == "NextContinuationToken":
+                    token = child.text
+            if not truncated:
+                return {"objects": objects, "size_bytes": size}
+            if not token:
+                return {"error": "listing truncated without a NextContinuationToken"}
+        return {"error": f"listing exceeded {MAX_LIST_PAGES} pages"}
+    except urllib.error.HTTPError as e:
+        body = e.read()[:300].decode("utf-8", "replace")
+        return {"error": f"HTTP {e.code} from the store: {body}"}
+    except (urllib.error.URLError, http.client.HTTPException, OSError, ET.ParseError, ValueError) as e:
+        if time.monotonic() >= give_up_at:
+            return {"error": f"listing exceeded its {budget:g}s deadline after {objects} objects ({type(e).__name__})"}
         return {"error": f"{type(e).__name__}: {e}"}
 
 
+class _Totals:
+    """Stale-while-revalidate holder for the bucket totals.
+
+    One walk at a time runs in a background thread; readers take the last
+    result under a lock held only for the read, never across a walk. A result
+    older than CACHE_TTL_SECS starts a refresh and is still served.
+
+    A FAILED walk never erases the last good totals: readers keep getting them,
+    with ``age_secs`` measured from that good walk, ``stale: true`` and the
+    failure in ``last_error``. Only when no walk has ever succeeded is the
+    answer error-only. Failures count as attempts for the TTL, so a failing
+    store is not hammered."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.good: dict | None = None       # last successful totals
+        self.good_at: float | None = None
+        self.last_error: str | None = None  # set by a failed walk, cleared by a good one
+        self.attempt_at: float | None = None
+        self.refreshing = False
+        self.first_done = threading.Event()
+        self.walks = 0
+        self.generation = 0
+
+    def reset(self) -> None:
+        """Forget every result; a walk still running from before is ignored."""
+        with self.lock:
+            self.good = self.good_at = self.last_error = self.attempt_at = None
+            self.refreshing, self.walks = False, 0
+            self.first_done = threading.Event()
+            self.generation += 1
+
+    def _refresh(self, generation: int) -> None:
+        try:
+            value = _bucket_stats_uncached()
+        except Exception as e:  # noqa: BLE001 — a walk must never kill the refresher
+            value = {"error": f"{type(e).__name__}: {e}"}
+        with self.lock:
+            if generation != self.generation:
+                return
+            now = time.monotonic()
+            if "error" in value:
+                self.last_error = str(value["error"])
+            else:
+                self.good, self.good_at, self.last_error = value, now, None
+            self.attempt_at, self.refreshing = now, False
+            self.walks += 1
+            done = self.first_done
+        done.set()
+
+    def kick(self) -> None:
+        """Start a background walk unless one is running or the last attempt is fresh."""
+        with self.lock:
+            fresh = self.attempt_at is not None and time.monotonic() - self.attempt_at < CACHE_TTL_SECS
+            if self.refreshing or fresh:
+                return
+            self.refreshing = True
+            generation = self.generation
+        threading.Thread(target=self._refresh, args=(generation,), name="bucket-totals", daemon=True).start()
+
+    def get(self, wait_secs: float | None = None) -> dict:
+        """The totals as they stand. When no walk has finished yet, wait at most
+        ``wait_secs`` (default FIRST_RESULT_WAIT_SECS) for the first one."""
+        self.kick()
+        with self.lock:
+            done = self.first_done
+            have = self.attempt_at is not None
+        if not have:
+            done.wait(FIRST_RESULT_WAIT_SECS if wait_secs is None else max(0.0, wait_secs))
+        with self.lock:
+            if self.good is not None:
+                out = dict(self.good)
+                out["age_secs"] = round(time.monotonic() - self.good_at, 1)
+                if self.last_error is not None:
+                    out["stale"] = True
+                    out["last_error"] = self.last_error
+                return out
+            if self.last_error is not None:
+                return {"error": self.last_error}
+            return {"error": "bucket totals not computed yet (first walk in progress)"}
+
+
+_totals = _Totals()
+
+
+def bucket_stats(wait_secs: float | None = None) -> dict:
+    """Return { objects, size_bytes, age_secs[, stale, last_error] }, or
+    { error } when no walk has ever succeeded, for the sccache bucket, from the
+    background walks. Never blocks on a walk beyond the first-result wait."""
+    return _totals.get(wait_secs)
+
+
+def _bucket_stats_uncached() -> dict:
+    access_key = os.environ.get("AWS_ACCESS_KEY_ID", "")
+    secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+    if not access_key or not secret_key:
+        return {"error": "AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY not set"}
+    region = os.environ.get("SCCACHE_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
+    return list_bucket_totals(_endpoint_url(), BUCKET, access_key, secret_key, region)
+
+
+# The local sccache counters, cached briefly so a scrape rarely runs the CLI.
+LOCAL_STATS_TTL_SECS = float(os.environ.get("SCCACHE_STATS_LOCAL_TTL_SECS", "10"))
+_local_lock = threading.Lock()
+_local_cache: dict = {"at": None, "value": None}
+
+
+def _local_stats_cached() -> dict:
+    with _local_lock:
+        at = _local_cache["at"]
+        if at is not None and time.monotonic() - at < LOCAL_STATS_TTL_SECS:
+            return _local_cache["value"]
+    value = sccache_stats_json()
+    with _local_lock:
+        _local_cache["at"], _local_cache["value"] = time.monotonic(), value
+    return value
+
+
 def _stats_payload() -> dict:
-    local = sccache_stats_json()
-    bucket = bucket_stats()
+    """/stats and /metrics body. The bucket walk is kicked FIRST so it runs while
+    the local CLI is read, and the first-result wait only spends what is left of
+    FIRST_RESULT_WAIT_SECS after that, so the worst case is about
+    max(local CLI time, FIRST_RESULT_WAIT_SECS), not their sum."""
+    started = time.monotonic()
+    _totals.kick()
+    local = _local_stats_cached()
+    remaining = FIRST_RESULT_WAIT_SECS - (time.monotonic() - started)
+    bucket = bucket_stats(wait_secs=remaining)
     return {"local": local, "bucket": bucket, "bucket_name": BUCKET}
 
 
@@ -84,11 +318,11 @@ def _prometheus_payload(stats: dict) -> str:
     objects = bucket.get("objects")
     size = bucket.get("size_bytes")
     if isinstance(objects, int):
-        lines.append("# HELP sccache_bucket_objects Object count in the shared sccache MinIO bucket.")
+        lines.append("# HELP sccache_bucket_objects Object count in the shared sccache object-store bucket.")
         lines.append("# TYPE sccache_bucket_objects gauge")
         lines.append(f'sccache_bucket_objects{{bucket="{BUCKET}"}} {objects}')
     if isinstance(size, int):
-        lines.append("# HELP sccache_bucket_size_bytes Total byte size of the shared sccache MinIO bucket.")
+        lines.append("# HELP sccache_bucket_size_bytes Total byte size of the shared sccache object-store bucket.")
         lines.append("# TYPE sccache_bucket_size_bytes gauge")
         lines.append(f'sccache_bucket_size_bytes{{bucket="{BUCKET}"}} {size}')
     local = stats.get("local", {})
@@ -153,9 +387,18 @@ class Handler(BaseHTTPRequestHandler):
         return
 
 
+def make_server(host: str = "0.0.0.0", port: int = 4227) -> ThreadingHTTPServer:
+    """The server main() runs: threaded, so one slow request never blocks
+    /health, with daemon request threads."""
+    srv = ThreadingHTTPServer((host, port), Handler)
+    srv.daemon_threads = True
+    return srv
+
+
 def main() -> None:
     port = int(os.environ.get("SCCACHE_STATS_PORT", "4227"))
-    srv = HTTPServer(("0.0.0.0", port), Handler)
+    srv = make_server("0.0.0.0", port)
+    _totals.kick()  # warm the totals before the first scrape arrives
     print(f"[sccache-stats] listening on :{port}", flush=True)
     srv.serve_forever()
 

@@ -1,6 +1,6 @@
 # qontinui-stack
 
-The canonical-database stack for qontinui. One Postgres + one Redis + one MinIO,
+The canonical-database stack for qontinui. One Postgres + one Redis + one S3 object store,
 shared by every machine that's developing against this project. Per topology
 plan §9 Phase 1 (`tmp_canonical_db_topology_plan.md`).
 
@@ -14,11 +14,11 @@ alembic chain.
 |---|---|---|
 | `postgres` | Canonical durable state (`project`, `coord`, `agent`, `auth`, `cloud` schemas + `pgvector`) | 5433 |
 | `redis` | Claims, presence, pub/sub | 6380 |
-| `minio` | S3-compatible blob storage (snapshots, screenshots, recordings) | 9100 (API), 9101 (console) |
+| `object-store` | S3-compatible blob storage (snapshots, screenshots, recordings): versitygw, chosen by the D7 conformance subset; `object-store-seaweedfs` is its fallback behind `--profile fallback-store` | 9100 (S3 API; no console) |
 | `migrator` | One-shot — `alembic upgrade head` on `up`, exits 0 on no-op or success. Built from `./migrator/Dockerfile`. | — |
 
 Default ports are deliberately offset from the legacy `qontinui-web/docker-compose.yml`
-stack (5432/6379/9000-9001) so both can coexist during the cutover. Once the
+stack (5432/6379/9000) so both can coexist during the cutover. Once the
 legacy stack is decommissioned, you can move this one to standard ports.
 
 ## Bring it up
@@ -43,9 +43,11 @@ docker exec qontinui-canonical-postgres psql -U qontinui_user -d qontinui_db -c 
 docker exec qontinui-canonical-redis redis-cli ping
 # Expected: PONG
 
-# MinIO bucket created
-curl -s http://localhost:9100/minio/health/live
-# Expected: 200 OK
+# Object store live, and the init sidecar created its buckets
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:9100/health
+# Expected: 200
+docker compose logs object-store-init | tail -1
+# Expected: object-store buckets qontinui-dev + ... ready
 ```
 
 ## Connection strings
@@ -62,8 +64,8 @@ For `~/.qontinui/profiles.json` (`dev` profile):
       "blob": {
         "kind":       "s3-compatible",
         "endpoint":   "http://<host>:9100",
-        "access_key": "minioadmin",
-        "secret_key": "minioadmin",
+        "access_key": "qontinui_dev_s3",
+        "secret_key": "qontinui_dev_s3_secret",
         "bucket":     "qontinui-dev"
       }
     }
@@ -88,7 +90,7 @@ docker compose start
 # Stop and remove containers (data persists in named volumes)
 docker compose down
 
-# Stop and DESTROY all data (Postgres + Redis + MinIO)
+# Stop and DESTROY all data (Postgres + Redis + the object store)
 docker compose down -v
 
 # Re-run migrator only (after authoring new alembic revisions)
@@ -101,8 +103,79 @@ docker compose build migrator
 # Tail logs
 docker compose logs -f postgres
 docker compose logs -f redis
-docker compose logs -f minio
+docker compose logs -f object-store
 ```
+
+## Object store
+
+`object-store` is [versitygw](https://github.com/versity/versitygw) v1.11.0
+(posix backend), built locally from `object-store/Dockerfile` — the release
+tarball pinned by sha256 on a digest-pinned base. It replaced MinIO, whose
+repository GitHub reports as archived (repo API `archived: true`, read
+2026-11-22; the API gives no archive date, and the last push was 2026-04-24).
+It was chosen by running a conformance subset (put, get,
+head, delete, multipart, presign, create-if-absent) and both real clients
+(bazel-remote, sccache) against each candidate (plan
+`2026-11-22-fetches-stop-depending-on-upstreams`; result in qontinui-dev-notes
+`investigation-results/2026-11-19-in-house-substrate-strategy/phase1/s3-store-conformance.md`).
+The CI job `s3 store conformance` re-runs that subset on every PR, against the
+store and against its fallback.
+
+- **No console port.** The S3 API stays on 9100. 9101 is gone, and
+  `scripts/open-firewall-lan.ps1` removes its old rule. qontinui-runner's env
+  collector (`src-tauri/src/env_agent/collectors.rs`, `KNOWN_DEV_PORTS`) still
+  probes the legacy qontinui-web ports 9000/9001 under the names `minio_api` /
+  `minio_console`. Those names are kept because renaming them would change the
+  keys of the captured env section across runner builds. With the console gone,
+  `minio_console` reads `closed` by design.
+- **Extended attributes.** The posix backend keeps object metadata in user
+  xattrs on the volume's files. Docker's local volumes (ext4, xfs, Docker
+  Desktop's WSL2 ext4) support them. The container checks this at start and
+  refuses to serve on a filesystem that does not, naming the `VGW_META_SIDECAR`
+  sidecar-metadata alternative (`VGW_META_SIDECAR=/meta`). Choose one mode per
+  volume: switching an existing volume between xattrs and the sidecar does not
+  move metadata, so objects written before the switch lose theirs. Switch by
+  copying into a fresh store instead.
+- **Fallback.** SeaweedFS 4.52 is `object-store-seaweedfs`, behind
+  `--profile fallback-store`. It answers as `object-store` on the same port and
+  has its own volume. The switch commands are in the comment above the service in
+  `docker-compose.yml`. `scripts/s3-store-check.sh check <label>` proves either
+  one.
+- **Moving data off the old MinIO.** The swap mounts a new volume
+  (`qontinui_canonical_object_store_data`). The old `qontinui_canonical_minio_data`
+  stays declared and untouched. Start the old MinIO on a spare port against it
+  and run `scripts/s3-migrate-from-minio.sh --source-endpoint <url>`. It copies
+  each bucket and verifies the copy by listing keys, sizes and ETags. The header
+  gives the full procedure.
+- **Cutting over a running stack.** The old `minio` / `minio-init` services
+  are no longer in this file, so their containers become orphans that still
+  hold port 9100. Remove them first, then bring the stack up with orphans
+  pruned (named volumes, including the old MinIO data, are not touched).
+  `--remove-orphans` is safe here because this directory has one compose file,
+  so its compose project holds only this stack's containers:
+
+  ```bash
+  docker rm -fv qontinui-canonical-minio qontinui-canonical-minio-init  # -v: anonymous volumes only; named ones are kept
+  docker compose up -d --build --remove-orphans
+  ```
+
+  Then copy the data across with `scripts/s3-migrate-from-minio.sh`, below.
+  Anything clients write to the new store between the cutover and the copy is
+  reported by the script's verification as `only on destination`. That is
+  expected for those keys, but it makes the run exit 1, so run the copy
+  before restarting the clients, or check the listed keys by hand.
+- **bazel-remote health** is read from the host with
+  `bash scripts/bazel-remote-probe.sh` (its upstream image is distroless, so
+  the container has no healthcheck). Its volume is handed to the image's
+  non-root uid by the one-shot `bazel-remote-init`.
+- **Image pins** are checked by `scripts/tests/test_image_pins.py` for FORMAT
+  and age only (digest shape, `released <= pinned <= today`, a 14-day gap);
+  where each `released:` date came from is recorded in that test's docstring.
+  OS packages installed inside the built images are not version-pinned.
+- **Credentials** are `S3_ACCESS_KEY` / `S3_SECRET_KEY` (default
+  `qontinui_dev_s3` / `qontinui_dev_s3_secret`), replacing `MINIO_ROOT_USER` /
+  `MINIO_ROOT_PASSWORD`. Update `blob.access_key` / `blob.secret_key` in
+  `~/.qontinui/profiles.json` to match.
 
 ## Backup
 
@@ -114,7 +187,7 @@ PGPASSWORD=qontinui_dev_password pg_dump -h <host> -p 5433 -U qontinui_user qont
   | gzip > qontinui_db_$(date -u +%Y-%m-%dT%H%M%S).sql.gz
 ```
 
-A scheduled cron that uploads to S3 (or to MinIO + offsite mirror) is on the
+A scheduled cron that uploads to S3 (or to the object store + offsite mirror) is on the
 roadmap (topology plan §10).
 
 ## Coord redeploy procedure
@@ -255,7 +328,7 @@ Pre-2026-04-30, the migrator failed against existing DBs because the alembic cha
 
 ## Cross-machine sccache (shared S3)
 
-The in-stack `sccache` service (above) caches into the in-stack MinIO bucket
+The in-stack `sccache` service (above) caches into the in-stack object store's bucket
 `qontinui-sccache` — fine for builders living inside the stack network, but
 developer machines (spaceship, MSI, future build hosts) hit a separate
 shared real-AWS S3 bucket so they all read/write the same artifact store
@@ -263,7 +336,7 @@ across the LAN/internet. Operator-side setup, per-machine env, rotation:
 
 - [`docs/sccache-cross-machine.md`](docs/sccache-cross-machine.md)
 
-The two lanes coexist: in-stack MinIO stays for the docker-compose-only
+The two lanes coexist: the in-stack object store stays for the docker-compose-only
 path, AWS S3 lane is purely additive for host-machine builds.
 
 ## Promotion path

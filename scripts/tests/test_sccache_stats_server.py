@@ -1,0 +1,484 @@
+"""Tests for ``sccache/stats_server.py``'s S3 bucket metrics.
+
+Plan 2026-11-22-fetches-stop-depending-on-upstreams, Phase 2. The stats server
+used to shell out to ``mc du --json``; it now walks the bucket with a
+SigV4-signed ListObjectsV2 (stdlib only), and coord's ``sccache_metrics.rs``
+scrapes the resulting ``sccache_bucket_objects`` / ``sccache_bucket_size_bytes``
+gauges. Two arms:
+
+* **Stub arm (always runs).** An in-process S3 endpoint that VERIFIES the
+  header signature and paginates. The walk must count every object across
+  pages; a wrong secret, a truncated listing with no continuation token and an
+  unreachable store must each come back as ``{"error": ...}``, never as a
+  number — a metrics surface that turns a failed read into ``0`` would tell
+  coord the shared cache is empty [policy: verification-and-evidence/
+  silent-empty-is-unknown].
+* **Live arm (the conformance store).** When ``QONTINUI_S3_TEST_ENDPOINT`` is
+  set it puts three objects into a fresh bucket on that store (boto3) and
+  asserts the object and size counts are non-empty and exact. The CI job
+  ``s3 store conformance`` runs it against versitygw and against the SeaweedFS
+  fallback with ``QONTINUI_S3_TEST_REQUIRED=1``, which turns a skip into a
+  failure so the arm cannot pass by not running.
+
+Locally::
+
+    uv run --no-project --with boto3==1.43.126 --with pytest \
+        python -m pytest scripts/tests/test_sccache_stats_server.py -q
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import importlib.util
+import os
+import socket
+import sys
+import threading
+import time
+import unittest
+import urllib.request
+import urllib.parse
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from unittest import mock
+
+_MODULE_PATH = Path(__file__).resolve().parents[2] / "sccache" / "stats_server.py"
+_spec = importlib.util.spec_from_file_location("sccache_stats_server", _MODULE_PATH)
+assert _spec and _spec.loader
+stats = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = stats
+_spec.loader.exec_module(stats)
+
+ACCESS = "stats-stub-access"
+SECRET = "stats-stub-secret-not-a-real-secret"
+REGION = "us-east-1"
+
+
+def _uri_encode(value: str) -> str:
+    return urllib.parse.quote(value, safe="-_.~")
+
+
+def _header_signature_valid(handler: BaseHTTPRequestHandler) -> bool:
+    """Recompute the SigV4 header signature of a request with the stub's secret."""
+    auth = handler.headers.get("Authorization", "")
+    if not auth.startswith("AWS4-HMAC-SHA256 "):
+        return False
+    fields = dict(
+        item.strip().split("=", 1) for item in auth[len("AWS4-HMAC-SHA256 "):].split(",")
+    )
+    try:
+        access, date, region, service, terminal = fields["Credential"].split("/")
+    except (KeyError, ValueError):
+        return False
+    if access != ACCESS or terminal != "aws4_request":
+        return False
+    parts = urllib.parse.urlsplit(handler.path)
+    pairs = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+    canonical_query = "&".join(f"{_uri_encode(k)}={_uri_encode(v)}" for k, v in sorted(pairs))
+    signed = fields.get("SignedHeaders", "").split(";")
+    canonical_headers = "".join(f"{h}:{(handler.headers.get(h) or '').strip()}\n" for h in signed)
+    payload_hash = handler.headers.get("x-amz-content-sha256", "")
+    canonical_request = "\n".join(
+        [handler.command, parts.path, canonical_query, canonical_headers, ";".join(signed), payload_hash]
+    )
+    scope = f"{date}/{region}/{service}/aws4_request"
+    string_to_sign = "\n".join(
+        [
+            "AWS4-HMAC-SHA256",
+            handler.headers.get("x-amz-date", ""),
+            scope,
+            hashlib.sha256(canonical_request.encode()).hexdigest(),
+        ]
+    )
+    key = ("AWS4" + SECRET).encode()
+    for part in (date, region, service, "aws4_request"):
+        key = hmac.new(key, part.encode(), hashlib.sha256).digest()
+    expected = hmac.new(key, string_to_sign.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, fields.get("Signature", ""))
+
+
+class _ListStub:
+    """A bucket of ``objects`` (key -> size) served by a signature-checking
+    ListObjectsV2. ``drop_token`` makes it claim truncation without a token."""
+
+    def __init__(self, objects: dict[str, int], drop_token: bool = False, page_delay: float = 0.0) -> None:
+        self.objects = dict(sorted(objects.items()))
+        self.drop_token = drop_token
+        self.page_delay = page_delay
+        self.pages_served = 0
+        store = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args: object) -> None:
+                pass
+
+            def _send(self, status: int, body: bytes) -> None:
+                self.send_response(status)
+                self.send_header("Content-Type", "application/xml")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self) -> None:  # noqa: N802
+                if not _header_signature_valid(self):
+                    return self._send(403, b"<Error><Code>SignatureDoesNotMatch</Code></Error>")
+                query = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(self.path).query))
+                if query.get("list-type") != "2":
+                    return self._send(400, b"<Error><Code>InvalidRequest</Code></Error>")
+                keys = list(store.objects)
+                start = int(query.get("continuation-token") or 0)
+                size = int(query.get("max-keys") or 1000)
+                page = keys[start:start + size]
+                truncated = start + size < len(keys)
+                store.pages_served += 1
+                if store.page_delay:
+                    time.sleep(store.page_delay)
+                body = ['<?xml version="1.0" encoding="UTF-8"?>',
+                        '<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">',
+                        f"<KeyCount>{len(page)}</KeyCount>",
+                        f"<IsTruncated>{'true' if truncated else 'false'}</IsTruncated>"]
+                if truncated and not store.drop_token:
+                    body.append(f"<NextContinuationToken>{start + size}</NextContinuationToken>")
+                for k in page:
+                    body.append(f"<Contents><Key>{k}</Key><Size>{store.objects[k]}</Size></Contents>")
+                body.append("</ListBucketResult>")
+                self._send(200, "".join(body).encode())
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def __enter__(self) -> "_ListStub":
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def _closed_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+FIVE = {"sccache/a/1": 100, "sccache/a/2": 250, "sccache/b/3": 1, "sccache/c/4": 4096, "other/5": 7}
+
+
+class StubListingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        stats._totals.reset()
+        stats._local_cache.update(at=None, value=None)
+
+    def test_walk_counts_every_object_across_pages(self) -> None:
+        with _ListStub(FIVE) as stub:
+            got = stats.list_bucket_totals(stub.url, "qontinui-sccache", ACCESS, SECRET, REGION, page_size=2)
+            self.assertEqual(got, {"objects": 5, "size_bytes": sum(FIVE.values())})
+            self.assertEqual(stub.pages_served, 3, "five objects at two per page is three pages")
+
+    def test_empty_bucket_is_a_real_zero(self) -> None:
+        with _ListStub({}) as stub:
+            got = stats.list_bucket_totals(stub.url, "qontinui-sccache", ACCESS, SECRET, REGION)
+        self.assertEqual(got, {"objects": 0, "size_bytes": 0})
+
+    def test_wrong_secret_is_an_error_not_a_zero(self) -> None:
+        # The negative control for the signer: the stub checks signatures, so a
+        # passing walk above proves the signing is right, and this proves the
+        # stub would have caught it if it were not.
+        with _ListStub(FIVE) as stub:
+            got = stats.list_bucket_totals(stub.url, "qontinui-sccache", ACCESS, "wrong-secret", REGION)
+        self.assertIn("error", got)
+        self.assertIn("403", got["error"])
+        self.assertNotIn("objects", got)
+
+    def test_truncated_listing_without_a_token_is_an_error(self) -> None:
+        with _ListStub(FIVE, drop_token=True) as stub:
+            got = stats.list_bucket_totals(stub.url, "qontinui-sccache", ACCESS, SECRET, REGION, page_size=2)
+        self.assertIn("error", got)
+        self.assertNotIn("objects", got)
+
+    def test_unreachable_store_is_an_error(self) -> None:
+        got = stats.list_bucket_totals(f"http://127.0.0.1:{_closed_port()}", "b", ACCESS, SECRET, REGION, timeout=2)
+        self.assertIn("error", got)
+
+    def test_walk_past_its_deadline_is_an_error(self) -> None:
+        # Five objects at one per page, 0.3 s a page, against a 0.5 s budget.
+        with _ListStub(FIVE, page_delay=0.3) as stub:
+            started = time.monotonic()
+            got = stats.list_bucket_totals(stub.url, "qontinui-sccache", ACCESS, SECRET, REGION,
+                                           page_size=1, deadline_secs=0.5)
+            elapsed = time.monotonic() - started
+        self.assertIn("error", got)
+        self.assertIn("deadline", got["error"])
+        self.assertNotIn("objects", got)
+        self.assertLess(elapsed, 2.0, "the deadline bounds the whole walk")
+
+    def _env(self, stub: "_ListStub") -> dict[str, str]:
+        return {"SCCACHE_ENDPOINT": stub.url, "SCCACHE_REGION": REGION,
+                "AWS_ACCESS_KEY_ID": ACCESS, "AWS_SECRET_ACCESS_KEY": SECRET}
+
+    @staticmethod
+    def _wait_for(pred, secs: float = 5.0) -> bool:
+        end = time.monotonic() + secs
+        while time.monotonic() < end:
+            if pred():
+                return True
+            time.sleep(0.02)
+        return pred()
+
+    @staticmethod
+    def _totals_only(d: dict) -> dict:
+        return {k: v for k, v in d.items() if k != "age_secs"}
+
+    def test_bucket_stats_is_served_from_the_last_walk_within_the_ttl(self) -> None:
+        with _ListStub(FIVE) as stub, mock.patch.dict(os.environ, self._env(stub)), \
+                mock.patch.object(stats, "CACHE_TTL_SECS", 60.0):
+            first = stats.bucket_stats()
+            served = stub.pages_served
+            second = stats.bucket_stats()
+            self.assertEqual(self._totals_only(first), self._totals_only(second))
+            self.assertIn("age_secs", second)
+            self.assertEqual(stub.pages_served, served, "a second scrape inside the TTL walks nothing")
+            self.assertEqual(stats._totals.walks, 1)
+
+    def test_n_concurrent_scrapes_cost_one_walk(self) -> None:
+        with _ListStub(FIVE, page_delay=0.3) as stub, mock.patch.dict(os.environ, self._env(stub)), \
+                mock.patch.object(stats, "CACHE_TTL_SECS", 60.0), \
+                mock.patch.object(stats, "FIRST_RESULT_WAIT_SECS", 2.0):
+            results: list[dict] = []
+            threads = [threading.Thread(target=lambda: results.append(stats.bucket_stats())) for _ in range(10)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(10)
+            self.assertEqual(len(results), 10)
+            self.assertEqual(stub.pages_served, 1, "ten concurrent scrapes, one single-page walk")
+            self.assertEqual(stats._totals.walks, 1)
+            for r in results:
+                self.assertEqual(self._totals_only(r), {"objects": 5, "size_bytes": sum(FIVE.values())})
+
+    def test_a_stale_result_is_served_at_once_while_a_slow_refresh_runs(self) -> None:
+        with _ListStub(FIVE) as stub, mock.patch.dict(os.environ, self._env(stub)), \
+                mock.patch.object(stats, "CACHE_TTL_SECS", 0.0):
+            stats.bucket_stats()  # first walk completes (fast)
+            stub.page_delay = 3.0  # every later walk is slow
+            started = time.monotonic()
+            got = stats.bucket_stats()  # stale: kicks a refresh, does not wait for it
+            self.assertLess(time.monotonic() - started, 1.0, "a scrape never waits on a walk")
+            self.assertEqual(self._totals_only(got), {"objects": 5, "size_bytes": sum(FIVE.values())})
+            self.assertTrue(self._wait_for(lambda: stub.pages_served >= 2), "the refresh started")
+
+    def test_first_scrape_during_a_slow_first_walk_says_not_computed_yet(self) -> None:
+        with _ListStub(FIVE, page_delay=2.0) as stub, mock.patch.dict(os.environ, self._env(stub)), \
+                mock.patch.object(stats, "FIRST_RESULT_WAIT_SECS", 0.2):
+            started = time.monotonic()
+            got = stats.bucket_stats()
+            self.assertLess(time.monotonic() - started, 1.0)
+            self.assertIn("not computed yet", got.get("error", ""))
+            self.assertNotIn("objects", got)
+
+    def test_a_failed_walk_keeps_the_last_good_totals_and_says_so(self) -> None:
+        with _ListStub(FIVE) as stub, mock.patch.dict(os.environ, self._env(stub)), \
+                mock.patch.object(stats, "CACHE_TTL_SECS", 0.0):
+            good = stats.bucket_stats()
+            self.assertEqual(self._totals_only(good), {"objects": 5, "size_bytes": sum(FIVE.values())})
+            with mock.patch.dict(os.environ, {"AWS_SECRET_ACCESS_KEY": "wrong-secret"}):
+                stats.bucket_stats()  # kicks a walk that will fail (403)
+                self.assertTrue(self._wait_for(lambda: stats._totals.walks >= 2))
+            with mock.patch.object(stats, "CACHE_TTL_SECS", 60.0):
+                after = stats.bucket_stats()
+        self.assertEqual(after["objects"], 5, "the good totals survive a failed walk")
+        self.assertEqual(after["size_bytes"], sum(FIVE.values()))
+        self.assertTrue(after["stale"])
+        self.assertIn("403", after["last_error"])
+        self.assertNotIn("error", after)
+
+    def test_a_good_walk_clears_the_stale_marker(self) -> None:
+        with _ListStub(FIVE) as stub, mock.patch.dict(os.environ, self._env(stub)), \
+                mock.patch.object(stats, "CACHE_TTL_SECS", 0.0):
+            stats.bucket_stats()
+            with mock.patch.dict(os.environ, {"AWS_SECRET_ACCESS_KEY": "wrong-secret"}):
+                stats.bucket_stats()
+                self.assertTrue(self._wait_for(lambda: stats._totals.walks >= 2))
+            stats.bucket_stats()
+            self.assertTrue(self._wait_for(lambda: stats._totals.walks >= 3))
+            with mock.patch.object(stats, "CACHE_TTL_SECS", 60.0):
+                after = stats.bucket_stats()
+        self.assertNotIn("stale", after)
+        self.assertNotIn("last_error", after)
+
+    def test_error_only_when_no_walk_ever_succeeded(self) -> None:
+        with _ListStub(FIVE) as stub, mock.patch.dict(os.environ, {**self._env(stub), "AWS_SECRET_ACCESS_KEY": "wrong"}):
+            got = stats.bucket_stats()
+        self.assertIn("403", got.get("error", ""))
+        self.assertNotIn("objects", got)
+
+    def test_stats_payload_does_not_add_the_cli_time_to_the_first_wait(self) -> None:
+        def slow_cli() -> dict:
+            time.sleep(1.5)
+            return {"stats": {}}
+
+        with _ListStub(FIVE, page_delay=5.0) as stub, mock.patch.dict(os.environ, self._env(stub)), \
+                mock.patch.object(stats, "sccache_stats_json", slow_cli), \
+                mock.patch.object(stats, "FIRST_RESULT_WAIT_SECS", 2.0):
+            started = time.monotonic()
+            payload = stats._stats_payload()
+            elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 2.6, "worst case is about max(CLI, first wait), not their sum (3.5 s)")
+        self.assertIn("not computed yet", payload["bucket"].get("error", ""))
+
+    def test_stats_payload_runs_the_walk_while_the_cli_is_read(self) -> None:
+        def slow_cli() -> dict:
+            time.sleep(1.0)
+            return {"stats": {}}
+
+        with _ListStub(FIVE, page_delay=0.5) as stub, mock.patch.dict(os.environ, self._env(stub)), \
+                mock.patch.object(stats, "sccache_stats_json", slow_cli), \
+                mock.patch.object(stats, "FIRST_RESULT_WAIT_SECS", 2.0):
+            started = time.monotonic()
+            payload = stats._stats_payload()
+            elapsed = time.monotonic() - started
+        self.assertEqual(payload["bucket"]["objects"], 5)
+        self.assertLess(elapsed, 1.4, "the 0.5 s walk overlapped the 1.0 s CLI read")
+
+    def test_local_counters_are_cached_briefly(self) -> None:
+        calls = []
+
+        def cli() -> dict:
+            calls.append(1)
+            return {"stats": {}}
+
+        with mock.patch.object(stats, "sccache_stats_json", cli), \
+                mock.patch.object(stats, "LOCAL_STATS_TTL_SECS", 60.0):
+            stats._local_stats_cached()
+            stats._local_stats_cached()
+        self.assertEqual(len(calls), 1)
+
+    def test_health_answers_while_a_stats_request_is_in_flight(self) -> None:
+        release = threading.Event()
+
+        def slow_bucket_stats(wait_secs: float | None = None) -> dict:
+            release.wait(5)
+            return {"objects": 1, "size_bytes": 1}
+
+        srv = stats.make_server("127.0.0.1", 0)  # the server main() runs
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+        try:
+            with mock.patch.object(stats, "bucket_stats", slow_bucket_stats), \
+                    mock.patch.object(stats, "sccache_stats_json", lambda: {"stats": {}}):
+                blocked = threading.Thread(target=lambda: urllib.request.urlopen(base + "/stats", timeout=10).read())
+                blocked.start()
+                time.sleep(0.2)
+                with urllib.request.urlopen(base + "/health", timeout=2) as resp:
+                    self.assertEqual(resp.status, 200)
+                release.set()
+                blocked.join(10)
+        finally:
+            release.set()
+            srv.shutdown()
+            srv.server_close()
+
+    def test_a_malformed_http_answer_is_an_error_not_an_exception(self) -> None:
+        # A store that answers with a garbage status line raises
+        # http.client.BadStatusLine, which is not an OSError.
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+
+        def answer() -> None:
+            conn, _ = srv.accept()
+            conn.recv(65536)
+            conn.sendall(b"NOT-HTTP garbage\r\n\r\n")
+            conn.close()
+
+        threading.Thread(target=answer, daemon=True).start()
+        try:
+            got = stats.list_bucket_totals(f"http://127.0.0.1:{port}", "b", ACCESS, SECRET, REGION, timeout=3)
+        finally:
+            srv.close()
+        self.assertIn("error", got)
+        self.assertNotIn("objects", got)
+
+    def test_bucket_stats_reads_the_sccache_env(self) -> None:
+        with _ListStub(FIVE) as stub:
+            host = stub.url.removeprefix("http://")
+            env = {"SCCACHE_ENDPOINT": host, "SCCACHE_S3_USE_SSL": "off", "SCCACHE_REGION": REGION,
+                   "AWS_ACCESS_KEY_ID": ACCESS, "AWS_SECRET_ACCESS_KEY": SECRET}
+            with mock.patch.dict(os.environ, env):
+                got = stats.bucket_stats()
+        self.assertEqual(self._totals_only(got), {"objects": 5, "size_bytes": sum(FIVE.values())})
+
+    def test_bucket_stats_without_credentials_is_an_error(self) -> None:
+        with mock.patch.dict(os.environ, {"AWS_ACCESS_KEY_ID": "", "AWS_SECRET_ACCESS_KEY": ""}):
+            self.assertIn("error", stats.bucket_stats())
+
+    def test_prometheus_payload_exports_the_counts_and_names_no_minio(self) -> None:
+        text = stats._prometheus_payload({"bucket": {"objects": 5, "size_bytes": 4454}, "local": {}})
+        self.assertIn('sccache_bucket_objects{bucket="qontinui-sccache"} 5', text)
+        self.assertIn('sccache_bucket_size_bytes{bucket="qontinui-sccache"} 4454', text)
+        self.assertNotIn("minio", text.lower())
+
+    def test_prometheus_payload_omits_gauges_on_error(self) -> None:
+        text = stats._prometheus_payload({"bucket": {"error": "HTTP 403"}, "local": {}})
+        self.assertNotIn("sccache_bucket_objects", text)
+
+
+LIVE_ENDPOINT = os.environ.get("QONTINUI_S3_TEST_ENDPOINT", "")
+LIVE_REQUIRED = os.environ.get("QONTINUI_S3_TEST_REQUIRED", "") == "1"
+
+
+class LiveStoreTests(unittest.TestCase):
+    """Against a real store (the conformance store in CI)."""
+
+    def setUp(self) -> None:
+        if not LIVE_ENDPOINT:
+            if LIVE_REQUIRED:
+                self.fail("QONTINUI_S3_TEST_REQUIRED=1 but QONTINUI_S3_TEST_ENDPOINT is unset")
+            self.skipTest("QONTINUI_S3_TEST_ENDPOINT not set")
+        try:
+            import boto3  # noqa: F401
+        except ImportError:
+            if LIVE_REQUIRED:
+                self.fail("QONTINUI_S3_TEST_REQUIRED=1 but boto3 is not installed")
+            self.skipTest("boto3 not installed")
+
+    def test_counts_are_non_empty_and_exact_on_the_real_store(self) -> None:
+        import boto3
+        from botocore.config import Config
+
+        access = os.environ["S3_ACCESS_KEY"]
+        secret = os.environ["S3_SECRET_KEY"]
+        client = boto3.client(
+            "s3", endpoint_url=LIVE_ENDPOINT, region_name=REGION,
+            aws_access_key_id=access, aws_secret_access_key=secret,
+            config=Config(s3={"addressing_style": "path"},
+                          request_checksum_calculation="when_required",
+                          response_checksum_validation="when_required"),
+        )
+        bucket = f"stats-test-{uuid.uuid4().hex[:12]}"
+        client.create_bucket(Bucket=bucket)
+        bodies = {"sccache/x/one": b"a" * 10, "sccache/y/two": b"b" * 2000, "top": b"c" * 5}
+        try:
+            for key, body in bodies.items():
+                client.put_object(Bucket=bucket, Key=key, Body=body)
+            got = stats.list_bucket_totals(LIVE_ENDPOINT, bucket, access, secret, REGION, page_size=2)
+            self.assertNotIn("error", got, got)
+            self.assertGreater(got["objects"], 0)
+            self.assertGreater(got["size_bytes"], 0)
+            self.assertEqual(got, {"objects": 3, "size_bytes": 2015})
+        finally:
+            for key in bodies:
+                client.delete_object(Bucket=bucket, Key=key)
+            client.delete_bucket(Bucket=bucket)
+
+
+if __name__ == "__main__":
+    unittest.main()

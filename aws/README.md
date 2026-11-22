@@ -9,7 +9,7 @@ recreate data resources, so the names are preserved.
 |------------------|-----------------|----------------------------------|
 | Postgres 16      | container       | RDS db.t4g.medium                |
 | Redis 7          | container       | ElastiCache cache.t4g.micro      |
-| MinIO / S3       | MinIO container | S3 bucket                        |
+| S3 object store  | container       | S3 bucket                        |
 | qontinui-coord   | container       | ECS Fargate (2 tasks, 0.25 vCPU) |
 | Cloudflare Tunnel| host daemon     | ALB → ACM cert → Route53 record  |
 

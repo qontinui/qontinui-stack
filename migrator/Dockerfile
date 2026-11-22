@@ -1,4 +1,5 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.7.1@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+# released: 2024-04-25 pinned: 2026-11-22
 #
 # qontinui canonical-DB migrator — one-shot `alembic upgrade head`.
 #
@@ -23,7 +24,11 @@
 #   that lists exactly the deps env.py + the model graph need (see that file's
 #   header comment for the rationale). Image stays well under the 500 MB target.
 
-FROM python:3.12-slim AS base
+# Digest-pinned (plan 2026-11-22-fetches-stop-depending-on-upstreams D5;
+# scripts/tests/test_image_pins.py): 3.12.15 is the newest 3.12-slim build
+# outside the 14-day cooldown on the pin date.
+# released: 2026-10-22 pinned: 2026-11-22
+FROM python:3.12.15-slim@sha256:a0f57064cbdcd6285fa45f51237ab0b35ea8ebaed06a1f5973e89e19dfb86704 AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

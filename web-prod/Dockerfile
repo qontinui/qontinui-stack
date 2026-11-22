@@ -1,4 +1,5 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.7.1@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+# released: 2024-04-25 pinned: 2026-11-22
 #
 # qontinui-web production overlay — layers qontinui-cloud-control (AGPL, public:
 # github.com/qontinui/qontinui-cloud-control) on top of the OSS slim image so the AWS staging/prod web service has the

@@ -1,6 +1,6 @@
 # NATS JetStream cluster config (Row 9 Phase 1)
 
-3-node JetStream cluster, paired to the canonical PG/Redis/MinIO
+3-node JetStream cluster, paired to the canonical PG/Redis/object store
 stack. Per `plans/2026-05-14-failure-modes-at-scale-design.md` §3.1.
 
 ## Port map (host-facing)
@@ -15,7 +15,7 @@ The cluster-route port (6222) is **not** exposed to the host. Cluster
 traffic stays on the compose-default network.
 
 Host port 4223 follows the "+1 offset" convention used for postgres
-(5433→5432), redis (6380→6379), and minio (9100→9000) elsewhere in
+(5433→5432), redis (6380→6379), and object-store (9100→9000) elsewhere in
 this stack.
 
 ## Auth posture (Phase 1 vs Phase 2)

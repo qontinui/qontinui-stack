@@ -145,3 +145,102 @@ jobs:
       # relay imports boto3 lazily. pytest's summary line is the count of tests run.
       - name: pytest
         run: python -m pytest scripts/tests/ aws/lambdas/ -q
+
+  # The stack's object store passes the D7 conformance subset — and so does its
+  # fallback — on every PR and merge candidate (plan 2026-11-22-fetches-stop-
+  # depending-on-upstreams, Phase 2). Two arms, both required:
+  #
+  #   1. `object-store` (versitygw, built from ./object-store) alone, then the
+  #      `object-store-init` sidecar, then scripts/s3-store-check.sh: the seven
+  #      operations (7/7 or red), the three init buckets with qontinui-dev
+  #      anonymous-download and the cold-tier bucket private, and the sccache
+  #      stats server's live S3 listing test.
+  #   2. The same under `--profile fallback-store` with `object-store-seaweedfs`
+  #      answering as `object-store` — the fallback REHEARSAL, run every time so
+  #      the fallback is known to work before it is needed, not after.
+  #
+  # So a PR that swaps in a store failing the subset, or breaks the fallback,
+  # goes red here. Credential-free and zero-spend: GitHub-hosted runner, a
+  # throwaway key pair, no AWS principal (the `permissions: contents: read`
+  # above still holds). Images are digest-pinned in docker-compose.yml.
+  s3-store-conformance:
+    name: s3 store conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      S3_ACCESS_KEY: ci-conformance-access
+      S3_SECRET_KEY: ci-conformance-secret-not-a-real-secret
+      S3_API_PORT: "9100"
+      OUT_DIR: s3-conformance-results
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install boto3 and pytest
+        run: python -m pip install --quiet boto3==1.43.126 pytest
+
+      - name: "arm 1: versitygw — start object-store and create the buckets"
+        run: |
+          docker compose up -d --build --wait object-store
+          bash scripts/s3-store-check.sh wait-writable
+          docker compose run --rm object-store-init
+      - name: "arm 1: versitygw — conformance, buckets, stats"
+        run: bash scripts/s3-store-check.sh check versitygw
+      - name: "arm 1: logs on failure"
+        if: failure()
+        run: docker compose logs object-store object-store-init
+      - name: "arm 1: stop"
+        if: always()
+        run: docker compose down -v
+
+      - name: "arm 2: SeaweedFS fallback — start object-store-seaweedfs and create the buckets"
+        # Runs even when arm 1 failed, so one red shows both verdicts.
+        if: ${{ !cancelled() }}
+        run: |
+          docker compose --profile fallback-store up -d --wait object-store-seaweedfs
+          bash scripts/s3-store-check.sh wait-writable
+          docker compose run --rm --no-deps object-store-init
+      - name: "arm 2: SeaweedFS fallback — conformance, buckets, stats"
+        # Runs even when arm 1 failed, so one red shows both verdicts.
+        if: ${{ !cancelled() }}
+        run: bash scripts/s3-store-check.sh check seaweedfs
+      - name: "arm 2: logs on failure"
+        if: failure()
+        run: docker compose --profile fallback-store logs object-store-seaweedfs
+      - name: "arm 2: stop"
+        if: always()
+        run: docker compose --profile fallback-store down -v
+
+      # Arm 3: qontinui-web's compose pulls the upstream versitygw image by
+      # digest (v1.10.0, outside the cooldown) instead of building
+      # ./object-store. Its conformance is re-checked here so that pin is not
+      # an unverified claim. Keep this digest equal to qontinui-web's
+      # docker-compose.yml `object-store` image. `-v /data` is an anonymous
+      # local volume (ext4 on the runner, so user xattrs work); the stop step's
+      # `rm -fv` removes it.
+      - name: "arm 3: qontinui-web's versitygw image — conformance"
+        if: ${{ !cancelled() }}
+        env:
+          WEB_STORE_IMAGE: versity/versitygw:v1.10.0@sha256:89cad13cc981986ee284cbafea4613f9533ce6fd5f37a2c96c4c4fb8adb3a316
+        run: |
+          docker run -d --name web-object-store -p 127.0.0.1:9200:9000 \
+            -e ROOT_ACCESS_KEY="$S3_ACCESS_KEY" -e ROOT_SECRET_KEY="$S3_SECRET_KEY" \
+            -v /data "$WEB_STORE_IMAGE" --port :9000 --health /health posix /data
+          S3_ENDPOINT=http://127.0.0.1:9200 bash scripts/s3-store-check.sh wait-writable
+          mkdir -p "$OUT_DIR"
+          python3 scripts/s3-conformance.py --endpoint http://127.0.0.1:9200 \
+            --access-key-env S3_ACCESS_KEY --secret-key-env S3_SECRET_KEY \
+            --bucket conformance-web-image --label versitygw-web-image \
+            --json-out "$OUT_DIR/s3-conformance-versitygw-web-image.json"
+      - name: "arm 3: stop"
+        if: always()
+        run: docker rm -fv web-object-store || true
+
+      - name: keep the conformance records
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s3-store-conformance
+          path: s3-conformance-results/
+          if-no-files-found: warn
