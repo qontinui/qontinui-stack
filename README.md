@@ -150,7 +150,9 @@ store and against its fallback.
 - **Cutting over a running stack.** The old `minio` / `minio-init` services
   are no longer in this file, so their containers become orphans that still
   hold port 9100. Remove them first, then bring the stack up with orphans
-  pruned (named volumes, including the old MinIO data, are not touched):
+  pruned (named volumes, including the old MinIO data, are not touched).
+  `--remove-orphans` is safe here because this directory has one compose file,
+  so its compose project holds only this stack's containers:
 
   ```bash
   docker rm -fv qontinui-canonical-minio qontinui-canonical-minio-init  # -v: anonymous volumes only; named ones are kept

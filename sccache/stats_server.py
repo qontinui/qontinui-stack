@@ -58,7 +58,7 @@ def sccache_stats_json() -> dict:
             ["sccache", "--show-stats", "--stats-format=json"],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=float(os.environ.get("SCCACHE_STATS_LOCAL_TIMEOUT_SECS", "2.5")),
         )
         if out.returncode != 0:
             return {"error": out.stderr.strip() or "non-zero exit"}
@@ -182,15 +182,21 @@ class _Totals:
     """Stale-while-revalidate holder for the bucket totals.
 
     One walk at a time runs in a background thread; readers take the last
-    completed result under a lock held only for the read, never across a walk.
-    A result older than CACHE_TTL_SECS starts a refresh and is still served
-    (with ``age_secs`` so a reader can see how old it is). Errors are cached
-    the same way, so a failing store is not hammered."""
+    result under a lock held only for the read, never across a walk. A result
+    older than CACHE_TTL_SECS starts a refresh and is still served.
+
+    A FAILED walk never erases the last good totals: readers keep getting them,
+    with ``age_secs`` measured from that good walk, ``stale: true`` and the
+    failure in ``last_error``. Only when no walk has ever succeeded is the
+    answer error-only. Failures count as attempts for the TTL, so a failing
+    store is not hammered."""
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
-        self.value: dict | None = None
-        self.at: float | None = None
+        self.good: dict | None = None       # last successful totals
+        self.good_at: float | None = None
+        self.last_error: str | None = None  # set by a failed walk, cleared by a good one
+        self.attempt_at: float | None = None
         self.refreshing = False
         self.first_done = threading.Event()
         self.walks = 0
@@ -199,7 +205,8 @@ class _Totals:
     def reset(self) -> None:
         """Forget every result; a walk still running from before is ignored."""
         with self.lock:
-            self.value, self.at, self.refreshing, self.walks = None, None, False, 0
+            self.good = self.good_at = self.last_error = self.attempt_at = None
+            self.refreshing, self.walks = False, 0
             self.first_done = threading.Event()
             self.generation += 1
 
@@ -211,44 +218,56 @@ class _Totals:
         with self.lock:
             if generation != self.generation:
                 return
-            self.value, self.at, self.refreshing = value, time.monotonic(), False
+            now = time.monotonic()
+            if "error" in value:
+                self.last_error = str(value["error"])
+            else:
+                self.good, self.good_at, self.last_error = value, now, None
+            self.attempt_at, self.refreshing = now, False
             self.walks += 1
             done = self.first_done
         done.set()
 
     def kick(self) -> None:
-        """Start a background walk unless one is running or the result is fresh."""
+        """Start a background walk unless one is running or the last attempt is fresh."""
         with self.lock:
-            fresh = self.at is not None and time.monotonic() - self.at < CACHE_TTL_SECS
+            fresh = self.attempt_at is not None and time.monotonic() - self.attempt_at < CACHE_TTL_SECS
             if self.refreshing or fresh:
                 return
             self.refreshing = True
             generation = self.generation
         threading.Thread(target=self._refresh, args=(generation,), name="bucket-totals", daemon=True).start()
 
-    def get(self) -> dict:
+    def get(self, wait_secs: float | None = None) -> dict:
+        """The totals as they stand. When no walk has finished yet, wait at most
+        ``wait_secs`` (default FIRST_RESULT_WAIT_SECS) for the first one."""
         self.kick()
         with self.lock:
             done = self.first_done
-            have = self.value is not None
+            have = self.attempt_at is not None
         if not have:
-            done.wait(FIRST_RESULT_WAIT_SECS)
+            done.wait(FIRST_RESULT_WAIT_SECS if wait_secs is None else max(0.0, wait_secs))
         with self.lock:
-            if self.value is None:
-                return {"error": "bucket totals not computed yet (first walk in progress)"}
-            out = dict(self.value)
-            out["age_secs"] = round(time.monotonic() - self.at, 1)
-            return out
+            if self.good is not None:
+                out = dict(self.good)
+                out["age_secs"] = round(time.monotonic() - self.good_at, 1)
+                if self.last_error is not None:
+                    out["stale"] = True
+                    out["last_error"] = self.last_error
+                return out
+            if self.last_error is not None:
+                return {"error": self.last_error}
+            return {"error": "bucket totals not computed yet (first walk in progress)"}
 
 
 _totals = _Totals()
 
 
-def bucket_stats() -> dict:
-    """Return { objects, size_bytes, age_secs } (or { error, age_secs }) for the
-    sccache bucket, from the last completed background walk. Never blocks on a
-    walk beyond FIRST_RESULT_WAIT_SECS on the very first call."""
-    return _totals.get()
+def bucket_stats(wait_secs: float | None = None) -> dict:
+    """Return { objects, size_bytes, age_secs[, stale, last_error] }, or
+    { error } when no walk has ever succeeded, for the sccache bucket, from the
+    background walks. Never blocks on a walk beyond the first-result wait."""
+    return _totals.get(wait_secs)
 
 
 def _bucket_stats_uncached() -> dict:
@@ -260,9 +279,33 @@ def _bucket_stats_uncached() -> dict:
     return list_bucket_totals(_endpoint_url(), BUCKET, access_key, secret_key, region)
 
 
+# The local sccache counters, cached briefly so a scrape rarely runs the CLI.
+LOCAL_STATS_TTL_SECS = float(os.environ.get("SCCACHE_STATS_LOCAL_TTL_SECS", "10"))
+_local_lock = threading.Lock()
+_local_cache: dict = {"at": None, "value": None}
+
+
+def _local_stats_cached() -> dict:
+    with _local_lock:
+        at = _local_cache["at"]
+        if at is not None and time.monotonic() - at < LOCAL_STATS_TTL_SECS:
+            return _local_cache["value"]
+    value = sccache_stats_json()
+    with _local_lock:
+        _local_cache["at"], _local_cache["value"] = time.monotonic(), value
+    return value
+
+
 def _stats_payload() -> dict:
-    local = sccache_stats_json()
-    bucket = bucket_stats()
+    """/stats and /metrics body. The bucket walk is kicked FIRST so it runs while
+    the local CLI is read, and the first-result wait only spends what is left of
+    FIRST_RESULT_WAIT_SECS after that, so the worst case is about
+    max(local CLI time, FIRST_RESULT_WAIT_SECS), not their sum."""
+    started = time.monotonic()
+    _totals.kick()
+    local = _local_stats_cached()
+    remaining = FIRST_RESULT_WAIT_SECS - (time.monotonic() - started)
+    bucket = bucket_stats(wait_secs=remaining)
     return {"local": local, "bucket": bucket, "bucket_name": BUCKET}
 
 

@@ -174,6 +174,7 @@ FIVE = {"sccache/a/1": 100, "sccache/a/2": 250, "sccache/b/3": 1, "sccache/c/4":
 class StubListingTests(unittest.TestCase):
     def setUp(self) -> None:
         stats._totals.reset()
+        stats._local_cache.update(at=None, value=None)
 
     def test_walk_counts_every_object_across_pages(self) -> None:
         with _ListStub(FIVE) as stub:
@@ -282,10 +283,87 @@ class StubListingTests(unittest.TestCase):
             self.assertIn("not computed yet", got.get("error", ""))
             self.assertNotIn("objects", got)
 
+    def test_a_failed_walk_keeps_the_last_good_totals_and_says_so(self) -> None:
+        with _ListStub(FIVE) as stub, mock.patch.dict(os.environ, self._env(stub)), \
+                mock.patch.object(stats, "CACHE_TTL_SECS", 0.0):
+            good = stats.bucket_stats()
+            self.assertEqual(self._totals_only(good), {"objects": 5, "size_bytes": sum(FIVE.values())})
+            with mock.patch.dict(os.environ, {"AWS_SECRET_ACCESS_KEY": "wrong-secret"}):
+                stats.bucket_stats()  # kicks a walk that will fail (403)
+                self.assertTrue(self._wait_for(lambda: stats._totals.walks >= 2))
+            with mock.patch.object(stats, "CACHE_TTL_SECS", 60.0):
+                after = stats.bucket_stats()
+        self.assertEqual(after["objects"], 5, "the good totals survive a failed walk")
+        self.assertEqual(after["size_bytes"], sum(FIVE.values()))
+        self.assertTrue(after["stale"])
+        self.assertIn("403", after["last_error"])
+        self.assertNotIn("error", after)
+
+    def test_a_good_walk_clears_the_stale_marker(self) -> None:
+        with _ListStub(FIVE) as stub, mock.patch.dict(os.environ, self._env(stub)), \
+                mock.patch.object(stats, "CACHE_TTL_SECS", 0.0):
+            stats.bucket_stats()
+            with mock.patch.dict(os.environ, {"AWS_SECRET_ACCESS_KEY": "wrong-secret"}):
+                stats.bucket_stats()
+                self.assertTrue(self._wait_for(lambda: stats._totals.walks >= 2))
+            stats.bucket_stats()
+            self.assertTrue(self._wait_for(lambda: stats._totals.walks >= 3))
+            with mock.patch.object(stats, "CACHE_TTL_SECS", 60.0):
+                after = stats.bucket_stats()
+        self.assertNotIn("stale", after)
+        self.assertNotIn("last_error", after)
+
+    def test_error_only_when_no_walk_ever_succeeded(self) -> None:
+        with _ListStub(FIVE) as stub, mock.patch.dict(os.environ, {**self._env(stub), "AWS_SECRET_ACCESS_KEY": "wrong"}):
+            got = stats.bucket_stats()
+        self.assertIn("403", got.get("error", ""))
+        self.assertNotIn("objects", got)
+
+    def test_stats_payload_does_not_add_the_cli_time_to_the_first_wait(self) -> None:
+        def slow_cli() -> dict:
+            time.sleep(1.5)
+            return {"stats": {}}
+
+        with _ListStub(FIVE, page_delay=5.0) as stub, mock.patch.dict(os.environ, self._env(stub)), \
+                mock.patch.object(stats, "sccache_stats_json", slow_cli), \
+                mock.patch.object(stats, "FIRST_RESULT_WAIT_SECS", 2.0):
+            started = time.monotonic()
+            payload = stats._stats_payload()
+            elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 2.6, "worst case is about max(CLI, first wait), not their sum (3.5 s)")
+        self.assertIn("not computed yet", payload["bucket"].get("error", ""))
+
+    def test_stats_payload_runs_the_walk_while_the_cli_is_read(self) -> None:
+        def slow_cli() -> dict:
+            time.sleep(1.0)
+            return {"stats": {}}
+
+        with _ListStub(FIVE, page_delay=0.5) as stub, mock.patch.dict(os.environ, self._env(stub)), \
+                mock.patch.object(stats, "sccache_stats_json", slow_cli), \
+                mock.patch.object(stats, "FIRST_RESULT_WAIT_SECS", 2.0):
+            started = time.monotonic()
+            payload = stats._stats_payload()
+            elapsed = time.monotonic() - started
+        self.assertEqual(payload["bucket"]["objects"], 5)
+        self.assertLess(elapsed, 1.4, "the 0.5 s walk overlapped the 1.0 s CLI read")
+
+    def test_local_counters_are_cached_briefly(self) -> None:
+        calls = []
+
+        def cli() -> dict:
+            calls.append(1)
+            return {"stats": {}}
+
+        with mock.patch.object(stats, "sccache_stats_json", cli), \
+                mock.patch.object(stats, "LOCAL_STATS_TTL_SECS", 60.0):
+            stats._local_stats_cached()
+            stats._local_stats_cached()
+        self.assertEqual(len(calls), 1)
+
     def test_health_answers_while_a_stats_request_is_in_flight(self) -> None:
         release = threading.Event()
 
-        def slow_bucket_stats() -> dict:
+        def slow_bucket_stats(wait_secs: float | None = None) -> dict:
             release.wait(5)
             return {"objects": 1, "size_bytes": 1}
 
