@@ -149,9 +149,24 @@ def check_dockerfile(text: str, path: str) -> list[str]:
             if v:
                 out.append(v)
             continue
-        if re.match(r"^RUN\s", stripped) and re.search(r"\b(curl|wget)\b[^;&|]*https?://", stripped):
-            if "sha256sum -c" not in stripped:
-                out.append(f"{path}:{n}: RUN downloads over http(s) without a 'sha256sum -c' check")
+        if re.match(r"^ADD\s", stripped, re.IGNORECASE) and re.search(r"https?://", stripped) \
+                and "--checksum=sha256:" not in stripped:
+            out.append(f"{path}:{n}: ADD of a URL without --checksum=sha256:")
+        refs = re.findall(r"(?:--from=|\bfrom=)([^\s,]+)", stripped) if re.match(r"^(COPY|RUN)\s", stripped) else []
+        for flag_ref in refs:
+            # COPY --from= / RUN --mount=...,from= naming an IMAGE (not a stage).
+            if flag_ref in stages or flag_ref.isdigit() or FIRST_PARTY.match(flag_ref):
+                continue
+            if not PINNED_REF.match(flag_ref):
+                out.append(f"{path}:{n}: external image {flag_ref} not pinned as <name>:<tag>@sha256:<digest>")
+        # A curl/wget INVOCATION (followed by a flag, quote, variable or URL),
+        # not the package name in `apk add curl` / `apt-get install curl`.
+        invocation = re.compile(r"\b(?:curl|wget)\s+(?:-|\"|'|\$|https?://)")
+        if re.match(r"^RUN\s", stripped) and invocation.search(stripped):
+            downloads = len(invocation.findall(stripped))
+            checks = stripped.count("sha256sum -c")
+            if checks < downloads:
+                out.append(f"{path}:{n}: RUN has {downloads} curl/wget call(s) but {checks} 'sha256sum -c' check(s)")
     return out
 
 
@@ -163,7 +178,10 @@ def _repo_dockerfiles() -> list[Path]:
 
 
 def _repo_compose_files() -> list[Path]:
-    return sorted(p for p in REPO.glob("docker-compose*.y*ml") if p.is_file())
+    return sorted(
+        p for pattern in ("docker-compose*.y*ml", "compose*.y*ml") for p in REPO.rglob(pattern)
+        if ".git" not in p.parts and p.is_file()
+    )
 
 
 class RepoPinsTests(unittest.TestCase):
@@ -244,6 +262,23 @@ class RuleCanFailTests(unittest.TestCase):
     def test_unverified_download_fails(self) -> None:
         text = "FROM scratch\nRUN curl -fsSL https://example.invalid/tool.tgz \\\n    | tar -xz\n"
         self.assertTrue(check_dockerfile(text, "d"))
+
+    def test_second_unverified_download_in_one_run_fails(self) -> None:
+        text = ("FROM scratch\nRUN curl -fsSL -o /a https://x.invalid/a && echo \"h  /a\" | sha256sum -c - "
+                "&& curl -fsSL -o /b \"$URL\"\n")
+        self.assertTrue(check_dockerfile(text, "d"))
+
+    def test_package_named_curl_is_not_a_download(self) -> None:
+        self.assertEqual(check_dockerfile("FROM scratch\nRUN apt-get install -y python3 curl >/dev/null\n", "d"), [])
+
+    def test_add_url_without_checksum_fails(self) -> None:
+        self.assertTrue(check_dockerfile("FROM scratch\nADD https://x.invalid/t.tgz /t.tgz\n", "d"))
+
+    def test_copy_from_external_image_fails_and_stage_passes(self) -> None:
+        self.assertTrue(check_dockerfile("FROM scratch\nCOPY --from=busybox:latest /bin/sh /sh\n", "d"))
+        text = (f"# released: 2026-10-23 pinned: 2026-11-22\nFROM alpine:3.23.7@{self.D} AS build\n"
+                "FROM scratch\nCOPY --from=build /x /x\n")
+        self.assertEqual(check_dockerfile(text, "d"), [])
 
     def test_sha_arg_needs_its_age(self) -> None:
         text = f"FROM scratch\nARG TOOL_SHA256={'b' * 64}\n"
