@@ -212,6 +212,31 @@ jobs:
         if: always()
         run: docker compose --profile fallback-store down -v
 
+      # Arm 3: qontinui-web's compose pulls the upstream versitygw image by
+      # digest (v1.10.0, outside the cooldown) instead of building
+      # ./object-store. Its conformance is re-checked here so that pin is not
+      # an unverified claim. Keep this digest equal to qontinui-web's
+      # docker-compose.yml `object-store` image. `-v /data` is an anonymous
+      # local volume (ext4 on the runner, so user xattrs work); the stop step's
+      # `rm -fv` removes it.
+      - name: "arm 3: qontinui-web's versitygw image — conformance"
+        if: ${{ !cancelled() }}
+        env:
+          WEB_STORE_IMAGE: versity/versitygw:v1.10.0@sha256:89cad13cc981986ee284cbafea4613f9533ce6fd5f37a2c96c4c4fb8adb3a316
+        run: |
+          docker run -d --name web-object-store -p 127.0.0.1:9200:9000 \
+            -e ROOT_ACCESS_KEY="$S3_ACCESS_KEY" -e ROOT_SECRET_KEY="$S3_SECRET_KEY" \
+            -v /data "$WEB_STORE_IMAGE" --port :9000 --health /health posix /data
+          S3_ENDPOINT=http://127.0.0.1:9200 bash scripts/s3-store-check.sh wait-writable
+          mkdir -p "$OUT_DIR"
+          python3 scripts/s3-conformance.py --endpoint http://127.0.0.1:9200 \
+            --access-key-env S3_ACCESS_KEY --secret-key-env S3_SECRET_KEY \
+            --bucket conformance-web-image --label versitygw-web-image \
+            --json-out "$OUT_DIR/s3-conformance-versitygw-web-image.json"
+      - name: "arm 3: stop"
+        if: always()
+        run: docker rm -fv web-object-store || true
+
       - name: keep the conformance records
         if: always()
         uses: actions/upload-artifact@v4
