@@ -1,0 +1,114 @@
+# Pins for scripts/s3-candidates.sh — the D8 object-store candidates and the
+# two real clients of the stack's store, each fetched by version and sha256.
+#
+# Plan 2026-11-22-fetches-stop-depending-on-upstreams, Phase 1. These live
+# beside s3-candidates.sh because Phase 1 runs before Phase 3 creates the
+# fleet pin manifest (qontinui-claude-config scripts/substrate/fetch-pins.toml);
+# Phase 3 absorbs them.
+#
+# Release-age cooldown (D5): `pinned_at - released_at` must be >= 14 days, and
+# s3-candidates.sh refuses an entry that is not, unless it carries a
+# `cooldown_waiver`. `released_at` was read from the upstream release API
+# (GitHub `published_at`; Garage's Forgejo `published_at`), never typed from
+# memory.
+#
+# `sha256_source` says how the digest was established. For the GitHub assets
+# the digest was read from the release API's per-asset `digest` field and
+# matched by a local `sha256sum` of the download (and, where the project ships
+# one, its own checksum file). Garage publishes no checksum file: the digest
+# was taken from the download and matched against the `garage` binary inside
+# the project's own `dxflrs/garage:v2.5.0` linux/amd64 image layer — two
+# independent distribution channels agreeing.
+#
+# `license_*`: the LICENSE file read at the pinned tag (D8: "Each candidate's
+# licence is read from its LICENSE file at the pinned tag"); the sha256 pins
+# exactly which text was screened.
+
+cooldown_days = 14
+
+[[candidate]]
+name = "garage"
+version = "v2.5.0"
+released_at = "2026-10-24"
+pinned_at = "2026-11-22"
+url = "https://garagehq.deuxfleurs.fr/_releases/v2.5.0/x86_64-unknown-linux-musl/garage"
+asset = "garage"
+archive = "none"
+binary = "garage"
+sha256 = "2ff667286217cd73ebcb1c03af993822365000441dfe31a80cb64c5189a9dea8"
+sha256_source = "download; equals /garage in docker.io/dxflrs/garage:v2.5.0 linux/amd64 (manifest sha256:23b16d34e0348d9aca9b960a7429a7e6d494974b5288bfb8f6c3ab856895f71e, layer sha256:8da82df9bbd402ca27f344d3995d457f5c21a83dbb6c8af5e9e952859699c003)"
+license_url = "https://git.deuxfleurs.fr/Deuxfleurs/garage/raw/tag/v2.5.0/LICENSE"
+license_sha256 = "0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0"
+governance = "forkable"
+governance_note = "Deuxfleurs (French non-profit association); AGPL-3.0, forkable; not foundation-governed"
+source_repo = "https://git.deuxfleurs.fr/Deuxfleurs/garage"
+
+[[candidate]]
+name = "seaweedfs"
+version = "4.52"
+released_at = "2026-11-02"
+pinned_at = "2026-11-22"
+url = "https://github.com/seaweedfs/seaweedfs/releases/download/4.52/linux_amd64.tar.gz"
+asset = "linux_amd64.tar.gz"
+archive = "tar.gz"
+binary = "weed"
+sha256 = "8b538c22d47d0c3fb6792adaa6b0c735a967401270a53427d5a476dcaca9b7ae"
+sha256_source = "GitHub release API asset digest; matched by local sha256sum"
+license_url = "https://raw.githubusercontent.com/seaweedfs/seaweedfs/4.52/LICENSE"
+license_sha256 = "d789d433cc11da163273d1e39be2e8fa67642f9a58ef220d3f258fa9c14ef613"
+governance = "forkable"
+governance_note = "single-maintainer-led project with a commercial enterprise edition; Apache-2.0, forkable; not foundation-governed"
+source_repo = "https://github.com/seaweedfs/seaweedfs"
+# 4.53 (2026-11-08T18:10Z) and 4.54 (2026-11-16) are inside the 14-day cooldown on 2026-11-22.
+
+[[candidate]]
+name = "versitygw"
+version = "v1.11.0"
+released_at = "2026-11-06"
+pinned_at = "2026-11-22"
+url = "https://github.com/versity/versitygw/releases/download/v1.11.0/versitygw_v1.11.0_Linux_x86_64.tar.gz"
+asset = "versitygw_v1.11.0_Linux_x86_64.tar.gz"
+archive = "tar.gz"
+binary = "versitygw_v1.11.0_Linux_x86_64/versitygw"
+sha256 = "1f075c9dc92fef232f5b3c7465711ddc5e1b062b2b6df4a3bd246a4be5b35b52"
+sha256_source = "GitHub release API asset digest; equals the release's own checksums.txt; matched by local sha256sum"
+license_url = "https://raw.githubusercontent.com/versity/versitygw/v1.11.0/LICENSE"
+license_sha256 = "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+governance = "forkable"
+governance_note = "Versity Software (company); Apache-2.0, forkable; not foundation-governed"
+source_repo = "https://github.com/versity/versitygw"
+
+# Screened out before the run, by footprint (D8: "not one process under
+# 512 MiB idle"). Recorded, not hidden.
+[[screened_out]]
+name = "ceph-rgw"
+governance = "foundation"
+governance_note = "Ceph Foundation (Linux Foundation); LGPL-2.1/3.0"
+reason = "not one process under 512 MiB idle: radosgw needs a RADOS cluster behind it (at least ceph-mon + ceph-osd, plus ceph-mgr in practice); the project's own minimum table sets ceph-mon RAM >= 5 GB per daemon and ceph-osd RAM >= 4 GiB per OSD"
+evidence_url = "https://raw.githubusercontent.com/ceph/ceph/ce12032d534773d03610918d37abc7fb95eaa644/doc/start/minimum-hardware.rst"
+evidence_sha256 = "a840c99e35ff7b99483cd07e2d12b2854610858b75106fcb96aae80fb903de83"
+
+# The stack's two real clients of its store (D8 rule 3).
+[[client]]
+name = "bazel-remote"
+version = "v2.6.4"
+released_at = "2026-10-20"
+pinned_at = "2026-11-22"
+url = "https://github.com/buchgr/bazel-remote/releases/download/v2.6.4/bazel-remote-2.6.4-linux-amd64"
+asset = "bazel-remote-2.6.4-linux-amd64"
+archive = "none"
+binary = "bazel-remote-2.6.4-linux-amd64"
+sha256 = "6a6b64666c2238ec6b49b7b29f5e41e4149de09417a0028897c9bffe40376876"
+sha256_source = "GitHub release API asset digest; matched by local sha256sum"
+
+[[client]]
+name = "sccache"
+version = "v0.19.0"
+released_at = "2026-10-24"
+pinned_at = "2026-11-22"
+url = "https://github.com/mozilla/sccache/releases/download/v0.19.0/sccache-v0.19.0-x86_64-unknown-linux-musl.tar.gz"
+asset = "sccache-v0.19.0-x86_64-unknown-linux-musl.tar.gz"
+archive = "tar.gz"
+binary = "sccache-v0.19.0-x86_64-unknown-linux-musl/sccache"
+sha256 = "aa73c7270c997894038c0d8f0d297865f57569e1687883322bc431713d4bb9dd"
+sha256_source = "GitHub release API asset digest; equals the release's own .sha256 file; matched by local sha256sum"
