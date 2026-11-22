@@ -196,7 +196,8 @@ licence_screen() {
         log "DOWNLOAD FAILED for $name's LICENSE ($PIN_LICENSE_URL)"
         return 5
     fi
-    # exit 1 = screened out (recorded); anything else is a failure of the step.
+    # exit 3 = screened out (recorded, LICENCE_EXCLUDED_EXIT); 0 = passed;
+    # anything else (1 is an uncaught Python exception) is a failure of the step.
     lib licence --pins "$PINS" --name "$name" --file "${d}/LICENSE" --out "${OUT_DIR}/${name}.licence.json"
 }
 
@@ -495,7 +496,7 @@ run_candidate() {
     licence_screen "$name" || rc=$?
     case "$rc" in
         0) ;;
-        1) log "$name EXCLUDED by the licence screen (recorded)" ;;
+        3) log "$name EXCLUDED by the licence screen (recorded)" ;;
         5) return 5 ;;
         *) log "$name licence screen could not run (exit $rc)"; return 1 ;;
     esac
@@ -553,6 +554,10 @@ run_controls() {
 import importlib.util, json, os, sys
 from pathlib import Path
 script_dir, out_dir = Path(sys.argv[1]), Path(sys.argv[2])
+lspec = importlib.util.spec_from_file_location("s3_candidates_lib", script_dir / "s3_candidates_lib.py")
+lib = importlib.util.module_from_spec(lspec)
+sys.modules[lspec.name] = lib
+lspec.loader.exec_module(lib)
 spec = importlib.util.spec_from_file_location("test_s3_conformance", script_dir / "tests" / "test_s3_conformance.py")
 mod = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = mod
@@ -568,12 +573,12 @@ for mode in ("broken", "conforming"):
     rec = json.loads(out.read_text())
     rec["exit_code"] = code
     out.write_text(json.dumps(rec, indent=2) + "\n")
-    verdicts[mode] = ({o["op"]: o["verdict"] for o in rec["operations"]}, code)
-broken, bcode = verdicts["broken"]
-good, gcode = verdicts["conforming"]
-failed = sorted(op for op, v in broken.items() if v != "PASS")
-ok = failed == ["create_if_absent", "presign"] and bcode != 0 and all(v == "PASS" for v in good.values()) and gcode == 0
-print(f"controls: broken stub failed {failed} (exit {bcode}); conforming stub exit {gcode} -> {'VALID' if ok else 'VOID'}")
+    verdicts[mode] = {"operations": {o["op"]: o["verdict"] for o in rec["operations"]}, "exit_code": code}
+# The validity rule lives in ONE place, the lib (cmd_decide applies it too).
+ok = lib.controls_are_valid(verdicts)
+failed = sorted(op for op, v in verdicts["broken"]["operations"].items() if v != "PASS")
+print(f"controls: broken stub failed {failed} (exit {verdicts['broken']['exit_code']}); "
+      f"conforming stub exit {verdicts['conforming']['exit_code']} -> {'VALID' if ok else 'VOID'}")
 sys.exit(0 if ok else 1)
 PY
 }

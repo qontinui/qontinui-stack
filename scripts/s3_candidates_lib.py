@@ -115,6 +115,12 @@ def classify_licence(text: str) -> tuple[str, list[str]]:
     return "UNKNOWN", hits
 
 
+# Exit code of `licence` for a RECORDED exclusion. Deliberately not 1, which is
+# what an uncaught Python exception exits with: a crash must not be read as
+# "screened out".
+LICENCE_EXCLUDED_EXIT = 3
+
+
 def cmd_licence(a: argparse.Namespace) -> int:
     entry = _entry(_load(a.pins), "candidate", a.name)
     data = Path(a.file).read_bytes()
@@ -136,7 +142,7 @@ def cmd_licence(a: argparse.Namespace) -> int:
     }
     Path(a.out).write_text(json.dumps(record, indent=2) + "\n")
     print(f"licence {a.name}: {spdx} screen={record['screen']}")
-    return 0 if not excluded else 1
+    return 0 if not excluded else LICENCE_EXCLUDED_EXIT
 
 
 def cmd_ports(a: argparse.Namespace) -> int:
@@ -295,7 +301,11 @@ CONTROL_BROKEN_OPS = ["create_if_absent", "presign"]
 
 
 def controls_are_valid(controls: dict) -> bool:
-    """D8's negative control: the run counts only when both controls read as designed."""
+    """D8's negative control: the run counts only when both controls read as designed.
+
+    The ONE rule: s3-candidates.sh's run_controls and cmd_decide both call this.
+    ``controls`` is ``{"broken"|"conforming": {"operations": {op: verdict},
+    "exit_code": int}}``."""
     broken, good = controls.get("broken") or {}, controls.get("conforming") or {}
     failed = sorted(op for op, v in (broken.get("operations") or {}).items() if v != "PASS")
     broken_ok = (

@@ -122,6 +122,47 @@ class LicenceTests(unittest.TestCase):
         spdx, hits = lib.classify_licence("   Apache License\n      Version 2.0, January 2004")
         self.assertEqual((spdx, hits), ("Apache-2.0", []))
 
+    def _run_licence(self, text: str | None) -> tuple[int, Path]:
+        """Run `licence` as s3-candidates.sh does (a subprocess), so an uncaught
+        exception surfaces as its real exit status."""
+        import subprocess
+        tmp = Path(tempfile.mkdtemp())
+        pins = tmp / "pins.toml"
+        pins.write_text('[[candidate]]\nname = "alpha"\nlicense_url = "u"\nlicense_sha256 = "x"\n')
+        lic = tmp / "LICENSE"
+        if text is not None:
+            lic.write_text(text)
+        out = tmp / "out.json"
+        proc = subprocess.run(
+            [sys.executable, str(_MODULE_PATH), "licence", "--pins", str(pins), "--name", "alpha",
+             "--file", str(lic), "--out", str(out)],
+            capture_output=True, text=True,
+        )
+        return proc.returncode, out
+
+    def test_a_recorded_exclusion_exits_with_its_own_code(self) -> None:
+        code, out = self._run_licence("Business Source License 1.1\nLicensor: x")
+        self.assertEqual(code, lib.LICENCE_EXCLUDED_EXIT)
+        self.assertEqual(json.loads(out.read_text())["screen"], "EXCLUDED")
+
+    def test_a_crash_is_not_read_as_an_exclusion(self) -> None:
+        # No LICENSE file: the step crashes (FileNotFoundError, exit 1) and
+        # records nothing. s3-candidates.sh treats only LICENCE_EXCLUDED_EXIT
+        # as "screened out".
+        code, out = self._run_licence(None)
+        self.assertNotEqual(code, 0)
+        self.assertNotEqual(code, lib.LICENCE_EXCLUDED_EXIT)
+        self.assertFalse(out.exists())
+
+    def test_the_script_maps_only_the_exclusion_code_to_excluded(self) -> None:
+        sh = (_MODULE_PATH.parent / "s3-candidates.sh").read_text()
+        self.assertIn(f"        {lib.LICENCE_EXCLUDED_EXIT}) log \"$name EXCLUDED by the licence screen", sh)
+        self.assertNotIn('        1) log "$name EXCLUDED', sh)
+
+    def test_run_controls_uses_the_lib_rule(self) -> None:
+        sh = (_MODULE_PATH.parent / "s3-candidates.sh").read_text()
+        self.assertIn("lib.controls_are_valid(verdicts)", sh)
+
 
 if __name__ == "__main__":
     unittest.main()
