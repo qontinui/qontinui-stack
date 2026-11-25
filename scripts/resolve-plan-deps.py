@@ -338,7 +338,7 @@ def resolve_dep(
 # ---------------------------------------------------------------------------
 
 
-_DATED_TOKEN_RE = re.compile(r"(?<![\w-])\d{4}-\d{2}-\d{2}-\S+")
+_DATED_TOKEN_RE = re.compile(r"(?<!\w)\d{4}-\d{2}-\d{2}-\S+")
 _STEM_PREFIX_RE = re.compile(r"\d{4}-\d{2}-\d{2}-[a-z0-9]+(?:-[a-z0-9]+)*")
 
 
@@ -365,6 +365,8 @@ def _declared_depends_on_anywhere(text: str) -> list[str]:
             # (`2026-06-02-foo-(phase 2)`, `2026-06-02-foo-Plan`) must not
             # vanish: keep its longest stem-shaped prefix, as the pre-owner
             # resolver did, so it resolves (and blocks) like any other edge.
+            # The left boundary is `(?<!\w)`, not the owner's `(?<![\w-])`,
+            # so `x-2026-01-01-dep` still yields its stem as it did before.
             for m in _DATED_TOKEN_RE.finditer(segment):
                 prefix = _STEM_PREFIX_RE.match(m.group(0))
                 if prefix and not any(f == m.group(0) for f in found):
@@ -395,7 +397,9 @@ def resolve_plan(
     # and no `Depends-On:` (e.g. design notes) reads as "no deps declared".
     # A stamp the owner did not locate, or a `Depends-On:` outside its
     # region, can therefore never drop an edge and read as satisfied.
-    stems = list(stamp[2]) if stamp is not None else []
+    # A plan never depends on itself: its own stem is dropped from both the
+    # owner's stems and the whole-text extras.
+    stems = [x for x in (stamp[2] if stamp is not None else []) if x != plan_stem]
     for extra in _declared_depends_on_anywhere(text):
         if extra not in stems and extra != plan_stem:
             stems.append(extra)
