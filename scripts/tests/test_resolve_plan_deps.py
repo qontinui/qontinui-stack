@@ -578,6 +578,7 @@ class TestStampShapesThroughTheOwner(unittest.TestCase):
             "2026-01-01-the-dep-Plan",
             "x-2026-01-01-the-dep",
             "-2026-01-01-the-dep.",
+            "2026-01-01-X-2026-01-01-the-dep",
         ):
             with self.subTest(token=token):
                 res = self._resolve_shape(
@@ -585,6 +586,13 @@ class TestStampShapesThroughTheOwner(unittest.TestCase):
                 )
                 self.assertFalse(res.all_satisfied)
                 self.assertEqual([x.stem for x in res.depends_on], ["2026-01-01-the-dep"])
+
+    def test_bold_list_depends_on_below_a_heading_is_read(self) -> None:
+        res = self._resolve_shape(
+            "# P\n\n- Status: vetted\n\n## Plan\n\n- **Depends-On**: 2026-01-01-the-dep\n"
+        )
+        self.assertFalse(res.all_satisfied)
+        self.assertEqual([x.stem for x in res.depends_on], ["2026-01-01-the-dep"])
 
     def test_own_stem_in_the_stamp_region_is_not_an_edge(self) -> None:
         res = self._resolve_shape(
