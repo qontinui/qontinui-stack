@@ -341,7 +341,8 @@ def resolve_dep(
 _DATED_TOKEN_RE = re.compile(r"(?<!\w)\d{4}-\d{2}-\d{2}-\S+")
 _STEM_PREFIX_RE = re.compile(r"\d{4}-\d{2}-\d{2}-[a-z0-9]+(?:-[a-z0-9]+)*")
 #: The pre-owner resolver's stem pattern. Its matches are always unioned in,
-#: so the whole-text scan reads a SUPERSET of the edges that resolver read.
+#: (on the raw line as well as the marker-stripped one), so every edge that
+#: resolver read from a Depends-On: segment is read here too.
 _LEGACY_STEM_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}-[a-z0-9]+(?:-[a-z0-9]+)*\b")
 
 
@@ -357,10 +358,16 @@ def _declared_depends_on_anywhere(text: str) -> list[str]:
     """
     key = plan_stamp.DEPENDS_ON_KEY
     out: list[str] = []
-    for raw in text.splitlines():
-        # Strip blockquote/bold/code markers first, as the owner's region
-        # reader does, so `- **Depends-On**: <stem>` is seen too.
-        line = plan_stamp.strip_markers(raw)
+    # Each line is scanned twice: RAW (what the pre-owner resolver read, so
+    # stripping a marker can never glue a stem onto the text after it) and
+    # with blockquote/bold/code markers stripped, as the owner's region reader
+    # does, so `- **Depends-On**: <stem>` is seen too. Both results are kept.
+    lines = (
+        variant
+        for raw in text.splitlines()
+        for variant in (raw, plan_stamp.strip_markers(raw))
+    )
+    for line in lines:
         idx = line.find(key)
         while idx != -1:
             start = idx + len(key)

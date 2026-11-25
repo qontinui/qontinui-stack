@@ -594,6 +594,25 @@ class TestStampShapesThroughTheOwner(unittest.TestCase):
         self.assertFalse(res.all_satisfied)
         self.assertEqual([x.stem for x in res.depends_on], ["2026-01-01-the-dep"])
 
+    def test_stripping_a_marker_never_glues_an_unshipped_stem_into_a_shipped_one(self) -> None:
+        for value in ("`2026-01-01-the-dep`-b", "2026-01-01-the-dep**-b**"):
+            with self.subTest(value=value):
+                with tempfile.TemporaryDirectory() as tmp:
+                    d = Path(tmp)
+                    (d / "2026-01-01-the-dep.md").write_text(
+                        "# Dep\n\n> **Status: DRAFT 2026-01-01.**\n", encoding="utf-8"
+                    )
+                    (d / "2026-01-01-the-dep-b.md").write_text(
+                        "# Dep b\n\n> **Status: SHIPPED 2026-01-01.**\n", encoding="utf-8"
+                    )
+                    (d / "2026-01-02-the-plan.md").write_text(
+                        f"# P\n\n> **Status: VETTED 2026-01-02.**\n> Depends-On: {value}\n",
+                        encoding="utf-8",
+                    )
+                    res = rpd.resolve_plan(d / "2026-01-02-the-plan.md", d, None)
+                    self.assertFalse(res.all_satisfied)
+                    self.assertIn("2026-01-01-the-dep", [x.stem for x in res.depends_on])
+
     def test_own_stem_in_the_stamp_region_is_not_an_edge(self) -> None:
         res = self._resolve_shape(
             "# P\n\n> **Status: VETTED 2026-01-02.** Depends-On: 2026-01-02-the-plan\n"
