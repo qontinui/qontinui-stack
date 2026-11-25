@@ -519,10 +519,45 @@ class TestStampShapesThroughTheOwner(unittest.TestCase):
             )
             res = rpd.resolve_plan(d / "2026-01-02-the-plan.md", d, None)
             self.assertFalse(res.all_satisfied)
+            self.assertEqual([x.stem for x in res.depends_on], ["2026-01-01-the-dep"])
             self.assertEqual(
-                res.unsatisfied, [{"stem": "2026-01-02-the-plan", "reason": "unread_stamp"}]
+                res.unsatisfied, [{"stem": "2026-01-01-the-dep", "reason": "not_yet_shipped"}]
             )
             self.assertIn("all_satisfied = false", rpd._format_human(res))
+
+    def _resolve_shape(self, plan_body: str) -> rpd.Resolution:
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / "2026-01-01-the-dep.md").write_text(
+                "# Dep\n\n> **Status: DRAFT 2026-01-01.**\n", encoding="utf-8"
+            )
+            (d / "2026-01-02-the-plan.md").write_text(plan_body, encoding="utf-8")
+            return rpd.resolve_plan(d / "2026-01-02-the-plan.md", d, None)
+
+    def test_frontmatter_status_then_late_blockquote_depends_on_fails_closed(self) -> None:
+        pad = "".join(f"line {i}\n" for i in range(62))
+        res = self._resolve_shape(
+            "---\nstatus: draft\n---\n# P\n" + pad
+            + "> **Status: VETTED.** Depends-On: 2026-01-01-the-dep\n"
+        )
+        self.assertFalse(res.all_satisfied)
+        self.assertEqual([x.stem for x in res.depends_on], ["2026-01-01-the-dep"])
+
+    def test_heading_between_first_stamp_and_depends_on_fails_closed(self) -> None:
+        res = self._resolve_shape(
+            "# P\n\nStatus: see below\n\n## Background\n\ntext\n\n"
+            "> **Status: VETTED.** Depends-On: 2026-01-01-the-dep\n"
+        )
+        self.assertFalse(res.all_satisfied)
+        self.assertEqual([x.stem for x in res.depends_on], ["2026-01-01-the-dep"])
+
+    def test_list_status_then_heading_then_depends_on_fails_closed(self) -> None:
+        res = self._resolve_shape(
+            "# P\n\n- Status: vetted\n\n## Plan\n\n> **Status:** VETTED\n"
+            "> Depends-On: 2026-01-01-the-dep\n"
+        )
+        self.assertFalse(res.all_satisfied)
+        self.assertEqual([x.stem for x in res.depends_on], ["2026-01-01-the-dep"])
 
     def test_stampless_plan_without_depends_on_stays_satisfied(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
