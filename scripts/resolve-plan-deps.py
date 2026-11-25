@@ -338,6 +338,20 @@ def resolve_dep(
 # ---------------------------------------------------------------------------
 
 
+def _declares_depends_on(text: str) -> bool:
+    """True when any line carries ``Depends-On:`` followed by a plan stem.
+
+    Used only when the owner found no stamp, to refuse reading a plan whose
+    dependency declaration the owner never saw as dependency-free.
+    """
+    key = plan_stamp.DEPENDS_ON_KEY
+    for line in text.splitlines():
+        idx = line.find(key)
+        if idx != -1 and plan_stamp.DEPENDS_ON_STEM_RE.search(line, idx + len(key)):
+            return True
+    return False
+
+
 def resolve_plan(
     plan_path: Path,
     plans_dir: Path,
@@ -358,6 +372,17 @@ def resolve_plan(
         # that legitimately have no status (e.g. design notes). Treat as
         # "no deps declared" and exit 0. The skill consumer can choose to
         # enforce status-block presence separately.
+        #
+        # EXCEPT when the text still declares a dependency: a stamp the
+        # owner did not read (e.g. one below its header window) would
+        # otherwise drop its `Depends-On:` stems and read as satisfied.
+        # Fail closed instead — never a false all_satisfied.
+        if _declares_depends_on(text):
+            return Resolution(
+                plan_stem=plan_stem,
+                all_satisfied=False,
+                unsatisfied=[{"stem": plan_stem, "reason": "unread_stamp"}],
+            )
         return Resolution(plan_stem=plan_stem)
 
     stems = stamp[2]
@@ -394,7 +419,7 @@ def resolve_plan(
 def _format_human(resolution: Resolution) -> str:
     out: list[str] = []
     out.append(f"Plan: {resolution.plan_stem}")
-    if not resolution.depends_on:
+    if not resolution.depends_on and not resolution.unsatisfied:
         out.append("  (no Depends-On declared)")
         out.append("Result: all_satisfied = true")
         return "\n".join(out)
