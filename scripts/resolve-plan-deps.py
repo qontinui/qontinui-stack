@@ -338,18 +338,29 @@ def resolve_dep(
 # ---------------------------------------------------------------------------
 
 
-def _declares_depends_on(text: str) -> bool:
-    """True when any line carries ``Depends-On:`` followed by a plan stem.
+def _declared_depends_on_anywhere(text: str) -> list[str]:
+    """Every plan stem that follows ``Depends-On:`` on ANY line, in order.
 
-    Used only when the owner found no stamp, to refuse reading a plan whose
-    dependency declaration the owner never saw as dependency-free.
+    The owner reads ``Depends-On:`` only inside its stamp region (header
+    window, up to the first heading). A dependency this resolver gates
+    dispatch on must never be dropped because it sits outside that region,
+    so the resolver unions the owner's stems with this whole-text scan.
+    Over-reading errs toward blocking (an extra stem resolves MISSING or
+    unshipped); under-reading would dispatch over an unmet dependency.
     """
     key = plan_stamp.DEPENDS_ON_KEY
+    out: list[str] = []
     for line in text.splitlines():
         idx = line.find(key)
-        if idx != -1 and plan_stamp.DEPENDS_ON_STEM_RE.search(line, idx + len(key)):
-            return True
-    return False
+        while idx != -1:
+            start = idx + len(key)
+            nxt = line.find(key, start)
+            segment = line[start:] if nxt == -1 else line[start:nxt]
+            for m in plan_stamp.DEPENDS_ON_STEM_RE.finditer(segment):
+                if m.group(0) not in out:
+                    out.append(m.group(0))
+            idx = nxt
+    return out
 
 
 def resolve_plan(
@@ -366,26 +377,15 @@ def resolve_plan(
     stamp = read_plan_stamp(text)
     plan_stem = plan_path.stem
 
-    if stamp is None:
-        # An input plan with no status block is malformed for the purposes
-        # of dependency resolution — but we should still tolerate plans
-        # that legitimately have no status (e.g. design notes). Treat as
-        # "no deps declared" and exit 0. The skill consumer can choose to
-        # enforce status-block presence separately.
-        #
-        # EXCEPT when the text still declares a dependency: a stamp the
-        # owner did not read (e.g. one below its header window) would
-        # otherwise drop its `Depends-On:` stems and read as satisfied.
-        # Fail closed instead — never a false all_satisfied.
-        if _declares_depends_on(text):
-            return Resolution(
-                plan_stem=plan_stem,
-                all_satisfied=False,
-                unsatisfied=[{"stem": plan_stem, "reason": "unread_stamp"}],
-            )
-        return Resolution(plan_stem=plan_stem)
-
-    stems = stamp[2]
+    # The owner's stems (stamp region only), unioned with every
+    # `Depends-On:` stem anywhere in the text. An input plan with no stamp
+    # and no `Depends-On:` (e.g. design notes) reads as "no deps declared".
+    # A stamp the owner did not locate, or a `Depends-On:` outside its
+    # region, can therefore never drop an edge and read as satisfied.
+    stems = list(stamp[2]) if stamp is not None else []
+    for extra in _declared_depends_on_anywhere(text):
+        if extra not in stems and extra != plan_stem:
+            stems.append(extra)
     resolution = Resolution(plan_stem=plan_stem)
     if not stems:
         return resolution
