@@ -197,7 +197,7 @@ def _parse_plan(path: Path) -> tuple[str, str, list[str]]:
     status = lifecycle or UNKNOWN_STATUS
     # Same edge set the resolver gates on: the owner's region stems plus
     # every `Depends-On:` stem anywhere in the plan.
-    deps = list(deps)
+    deps = [x for x in deps if x != stem]
     for extra in _rpd._declared_depends_on_anywhere(text):
         if extra not in deps and extra != stem:
             deps.append(extra)
