@@ -189,10 +189,18 @@ def _parse_plan(path: Path) -> tuple[str, str, list[str]]:
     stamp = read_plan_stamp(text)
     if stamp is None:
         # No status block at all — treat as DRAFT-equivalent. Matches the
-        # resolve-plan-deps.py convention.
-        return stem, "DRAFT", []
+        # resolve-plan-deps.py convention, including its whole-text
+        # `Depends-On:` scan.
+        extras = [x for x in _rpd._declared_depends_on_anywhere(text) if x != stem]
+        return stem, "DRAFT", extras
     lifecycle, _summary, deps = stamp
     status = lifecycle or UNKNOWN_STATUS
+    # Same edge set the resolver gates on: the owner's region stems plus
+    # every `Depends-On:` stem anywhere in the plan.
+    deps = list(deps)
+    for extra in _rpd._declared_depends_on_anywhere(text):
+        if extra not in deps and extra != stem:
+            deps.append(extra)
     return stem, status, deps
 
 

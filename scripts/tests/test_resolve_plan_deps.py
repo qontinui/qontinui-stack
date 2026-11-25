@@ -570,6 +570,25 @@ class TestStampShapesThroughTheOwner(unittest.TestCase):
             self.assertTrue(res.all_satisfied)
             self.assertEqual(res.unsatisfied, [])
 
+    def test_malformed_depends_on_token_keeps_its_stem_prefix(self) -> None:
+        # The owner's whole-stem pattern rejects these tokens; dropping them
+        # would read the plan satisfied over a DRAFT dependency.
+        for token in ("2026-01-01-the-dep-(phase 2)", "2026-01-01-the-dep-Plan"):
+            with self.subTest(token=token):
+                res = self._resolve_shape(
+                    f"# P\n\n> **Status: VETTED 2026-01-02.** Depends-On: {token}\n"
+                )
+                self.assertFalse(res.all_satisfied)
+                self.assertEqual([x.stem for x in res.depends_on], ["2026-01-01-the-dep"])
+
+    def test_own_stem_in_a_depends_on_line_is_not_an_edge(self) -> None:
+        res = self._resolve_shape(
+            "# P\n\n> **Status: VETTED 2026-01-02.**\n\n## Notes\n\n"
+            "Others write Depends-On: 2026-01-02-the-plan to wait on this plan.\n"
+        )
+        self.assertTrue(res.all_satisfied)
+        self.assertEqual(res.depends_on, [])
+
 
 class TestSummaryText(unittest.TestCase):
     def test_summary_stops_at_the_first_blank_blockquote_line(self) -> None:
