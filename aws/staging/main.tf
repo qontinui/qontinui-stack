@@ -434,10 +434,15 @@ module "operator_pager" {
 # ─── Replication tunnel (off-AWS logical replica) ───────────────────────
 # Tailscale subnet router + reverse forwarder between RDS and the local
 # subscriber (plan 2026-10-15-coord-and-web-data-move-off-aws-by-logical-
-# replication, D2). DISABLED: with enabled = false the module plans zero
-# resources and makes no AWS reads. Phase 3 turns it on, after Phase 1c has
-# imported the qontinui-staging Cloud Map namespace (cloud_map_namespace_id) and
-# the operator has decided OD1-OD3; see the module header for the order.
+# replication, D2(a)). DISABLED: with enabled = false the module plans zero
+# resources and makes no AWS reads. Not the Phase 3 tunnel: OD3(ii) moved D2 to
+# (e), module.replication_tunnel_wireguard above. This one stays as the upgrade
+# path if the operator later mints the Tailscale key (set the secret, switch
+# modules); see the module header for the order. The forwarder registers
+# in the qontinui-staging Cloud Map namespace Phase 1c imported (module.nats).
+# one() is null while nats_under_code is false, and the module's precondition
+# then names nats_under_code instead of planning against nothing. The reference
+# makes -target=module.replication_tunnel pull in module.nats's namespace.
 
 module "replication_tunnel" {
   source = "../modules/replication-tunnel"
@@ -451,6 +456,8 @@ module "replication_tunnel" {
   cluster_id           = module.coord.cluster_id
   db_security_group_id = module.network.data_plane_sg_id
   db_subnet_ids        = module.postgres.subnet_ids
+
+  cloud_map_namespace_id = one(module.nats[*].namespace_id)
 }
 
 # ─── Operator-staged, out-of-region ─────────────────────────────────────
