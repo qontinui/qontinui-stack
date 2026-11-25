@@ -120,8 +120,8 @@ variable "trusted_proxy_cidrs" {
   description = "CIDRs of the proxies allowed to set X-Forwarded-For (the ALB's subnets). Feeds RATE_LIMIT_TRUSTED_PROXY_CIDRS and uvicorn's FORWARDED_ALLOW_IPS. Must track the ALB's subnets."
 
   validation {
-    condition     = length(var.trusted_proxy_cidrs) > 0 && alltrue([for c in var.trusted_proxy_cidrs : can(cidrhost(c, 0))])
-    error_message = "trusted_proxy_cidrs must be a non-empty list of valid CIDR blocks (e.g. 10.20.0.0/20)."
+    condition     = length(var.trusted_proxy_cidrs) > 0 && alltrue([for c in var.trusted_proxy_cidrs : can(cidrhost(c, 0)) && tonumber(split("/", c)[1]) > 0])
+    error_message = "trusted_proxy_cidrs must be a non-empty list of valid CIDR blocks other than /0 (e.g. 10.20.0.0/20)."
   }
 }
 
@@ -486,6 +486,9 @@ resource "aws_ecs_task_definition" "web" {
         # fed from module.network.public_subnet_cidrs). uvicorn reads
         # FORWARDED_ALLOW_IPS as its --forwarded-allow-ips trust list; the
         # backend Dockerfile passes no such flag, so the env var is the knob.
+        # The service ignores task_definition changes, but deploy-web.yml clones the
+        # family's LATEST revision, so a revision registered from this file is what
+        # the next deploy inherits (it only swaps the image).
         { name = "RATE_LIMIT_TRUSTED_PROXY_CIDRS", value = join(",", var.trusted_proxy_cidrs) },
         { name = "FORWARDED_ALLOW_IPS", value = join(",", var.trusted_proxy_cidrs) },
         # Transactional email goes through the SES API rather than SMTP. The
