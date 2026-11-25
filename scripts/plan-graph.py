@@ -580,11 +580,26 @@ def _mermaid_id(stem: str) -> str:
     return f"{_MERMAID_SAFE_PREFIX}{safe}"
 
 
+def _mermaid_escape(text: str) -> str:
+    """Escape text interpolated into a quoted Mermaid label.
+
+    The status is the owner's first token from plan text, so it is not a
+    fixed vocabulary: a `"` would end the label and `<`/`>` would be read as
+    HTML. Mermaid's entity codes keep them literal.
+    """
+    return (
+        text.replace("&", "#amp;")
+        .replace('"', "#quot;")
+        .replace("<", "#lt;")
+        .replace(">", "#gt;")
+    )
+
+
 def _render_mermaid(graph: Graph) -> str:
     lines: list[str] = ["graph TD;"]
     for stem in sorted(graph.nodes):
         node = graph.nodes[stem]
-        label = f"{stem}<br/>{node.status}"
+        label = f"{_mermaid_escape(stem)}<br/>{_mermaid_escape(str(node.status))}"
         # Wrap label in quoted-string syntax so HTML-style <br/> renders.
         lines.append(f'  {_mermaid_id(stem)}["{label}"];')
     for src in sorted(graph.edges):

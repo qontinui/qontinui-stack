@@ -442,6 +442,13 @@ class TestFormatMermaid(unittest.TestCase):
             self.assertIn("VETTED", stdout)
             self.assertIn("DRAFT", stdout)
 
+    def test_mermaid_label_escapes_quote_and_angle_brackets(self) -> None:
+        # The status is the owner's first token from plan text, not a fixed
+        # vocabulary, so it must not be able to end the quoted label.
+        self.assertEqual(
+            pg._mermaid_escape('a"b<c>&d'), "a#quot;b#lt;c#gt;#amp;d"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Edge cases

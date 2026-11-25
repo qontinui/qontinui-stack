@@ -502,6 +502,39 @@ class TestStampShapesThroughTheOwner(unittest.TestCase):
             self.assertEqual([x.stem for x in res.depends_on], ["2026-01-01-the-dep"])
             self.assertEqual(res.depends_on[0].status, "MISSING")
 
+    def test_stamp_below_the_owner_window_fails_closed(self) -> None:
+        # The owner reads stamps only in its header window; a plan whose
+        # only stamp sits below it must not drop its Depends-On edges and
+        # read as satisfied (it used to: deps [] and all_satisfied true).
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / "2026-01-01-the-dep.md").write_text(
+                "# Dep\n\n> **Status: DRAFT 2026-01-01.**\n", encoding="utf-8"
+            )
+            intro = "".join(f"intro line {i}\n" for i in range(65))
+            (d / "2026-01-02-the-plan.md").write_text(
+                "# P\n\n" + intro
+                + "\n> **Status: VETTED 2026-01-02.** Depends-On: 2026-01-01-the-dep\n",
+                encoding="utf-8",
+            )
+            res = rpd.resolve_plan(d / "2026-01-02-the-plan.md", d, None)
+            self.assertFalse(res.all_satisfied)
+            self.assertEqual(
+                res.unsatisfied, [{"stem": "2026-01-02-the-plan", "reason": "unread_stamp"}]
+            )
+            self.assertIn("all_satisfied = false", rpd._format_human(res))
+
+    def test_stampless_plan_without_depends_on_stays_satisfied(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / "2026-01-02-notes.md").write_text(
+                "# Notes\n\nNo stamp, and Depends-On: is only discussed here.\n",
+                encoding="utf-8",
+            )
+            res = rpd.resolve_plan(d / "2026-01-02-notes.md", d, None)
+            self.assertTrue(res.all_satisfied)
+            self.assertEqual(res.unsatisfied, [])
+
 
 class TestSummaryText(unittest.TestCase):
     def test_summary_stops_at_the_first_blank_blockquote_line(self) -> None:
