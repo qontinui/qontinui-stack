@@ -340,6 +340,9 @@ def resolve_dep(
 
 _DATED_TOKEN_RE = re.compile(r"(?<!\w)\d{4}-\d{2}-\d{2}-\S+")
 _STEM_PREFIX_RE = re.compile(r"\d{4}-\d{2}-\d{2}-[a-z0-9]+(?:-[a-z0-9]+)*")
+#: The pre-owner resolver's stem pattern. Its matches are always unioned in,
+#: so the whole-text scan reads a SUPERSET of the edges that resolver read.
+_LEGACY_STEM_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}-[a-z0-9]+(?:-[a-z0-9]+)*\b")
 
 
 def _declared_depends_on_anywhere(text: str) -> list[str]:
@@ -354,7 +357,10 @@ def _declared_depends_on_anywhere(text: str) -> list[str]:
     """
     key = plan_stamp.DEPENDS_ON_KEY
     out: list[str] = []
-    for line in text.splitlines():
+    for raw in text.splitlines():
+        # Strip blockquote/bold/code markers first, as the owner's region
+        # reader does, so `- **Depends-On**: <stem>` is seen too.
+        line = plan_stamp.strip_markers(raw)
         idx = line.find(key)
         while idx != -1:
             start = idx + len(key)
@@ -371,6 +377,10 @@ def _declared_depends_on_anywhere(text: str) -> list[str]:
                 prefix = _STEM_PREFIX_RE.match(m.group(0))
                 if prefix and not any(f == m.group(0) for f in found):
                     found.append(prefix.group(0))
+            # And every match of the pre-owner pattern (e.g. the inner stem of
+            # `2026-01-01-X-2026-01-02-bar`, which the greedy token above
+            # swallows), so no edge that resolver read can be lost here.
+            found.extend(_LEGACY_STEM_RE.findall(segment))
             for stem in found:
                 if stem not in out:
                     out.append(stem)
