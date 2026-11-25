@@ -115,6 +115,16 @@ variable "ses_from_email" {
   description = "Source address for transactional mail (the backend's SMTP_FROM_EMAIL). It MUST be an address under the domain of var.ses_sender_identity_arn: the grant is resource-scoped to that identity, so anything else is AccessDenied by IAM. The backend's own default (noreply@qontinui.com) is not a verified identity in this account, which is why leaving this unset is not an option."
 }
 
+variable "trusted_proxy_cidrs" {
+  type        = list(string)
+  description = "CIDRs of the proxies allowed to set X-Forwarded-For (the ALB's subnets). Feeds RATE_LIMIT_TRUSTED_PROXY_CIDRS and uvicorn's FORWARDED_ALLOW_IPS. Must track the ALB's subnets."
+
+  validation {
+    condition     = length(var.trusted_proxy_cidrs) > 0 && alltrue([for c in var.trusted_proxy_cidrs : can(cidrhost(c, 0))])
+    error_message = "trusted_proxy_cidrs must be a non-empty list of valid CIDR blocks (e.g. 10.20.0.0/20)."
+  }
+}
+
 # Email address of the bootstrap superuser. qontinui-web's
 # backend/app/db/init_db.py seeds the FIRST superuser at app startup — but only
 # when FIRST_SUPERUSER_EMAIL is set; unset, the seed is inert and a deployed
@@ -468,6 +478,16 @@ resource "aws_ecs_task_definition" "web" {
         { name = "BACKEND_CORS_ORIGIN_REGEX", value = var.backend_cors_origin_regex },
         { name = "REDIS_ENABLED", value = "true" },
         { name = "RATE_LIMIT_ENABLED", value = "true" },
+        # Trusted-proxy list: only these peers may set X-Forwarded-For. Measured
+        # 2026-11-25: ALB qontinui-staging sits in subnets 10.20.0.0/20 and
+        # 10.20.16.0/20 (ELB ENIs 10.20.8.196 and 10.20.26.77), and the task SG
+        # sg-062b08f62161562d5 admits tcp/8000 only from the ALB SG, so the ALB
+        # is the sole direct peer. The list MUST track the ALB's subnets (it is
+        # fed from module.network.public_subnet_cidrs). uvicorn reads
+        # FORWARDED_ALLOW_IPS as its --forwarded-allow-ips trust list; the
+        # backend Dockerfile passes no such flag, so the env var is the knob.
+        { name = "RATE_LIMIT_TRUSTED_PROXY_CIDRS", value = join(",", var.trusted_proxy_cidrs) },
+        { name = "FORWARDED_ALLOW_IPS", value = join(",", var.trusted_proxy_cidrs) },
         # Transactional email goes through the SES API rather than SMTP. The
         # grant is aws_iam_role_policy.task_ses_send above.
         { name = "USE_SES_API", value = "true" },
