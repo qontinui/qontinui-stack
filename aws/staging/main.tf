@@ -273,6 +273,9 @@ module "web" {
   client_sg_id       = module.network.client_sg_id
   alb_sg_id          = module.network.alb_sg_id
 
+  # ALB subnets are the only peers that reach the tasks; see modules/web.
+  trusted_proxy_cidrs = module.network.public_subnet_cidrs
+
   cluster_id = module.coord.cluster_id # reuse coord's cluster (one per env)
 
   image_uri     = var.web_image_uri

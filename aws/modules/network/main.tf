@@ -298,6 +298,9 @@ resource "aws_security_group_rule" "data_self" {
 
 output "vpc_id" { value = aws_vpc.main.id }
 output "public_subnet_ids" { value = aws_subnet.public[*].id }
+# CIDRs of the public subnets the ALB sits in; consumed by modules/web as the
+# trusted-proxy list (the ALB is the only thing that can reach the web tasks).
+output "public_subnet_cidrs" { value = aws_subnet.public[*].cidr_block }
 output "private_subnet_ids" { value = aws_subnet.private[*].id }
 output "alb_sg_id" { value = aws_security_group.alb.id }
 output "client_sg_id" { value = aws_security_group.client.id }
