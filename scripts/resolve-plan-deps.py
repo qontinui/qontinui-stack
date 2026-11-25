@@ -338,6 +338,10 @@ def resolve_dep(
 # ---------------------------------------------------------------------------
 
 
+_DATED_TOKEN_RE = re.compile(r"(?<![\w-])\d{4}-\d{2}-\d{2}-\S+")
+_STEM_PREFIX_RE = re.compile(r"\d{4}-\d{2}-\d{2}-[a-z0-9]+(?:-[a-z0-9]+)*")
+
+
 def _declared_depends_on_anywhere(text: str) -> list[str]:
     """Every plan stem that follows ``Depends-On:`` on ANY line, in order.
 
@@ -356,9 +360,18 @@ def _declared_depends_on_anywhere(text: str) -> list[str]:
             start = idx + len(key)
             nxt = line.find(key, start)
             segment = line[start:] if nxt == -1 else line[start:nxt]
-            for m in plan_stamp.DEPENDS_ON_STEM_RE.finditer(segment):
-                if m.group(0) not in out:
-                    out.append(m.group(0))
+            found = [m.group(0) for m in plan_stamp.DEPENDS_ON_STEM_RE.finditer(segment)]
+            # A date-prefixed token the owner's whole-stem pattern rejects
+            # (`2026-06-02-foo-(phase 2)`, `2026-06-02-foo-Plan`) must not
+            # vanish: keep its longest stem-shaped prefix, as the pre-owner
+            # resolver did, so it resolves (and blocks) like any other edge.
+            for m in _DATED_TOKEN_RE.finditer(segment):
+                prefix = _STEM_PREFIX_RE.match(m.group(0))
+                if prefix and not any(f == m.group(0) for f in found):
+                    found.append(prefix.group(0))
+            for stem in found:
+                if stem not in out:
+                    out.append(stem)
             idx = nxt
     return out
 
